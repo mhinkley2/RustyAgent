@@ -1,0 +1,349 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   human.css — Human-in-the-loop feature (RUSTYAGE-6)
+
+   Sections:
+     1. HITL banner (board page top bar)
+     2. Human story card badge
+     3. HumanInputDialog (hid-*)
+     4. ApprovalGateDialog (agd-*)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── 1. HITL Banner ─────────────────────────────────────────────────────── */
+
+.hitl-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 24px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+}
+
+.hitl-banner--input {
+  background: var(--warning-subtle);
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+}
+
+.hitl-banner--approval {
+  background: var(--info-subtle);
+  color: var(--info);
+  border-color: color-mix(in srgb, var(--info) 30%, transparent);
+}
+
+.hitl-banner__icon {
+  flex-shrink: 0;
+}
+
+.hitl-banner__text {
+  flex: 1;
+}
+
+/* ─── 2. Human story card badge ──────────────────────────────────────────── */
+
+.story-card__human-badge {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 13px;
+  color: var(--warning);
+  line-height: 1;
+  animation: hitl-pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes hitl-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.45; }
+}
+
+.story-card__pipeline-badge {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  color: var(--color-accent, #cba6f7);
+  opacity: 0.85;
+}
+
+/* ─── 3. HumanInputDialog ────────────────────────────────────────────────── */
+
+.hid-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fade-in 150ms ease;
+}
+
+.hid-modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-modal);
+  padding: 24px;
+  width: 520px;
+  max-width: calc(100vw - 48px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: slide-up 150ms ease;
+}
+
+.hid-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hid-header__icon {
+  color: var(--warning);
+  flex-shrink: 0;
+}
+
+.hid-header__title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.hid-story-name {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.hid-question-block {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hid-question-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.hid-question-text {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  line-height: 1.55;
+}
+
+.hid-response-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.hid-response-textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  line-height: 1.5;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 120ms;
+}
+
+.hid-response-textarea:focus {
+  border-color: var(--accent);
+}
+
+.hid-hint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  margin: -8px 0 0;
+}
+
+.hid-error {
+  font-size: var(--text-sm);
+  color: var(--error);
+  margin: 0;
+}
+
+.hid-approval-notice {
+  font-size: var(--text-sm);
+  color: var(--warning);
+  background: var(--warning-subtle);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  margin: 0;
+}
+
+.hid-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* ─── 4. ApprovalGateDialog ──────────────────────────────────────────────── */
+
+.agd-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fade-in 150ms ease;
+}
+
+.agd-modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-modal);
+  padding: 24px;
+  width: 560px;
+  max-width: calc(100vw - 48px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: slide-up 150ms ease;
+}
+
+.agd-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agd-header__icon {
+  color: var(--warning);
+  flex-shrink: 0;
+}
+
+.agd-header__title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.agd-story-name {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0;
+}
+
+.agd-tool-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agd-tool-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.agd-tool-label--inputs {
+  margin-top: 8px;
+}
+
+.agd-tool-name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--info);
+}
+
+.agd-tool-inputs {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.agd-rejection {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agd-rejection-label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.agd-rejection-textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-family: inherit;
+  line-height: 1.5;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 120ms;
+}
+
+.agd-rejection-textarea:focus {
+  border-color: var(--error);
+}
+
+.agd-error {
+  font-size: var(--text-sm);
+  color: var(--error);
+  margin: 0;
+}
+
+.agd-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* ─── Shared modal animation ─────────────────────────────────────────────── */
+
+@keyframes slide-up {
+  from { transform: translateY(12px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}

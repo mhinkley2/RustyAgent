@@ -1,0 +1,196 @@
+/* Pipeline progress panel styles */
+
+.pipeline-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--color-surface-raised, #1e1e2e);
+  border: 1px solid var(--color-border, #313244);
+  border-radius: 8px;
+}
+
+/* Header */
+.pipeline-panel__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pipeline-panel__icon {
+  color: var(--color-accent, #cba6f7);
+  flex-shrink: 0;
+}
+
+.pipeline-panel__title {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--color-text-primary, #cdd6f4);
+}
+
+.pipeline-panel__mode {
+  font-size: 0.75rem;
+  padding: 1px 7px;
+  border-radius: 12px;
+  background: var(--color-surface, #181825);
+  color: var(--color-text-secondary, #a6adc8);
+  text-transform: capitalize;
+}
+
+.pipeline-panel__status {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 12px;
+}
+
+.pipeline-panel__status--running {
+  background: rgba(137, 220, 235, 0.15);
+  color: #89dceb;
+}
+.pipeline-panel__status--done {
+  background: rgba(166, 227, 161, 0.15);
+  color: #a6e3a1;
+}
+.pipeline-panel__status--failed {
+  background: rgba(243, 139, 168, 0.15);
+  color: #f38ba8;
+}
+.pipeline-panel__status--cancelled {
+  background: rgba(166, 173, 200, 0.15);
+  color: #a6adc8;
+}
+
+.pipeline-panel__progress {
+  margin-left: auto;
+  font-size: 0.75rem;
+  color: var(--color-text-secondary, #a6adc8);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Progress bar */
+.pipeline-panel__progress-bar {
+  height: 3px;
+  background: var(--color-surface, #181825);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.pipeline-panel__progress-fill {
+  height: 100%;
+  background: var(--color-accent, #cba6f7);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+/* Steps */
+.pipeline-panel__steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding-top: 4px;
+}
+
+.pipeline-step {
+  display: flex;
+  gap: 10px;
+}
+
+/* Track (dot + vertical line) */
+.pipeline-step__track {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex-shrink: 0;
+  width: 20px;
+}
+
+.pipeline-step__dot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.pipeline-step__connector {
+  width: 2px;
+  flex: 1;
+  min-height: 16px;
+  background: var(--color-border, #313244);
+  margin: 2px 0;
+}
+
+.pipeline-step__connector--done {
+  background: var(--color-accent, #cba6f7);
+}
+
+/* Step icons */
+.pipeline-step__icon {
+  display: block;
+}
+
+.pipeline-step__icon--pending { color: var(--color-text-muted, #6c7086); }
+.pipeline-step__icon--running {
+  color: #89dceb;
+  animation: pipeline-spin 1s linear infinite;
+}
+.pipeline-step__icon--done    { color: #a6e3a1; }
+.pipeline-step__icon--failed  { color: #f38ba8; }
+
+@keyframes pipeline-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Step body */
+.pipeline-step__body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pipeline-step__label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.pipeline-step__index {
+  font-size: 0.7rem;
+  color: var(--color-text-muted, #6c7086);
+  font-variant-numeric: tabular-nums;
+}
+
+.pipeline-step__name {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--color-text-primary, #cdd6f4);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pipeline-step__badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 6px;
+  text-transform: capitalize;
+  flex-shrink: 0;
+}
+
+.pipeline-step__badge--pending  { background: rgba(166,173,200,0.12); color: #a6adc8; }
+.pipeline-step__badge--running  { background: rgba(137,220,235,0.15); color: #89dceb; }
+.pipeline-step__badge--done     { background: rgba(166,227,161,0.15); color: #a6e3a1; }
+.pipeline-step__badge--failed   { background: rgba(243,139,168,0.15); color: #f38ba8; }
+
+.pipeline-step__run-id {
+  font-size: 0.7rem;
+  color: var(--color-text-muted, #6c7086);
+  font-family: var(--font-mono, monospace);
+  flex-shrink: 0;
+}

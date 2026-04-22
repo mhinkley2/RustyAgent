@@ -1,0 +1,21 @@
+[package]
+name = "pipeline"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+runtime = { path = "../runtime" }
+db = { path = "../db" }
+api = { path = "../api" }
+memory = { path = "../memory" }
+tools = { path = "../tools" }
+tauri = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }

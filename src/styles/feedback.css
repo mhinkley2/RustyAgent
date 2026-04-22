@@ -1,0 +1,393 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Feedback & Action Component Styles  (RUSTYAGE-17)
+   Button · IconButton · Toast · AlertBanner · Tooltip · Popover
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Spinner keyframe (shared with components.css spin) ────────────────── */
+/* Already defined in components.css as @keyframes spin — not duplicated. */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Button system
+   (The primitive .btn rules live in forms.css to avoid a circular dep.
+    This file adds the icon-button variant and loading-spinner styling.)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Link variant — not in forms.css */
+.btn--link {
+  background: none;
+  border-color: transparent;
+  color: var(--accent);
+  padding-left: 0;
+  padding-right: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.btn--link:hover {
+  opacity: 0.8;
+  background: none;
+}
+
+/* Spinner inside a button — spins via animation in components.css */
+.btn__spinner {
+  animation: spin 1s linear infinite;
+  flex-shrink: 0;
+}
+
+/* Icon slot */
+.btn__icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* ─── IconButton ──────────────────────────────────────────────────────────── */
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 0.1s, border-color 0.1s, color 0.1s;
+  color: var(--text-secondary);
+  outline: none;
+  flex-shrink: 0;
+}
+
+.icon-btn:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* sm */
+.icon-btn--sm {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+}
+
+/* ghost */
+.icon-btn--ghost:hover {
+  background-color: var(--bg-subtle);
+  color: var(--text-primary);
+}
+
+/* secondary */
+.icon-btn--secondary {
+  border-color: var(--border);
+}
+
+.icon-btn--secondary:hover {
+  background-color: var(--bg-subtle);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Toast notifications
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Container — fixed top-right, stacked */
+.toast-region {
+  position: fixed;
+  top: 44px; /* clear the 36px titlebar + 8px gap */
+  right: 12px;
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 320px;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: all;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  box-shadow: var(--shadow-modal);
+  animation: slide-in-right 0.2s ease, fade-in 0.2s ease;
+  max-width: 320px;
+}
+
+/* Variant left-border colors */
+.toast--success { border-left-color: var(--success); }
+.toast--error   { border-left-color: var(--error); }
+.toast--warning { border-left-color: var(--warning); }
+.toast--info    { border-left-color: var(--info); }
+
+/* Icon */
+.toast__icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  margin-top: 1px;
+}
+
+.toast--success .toast__icon { color: var(--success); }
+.toast--error   .toast__icon { color: var(--error); }
+.toast--warning .toast__icon { color: var(--warning); }
+.toast--info    .toast__icon { color: var(--info); }
+
+/* Content */
+.toast__content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toast__title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.toast__body {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.toast__action {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  margin-top: 4px;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.toast__action:hover {
+  opacity: 0.8;
+}
+
+/* Close button */
+.toast__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.1s, color 0.1s;
+  padding: 0;
+}
+
+.toast__close:hover {
+  background-color: var(--bg-subtle);
+  color: var(--text-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Alert Banner
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  font-size: var(--text-sm);
+  border-bottom: 1px solid transparent;
+}
+
+.alert-banner--info {
+  background-color: var(--info-subtle);
+  color: var(--info);
+  border-bottom-color: color-mix(in srgb, var(--info) 30%, transparent);
+}
+
+.alert-banner--warning {
+  background-color: var(--warning-subtle);
+  color: var(--warning);
+  border-bottom-color: color-mix(in srgb, var(--warning) 30%, transparent);
+}
+
+.alert-banner--error {
+  background-color: var(--error-subtle);
+  color: var(--error);
+  border-bottom-color: color-mix(in srgb, var(--error) 30%, transparent);
+}
+
+.alert-banner__icon {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.alert-banner__message {
+  flex: 1;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.alert-banner__action {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--accent);
+  cursor: pointer;
+  white-space: nowrap;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.alert-banner__action:hover {
+  opacity: 0.8;
+}
+
+.alert-banner__close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.1s, color 0.1s;
+  flex-shrink: 0;
+}
+
+.alert-banner__close:hover {
+  background-color: color-mix(in srgb, var(--bg-base) 40%, transparent);
+  color: var(--text-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Tooltip
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.tooltip-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.tooltip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 600;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: 400;
+  white-space: nowrap;
+  max-width: 240px;
+  text-align: center;
+  pointer-events: none;
+  box-shadow: var(--shadow-sm);
+  animation: fade-in 0.1s ease;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Popover
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.popover {
+  position: absolute;
+  z-index: 400;
+  min-width: 160px;
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-modal);
+  padding: 0.25rem;
+  outline: none;
+  animation: pop-in-sm 0.12s ease;
+}
+
+/* Placement variants */
+.popover--bottom-end {
+  top: calc(100% + 6px);
+  right: 0;
+}
+
+.popover--bottom-start {
+  top: calc(100% + 6px);
+  left: 0;
+}
+
+.popover--top-end {
+  bottom: calc(100% + 6px);
+  right: 0;
+}
+
+.popover--top-start {
+  bottom: calc(100% + 6px);
+  left: 0;
+}
+
+/* Popover menu items (consumers apply these) */
+.popover-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  background: none;
+  border: none;
+  width: 100%;
+  text-align: left;
+  transition: background-color 0.1s;
+}
+
+.popover-item:hover {
+  background-color: var(--bg-subtle);
+}
+
+.popover-item--danger {
+  color: var(--error);
+}
+
+.popover-item--danger:hover {
+  background-color: var(--error-subtle);
+}
+
+/* ─── Animations (already defined in forms.css — guard with @keyframes only if missing) ── */
+
+@keyframes pop-in-sm {
+  from { transform: scale(0.96); opacity: 0; }
+  to   { transform: scale(1);    opacity: 1; }
+}

@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.rusty/memory/
+
+# Secrets and local configuration
+.env
+.env.*
+*.env
+appsettings.json
+appsettings.*.json
+
+# Build outputs and generated artifacts
+build/
+out/
+release/
+debug/
+coverage/
+*.tsbuildinfo
+
+# Rust/Tauri build directories
+target/
+target-*/
+src-tauri/target/

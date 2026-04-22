@@ -1,0 +1,475 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Run Panel styles  (RUSTYAGE-18)
+   Live streaming agent output, tool call display & approval gates.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ---------------------------------------------------------------------------
+   Panel shell
+   --------------------------------------------------------------------------- */
+
+.rp {
+  position: relative;   /* anchor for .rp__jump-btn */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-base);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+/* ---------------------------------------------------------------------------
+   Header
+   --------------------------------------------------------------------------- */
+
+.rp__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 14px;
+  min-height: 44px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+
+.rp__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.rp__header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* Status badge in header */
+.rp__status-badge {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 100px;
+}
+
+.rp__status-badge[data-status="idle"]      { color: var(--text-secondary); background: var(--bg-subtle); }
+.rp__status-badge[data-status="running"]   { color: var(--accent);  background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.rp__status-badge[data-status="complete"]  { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+.rp__status-badge[data-status="cancelled"] { color: var(--text-secondary); background: var(--bg-subtle); }
+.rp__status-badge[data-status="failed"]    { color: var(--error);   background: color-mix(in srgb, var(--error) 12%, transparent); }
+
+/* ---------------------------------------------------------------------------
+   Log scroll area
+   --------------------------------------------------------------------------- */
+
+.rp__log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 0;
+  min-height: 0;
+  scroll-behavior: auto;
+}
+
+.rp__idle-msg {
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* Blinking cursor that appears at end of active streaming text */
+.rp__cursor {
+  display: inline-block;
+  width: 2px;
+  height: 13px;
+  background: var(--accent);
+  border-radius: 1px;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  animation: rp-blink 1s step-end infinite;
+}
+
+@keyframes rp-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+/* ---------------------------------------------------------------------------
+   Jump-to-bottom pill
+   --------------------------------------------------------------------------- */
+
+.rp__jump-btn {
+  position: absolute;
+  bottom: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 100px;
+  padding: 5px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.30);
+  z-index: 10;
+  white-space: nowrap;
+  animation: fade-in 0.15s ease;
+}
+
+.rp__jump-btn:hover { opacity: 0.85; }
+
+/* ---------------------------------------------------------------------------
+   Footer
+   --------------------------------------------------------------------------- */
+
+.rp__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  min-height: 44px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+
+.rp__footer-left  { display: flex; align-items: center; gap: 6px; }
+.rp__footer-right { display: flex; align-items: center; gap: 8px; }
+
+.rp__duration {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.rp__autoscroll-btn {
+  font-size: 11px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 9px;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: color 0.1s, border-color 0.1s;
+}
+
+.rp__autoscroll-btn--on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.rp__autoscroll-btn:hover { color: var(--text-primary); }
+
+/* ---------------------------------------------------------------------------
+   Event rows — shared base
+   --------------------------------------------------------------------------- */
+
+.rp-row {
+  padding: 5px 16px;
+  border-left: 2px solid transparent;
+  line-height: 1.55;
+}
+
+/* ---------------------------------------------------------------------------
+   Token row — streaming assistant text
+   --------------------------------------------------------------------------- */
+
+.rp-row--token {
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding-left: 18px;
+  border-left-color: transparent;
+}
+
+/* ---------------------------------------------------------------------------
+   Shared row header / label
+   --------------------------------------------------------------------------- */
+
+.rp-row__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.rp-row__icon {
+  font-size: 12px;
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+
+.rp-row__label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);  /* default; overridden by parent modifier */
+}
+
+/* Label colour by row type (via parent class) */
+.rp-row--tool-call    .rp-row__label { color: var(--warning); }
+.rp-row--complete     .rp-row__label { color: var(--success); }
+.rp-row--cancelled    .rp-row__label { color: var(--text-secondary); }
+.rp-row--failed       .rp-row__label { color: var(--error); }
+
+/* Label colour modifiers used directly on the element */
+.rp-row__label--error    { color: var(--error) !important; }
+.rp-row__label--approval { color: var(--warning) !important; }
+.rp-row__label--human    { color: var(--accent) !important; }
+
+.rp-row__tool-name {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+
+.rp-row__chevron {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.rp-row__status-text {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.rp-row__body {
+  margin-top: 4px;
+  padding-left: 22px;
+}
+
+/* ---------------------------------------------------------------------------
+   Tool call row
+   --------------------------------------------------------------------------- */
+
+.rp-row--tool-call {
+  border-left-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 4%, var(--bg-base));
+}
+
+.rp-row__toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 4px 0;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+
+.rp-row__toggle:hover .rp-row__tool-name { text-decoration: underline; }
+
+/* ---------------------------------------------------------------------------
+   Tool result row
+   --------------------------------------------------------------------------- */
+
+.rp-row--tool-result {
+  border-left-color: var(--border);
+}
+
+.rp-row--tool-result.rp-row--error {
+  border-left-color: var(--error);
+  background: color-mix(in srgb, var(--error) 5%, var(--bg-base));
+}
+
+.rp-row__output pre {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.rp-row__expand-btn {
+  display: block;
+  margin-top: 5px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+  padding: 0;
+}
+
+.rp-row__expand-btn:hover { text-decoration: underline; }
+
+/* ---------------------------------------------------------------------------
+   Status rows — complete / cancelled / failed
+   --------------------------------------------------------------------------- */
+
+.rp-row--failed {
+  border-left-color: var(--error);
+  background: color-mix(in srgb, var(--error) 5%, var(--bg-base));
+}
+
+.rp-row--complete {
+  border-left-color: var(--success);
+  background: color-mix(in srgb, var(--success) 4%, var(--bg-base));
+}
+
+/* ---------------------------------------------------------------------------
+   Approval gate row
+   --------------------------------------------------------------------------- */
+
+.rp-row--approval {
+  border-left-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 6%, var(--bg-base));
+}
+
+.rp-row__approval-prompt {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  color: var(--text-primary);
+}
+
+.rp-row__approval-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0 0 8px;
+}
+
+.rp-row__approval-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.rp-row__approval-result {
+  margin: 8px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* ---------------------------------------------------------------------------
+   Human input row
+   --------------------------------------------------------------------------- */
+
+.rp-row--human-input {
+  border-left-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-base));
+}
+
+.rp-row__human-prompt {
+  font-size: 13px;
+  font-style: italic;
+  color: var(--text-primary);
+  margin: 0 0 10px;
+}
+
+.rp-row__human-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.rp-row__human-response {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 6px 0 0;
+}
+
+/* ---------------------------------------------------------------------------
+   JSON viewer
+   --------------------------------------------------------------------------- */
+
+.json-viewer {
+  position: relative;
+  margin-top: 4px;
+}
+
+.json-viewer__pre {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.json-viewer__copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  font-size: 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 7px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.json-viewer:hover .json-viewer__copy { opacity: 1; }
+.json-viewer__copy:hover               { color: var(--text-primary); }
+
+/* ---------------------------------------------------------------------------
+   Token counter (header widget)
+   --------------------------------------------------------------------------- */
+
+.token-counter {
+  position: relative;
+  cursor: default;
+}
+
+.token-counter__value {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.token-counter__tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+  z-index: 100;
+  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
+}
+
+.token-counter__note {
+  color: var(--text-muted);
+  margin-top: 3px;
+  font-style: italic;
+}

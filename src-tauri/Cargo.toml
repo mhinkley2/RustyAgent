@@ -1,0 +1,71 @@
+[workspace]
+members = [
+    ".",
+    "crates/api",
+    "crates/runtime",
+    "crates/tools",
+    "crates/memory",
+    "crates/db",
+    "crates/scheduler",
+    "crates/pipeline",
+    "crates/commands",
+    "crates/workspace",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tauri = { version = "2", features = [] }
+cron = "0.13"
+dashmap = "6"
+
+[package]
+name = "rustyagentrustyagent"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+default-run = "rustyagentrustyagent"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "rustyagentrustyagent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+commands = { path = "crates/commands" }
+api = { path = "crates/api" }
+db = { path = "crates/db" }
+scheduler = { path = "crates/scheduler" }
+runtime = { path = "crates/runtime" }
+pipeline = { path = "crates/pipeline" }
+tools = { path = "crates/tools" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+

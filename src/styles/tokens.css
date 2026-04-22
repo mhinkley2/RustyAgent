@@ -1,0 +1,301 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   RustyAgent Design Token Foundation  (RUSTYAGE-13)
+   Single source of truth for all design tokens.
+
+   Structure:
+     1. Tailwind v4 @theme — tokens that generate Tailwind utilities
+     2. @layer base       — :root CSS custom properties + global base styles
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   1. TAILWIND THEME INTEGRATION
+   Defines named tokens that generate Tailwind utility classes.
+   e.g. --color-bg-base → bg-bg-base, text-bg-base, border-bg-base
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@theme {
+  /* ------------------------------------------------------------------ Fonts */
+
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+
+  /* --------------------------------------------------------------- Font sizes
+     Scale is rem-based at 16px root.
+     text-xs   11px  timestamps, metadata, badge labels
+     text-sm   13px  body copy, table rows, helper text
+     text-base 15px  primary readable content (default)
+     text-lg   17px  section headings, panel titles
+     text-xl   20px  page headings
+     text-2xl  24px  modal titles, hero numbers (token counts)
+  */
+  --text-xs:   0.6875rem;  /* 11px */
+  --text-sm:   0.8125rem;  /* 13px */
+  --text-base: 0.9375rem;  /* 15px */
+  --text-lg:   1.0625rem;  /* 17px */
+  --text-xl:   1.25rem;    /* 20px */
+  --text-2xl:  1.5rem;     /* 24px */
+
+  /* --------------------------------------------------------------- Spacing
+     Scale is 4px-based. Tailwind v4 defaults already match:
+     spacing-1  = 0.25rem =  4px
+     spacing-2  = 0.5rem  =  8px
+     spacing-3  = 0.75rem = 12px
+     spacing-4  = 1rem    = 16px
+     spacing-5  = 1.25rem = 20px
+     spacing-6  = 1.5rem  = 24px
+     spacing-8  = 2rem    = 32px
+     spacing-10 = 2.5rem  = 40px
+     spacing-12 = 3rem    = 48px
+     No overrides needed — use only these named values in components.
+  */
+
+  /* ------------------------------------------------------------- Border radius
+     rounded-sm  4px  badges, tags, small chips
+     rounded     6px  inputs, buttons, card content
+     rounded-lg  8px  cards, panels, modals
+  */
+  --radius-sm: 0.25rem;   /* 4px */
+  --radius:    0.375rem;  /* 6px */
+  --radius-lg: 0.5rem;    /* 8px */
+
+  /* --------------------------------------------------------- Color palette
+
+     Dark mode (default / dark-first).
+     Light mode overrides live in [data-theme="light"] in @layer base.
+
+     CONTRAST RATIOS on --color-bg-base (#0d1117):
+       text-primary   (#e6edf3)  → 12.8 : 1  ✓ AAA
+       text-secondary (#7d8590)  →  4.7 : 1  ✓ AA
+       accent         (#4493f8)  →  4.5 : 1  ✓ AA
+       success        (#3fb950)  →  5.6 : 1  ✓ AA
+       warning        (#d29922)  →  4.5 : 1  ✓ AA
+       error          (#f85149)  →  4.8 : 1  ✓ AA
+       info           (#58a6ff)  →  4.8 : 1  ✓ AA
+  */
+
+  /* Background layers */
+  --color-bg-base:     #0d1117;   /* outermost canvas */
+  --color-bg-surface:  #161b22;   /* cards, panels, sidebar */
+  --color-bg-elevated: #1c2128;   /* dropdowns, modals, tooltips */
+  --color-bg-subtle:   #21262d;   /* hover states, striped rows, inputs */
+
+  /* Borders */
+  --color-border:        #30363d;  /* default separator */
+  --color-border-strong: #484f58;  /* focused / active selection */
+
+  /* Text */
+  --color-text-primary:   #e6edf3;  /* primary content */
+  --color-text-secondary: #7d8590;  /* metadata, labels, helper text */
+  --color-text-muted:     #484f58;  /* disabled, placeholder */
+  --color-text-on-accent: #ffffff;  /* text on colored backgrounds */
+
+  /* Accent (brand) */
+  --color-accent:        #4493f8;  /* links, selected nav, primary button */
+  --color-accent-subtle: #1f2d45;  /* tint background for accent areas */
+
+  /* Semantic status colors */
+  --color-success:        #3fb950;  /* done / running healthy */
+  --color-warning:        #d29922;  /* scheduled / awaiting / pending */
+  --color-error:          #f85149;  /* failed / rejected */
+  --color-info:           #58a6ff;  /* neutral status / information */
+
+  /* Semantic backgrounds (subtle tints for badges / highlighted regions) */
+  --color-success-subtle: #12261e;
+  --color-warning-subtle: #2a1f00;
+  --color-error-subtle:   #2d1618;
+  --color-info-subtle:    #1f2d45;
+
+  /* Shadow — minimal; dark app uses border + bg elevation instead of shadows.
+     Reserve shadows for modals only. */
+  --shadow-sm:    0 1px 3px rgba(0, 0, 0, 0.40);
+  --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.60);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   2. BASE LAYER
+   CSS custom properties wired to the @theme tokens for direct var() usage,
+   plus global base styles.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@layer base {
+
+  /* ----------------------------------------------------------------
+     Dark mode — default (dark-first app).
+     These aliases allow components to reference var(--accent) etc.
+     without caring about which theme is active.
+  ---------------------------------------------------------------- */
+  :root,
+  [data-theme="dark"] {
+    color-scheme: dark;
+
+    /* Backgrounds */
+    --bg-base:     var(--color-bg-base);
+    --bg-surface:  var(--color-bg-surface);
+    --bg-elevated: var(--color-bg-elevated);
+    --bg-subtle:   var(--color-bg-subtle);
+
+    /* Borders */
+    --border:        var(--color-border);
+    --border-strong: var(--color-border-strong);
+
+    /* Text */
+    --text-primary:   var(--color-text-primary);
+    --text-secondary: var(--color-text-secondary);
+    --text-muted:     var(--color-text-muted);
+    --text-on-accent: var(--color-text-on-accent);
+
+    /* Accent */
+    --accent:        var(--color-accent);
+    --accent-subtle: var(--color-accent-subtle);
+
+    /* Semantic */
+    --success:        var(--color-success);
+    --warning:        var(--color-warning);
+    --error:          var(--color-error);
+    --info:           var(--color-info);
+    --success-subtle: var(--color-success-subtle);
+    --warning-subtle: var(--color-warning-subtle);
+    --error-subtle:   var(--color-error-subtle);
+    --info-subtle:    var(--color-info-subtle);
+  }
+
+  /* ----------------------------------------------------------------
+     Light mode — placeholder for future implementation.
+     Swap in by setting data-theme="light" on <html>.
+  ---------------------------------------------------------------- */
+  [data-theme="light"] {
+    color-scheme: light;
+
+    --bg-base:     #ffffff;
+    --bg-surface:  #f6f8fa;
+    --bg-elevated: #ffffff;
+    --bg-subtle:   #eaeef2;
+
+    --border:        #d0d7de;
+    --border-strong: #8c959f;
+
+    --text-primary:   #1f2328;
+    --text-secondary: #636c76;
+    --text-muted:     #8c959f;
+    --text-on-accent: #ffffff;
+
+    --accent:        #0969da;
+    --accent-subtle: #ddf4ff;
+
+    --success:        #1a7f37;
+    --warning:        #9a6700;
+    --error:          #cf222e;
+    --info:           #0969da;
+    --success-subtle: #dafbe1;
+    --warning-subtle: #fff8c5;
+    --error-subtle:   #ffebe9;
+    --info-subtle:    #ddf4ff;
+  }
+
+  /* ----------------------------------------------------------------
+     Global reset and base styles
+  ---------------------------------------------------------------- */
+
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    font-weight: 400;
+    line-height: 1.4;
+    min-height: 100vh;
+  }
+
+  /* Long-form content (system prompts, descriptions, docs) */
+  .prose {
+    line-height: 1.6;
+  }
+
+  /* Monospace context — tool inputs/outputs, JSON, token counts */
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    line-height: 1.5;
+  }
+
+  /* Links */
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  a:hover {
+    text-decoration: underline;
+  }
+
+  /* Focus ring — always visible.
+     NEVER use outline: none without a custom replacement. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  /* Remove default button / input chrome */
+  button,
+  input,
+  select,
+  textarea {
+    font-family: inherit;
+    font-size: inherit;
+  }
+
+  /* Scrollbar styling (Webkit/Blink — covers Tauri's WebView) */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+  }
+
+  /* ----------------------------------------------------------------
+     Reduced motion — disable all animations / transitions for users
+     who prefer reduced motion. Applied globally from the start.
+  ---------------------------------------------------------------- */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

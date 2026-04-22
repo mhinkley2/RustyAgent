@@ -1,0 +1,23 @@
+# Context Notes
+
+- [RustyAgent Feature Planning](./rustyagent-feature-planning-74f306a6.md)
+- [Feature: Multi-Agent Chat UI](./feature-multi-agent-chat-ui-e2fa078a.md)
+- [Feature: Agent Tabs / Grid View](./feature-agent-tabs-grid-view-f8f6a730.md)
+- [Feature: Git Diffs View](./feature-git-diffs-view-d2edf994.md)
+- [Feature: Local Agent Execution](./feature-local-agent-execution-89896fa0.md)
+- [Feature: MCP Integration](./feature-mcp-integration-8b031b80.md)
+- [Feature: Multiple Model Support](./feature-multiple-model-support-9e691691.md)
+- [Feature: Automations (Local)](./feature-automations-local-ad3fa203.md)
+- [Feature: Conversation History &amp; Search](./feature-conversation-history-amp-search-edec381f.md)
+- [Feature: Integrated Browser / WebView](./feature-integrated-browser-webview-7dbda208.md)
+- [Feature: Design Mode (UI Annotation)](./feature-design-mode-ui-annotation-68c36aa6.md)
+- [Feature: PR Management](./feature-pr-management-a989a91b.md)
+- [Feature: Streaming Responses](./feature-streaming-responses-04808654.md)
+- [parent-test](./parent-test-6a3d27f7.md)
+- [child-test](./child-test-e03fd11c.md)
+- [parent-test](./parent-test-bec73ebe.md)
+- [child-test](./child-test-4c05cd89.md)
+- [Product Vision & PRD — RustyAgent](./product-vision-prd-rustyagent-0bb99f93.md)
+- [Architecture Decisions — RustyAgent](./architecture-decisions-rustyagent-d486dd7b.md)
+- [Design Token Reference (RUSTYAGE-13)](./design-token-reference-rustyage-13-2482f6ae.md)
+
