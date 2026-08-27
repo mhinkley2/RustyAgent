@@ -3,7 +3,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -119,14 +118,14 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> ToolBinding {
 // get_mcp_servers
 // ---------------------------------------------------------------------------
 
-pub async fn get_mcp_servers(db: State<'_, DbPool>) -> Result<Vec<McpServer>, String> {
+pub async fn get_mcp_servers(db: &DbPool) -> Result<Vec<McpServer>, String> {
     let rows = sqlx::query(
         "SELECT id, name, command, args, env_vars, auto_restart, max_restart_attempts,
                 created_at, updated_at
          FROM mcp_servers
          ORDER BY name ASC",
     )
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -137,14 +136,14 @@ pub async fn get_mcp_servers(db: State<'_, DbPool>) -> Result<Vec<McpServer>, St
 // get_mcp_server
 // ---------------------------------------------------------------------------
 
-pub async fn get_mcp_server(id: String, db: State<'_, DbPool>) -> Result<McpServer, String> {
+pub async fn get_mcp_server(id: String, db: &DbPool) -> Result<McpServer, String> {
     let row = sqlx::query(
         "SELECT id, name, command, args, env_vars, auto_restart, max_restart_attempts,
                 created_at, updated_at
          FROM mcp_servers WHERE id = ?",
     )
     .bind(&id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?
     .ok_or_else(|| format!("MCP server '{id}' not found"))?;
@@ -158,7 +157,7 @@ pub async fn get_mcp_server(id: String, db: State<'_, DbPool>) -> Result<McpServ
 
 pub async fn create_mcp_server(
     input: CreateMcpServerInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<McpServer, String> {
     let id = Uuid::new_v4().to_string();
     let args_json =
@@ -182,7 +181,7 @@ pub async fn create_mcp_server(
     .bind(&env_json)
     .bind(auto_restart)
     .bind(max_restart)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -196,10 +195,10 @@ pub async fn create_mcp_server(
 pub async fn update_mcp_server(
     id: String,
     input: UpdateMcpServerInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<McpServer, String> {
     // Load current values then merge.
-    let current = get_mcp_server(id.clone(), db.clone()).await?;
+    let current = get_mcp_server(id.clone(), db).await?;
 
     let name = input.name.unwrap_or(current.name);
     let command = input.command.unwrap_or(current.command);
@@ -225,7 +224,7 @@ pub async fn update_mcp_server(
     .bind(auto_restart)
     .bind(max_restart)
     .bind(&id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB update error: {e}"))?;
 
@@ -236,10 +235,10 @@ pub async fn update_mcp_server(
 // delete_mcp_server
 // ---------------------------------------------------------------------------
 
-pub async fn delete_mcp_server(id: String, db: State<'_, DbPool>) -> Result<(), String> {
+pub async fn delete_mcp_server(id: String, db: &DbPool) -> Result<(), String> {
     sqlx::query("DELETE FROM mcp_servers WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())
@@ -251,7 +250,7 @@ pub async fn delete_mcp_server(id: String, db: State<'_, DbPool>) -> Result<(), 
 
 pub async fn get_tool_bindings(
     agent_profile_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<ToolBinding>, String> {
     let rows = sqlx::query(
         "SELECT atb.id, atb.agent_profile_id, atb.mcp_server_id,
@@ -263,7 +262,7 @@ pub async fn get_tool_bindings(
          ORDER BY ms.name ASC",
     )
     .bind(&agent_profile_id)
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -276,7 +275,7 @@ pub async fn get_tool_bindings(
 
 pub async fn create_tool_binding(
     input: CreateToolBindingInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<ToolBinding, String> {
     let id = Uuid::new_v4().to_string();
     let allowed_json: Option<String> = input
@@ -293,7 +292,7 @@ pub async fn create_tool_binding(
     .bind(&input.agent_profile_id)
     .bind(&input.mcp_server_id)
     .bind(&allowed_json)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -306,7 +305,7 @@ pub async fn create_tool_binding(
          WHERE atb.id = ?",
     )
     .bind(&id)
-    .fetch_one(db.inner())
+    .fetch_one(db)
     .await
     .map_err(|e| format!("DB fetch error: {e}"))?;
 
@@ -317,10 +316,10 @@ pub async fn create_tool_binding(
 // delete_tool_binding
 // ---------------------------------------------------------------------------
 
-pub async fn delete_tool_binding(id: String, db: State<'_, DbPool>) -> Result<(), String> {
+pub async fn delete_tool_binding(id: String, db: &DbPool) -> Result<(), String> {
     sqlx::query("DELETE FROM agent_tool_bindings WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())
@@ -333,7 +332,7 @@ pub async fn delete_tool_binding(id: String, db: State<'_, DbPool>) -> Result<()
 pub async fn update_tool_binding_allowed_tools(
     id: String,
     allowed_tools: Option<Vec<String>>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<ToolBinding, String> {
     let allowed_json: Option<String> = allowed_tools
         .as_ref()
@@ -344,7 +343,7 @@ pub async fn update_tool_binding_allowed_tools(
     )
     .bind(&allowed_json)
     .bind(&id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB update error: {e}"))?;
 
@@ -357,7 +356,7 @@ pub async fn update_tool_binding_allowed_tools(
          WHERE atb.id = ?",
     )
     .bind(&id)
-    .fetch_one(db.inner())
+    .fetch_one(db)
     .await
     .map_err(|e| format!("DB fetch error: {e}"))?;
 

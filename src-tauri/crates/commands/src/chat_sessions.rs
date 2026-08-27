@@ -1,7 +1,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSessionSummary {
@@ -26,7 +25,7 @@ pub struct ChatSessionMessage {
 pub async fn create_chat_session(
     workspace_id: Option<String>,
     title: Option<String>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<ChatSessionSummary, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let title = title
@@ -41,7 +40,7 @@ pub async fn create_chat_session(
     .bind(&id)
     .bind(&title)
     .bind(&workspace_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error creating chat session: {e}"))?;
 
@@ -58,7 +57,7 @@ pub async fn create_chat_session(
 pub async fn list_chat_sessions(
     workspace_id: Option<String>,
     limit: Option<i64>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<ChatSessionSummary>, String> {
     let mut conditions: Vec<String> = vec!["s.story_type = 'chat'".to_string()];
     let mut binds: Vec<String> = Vec::new();
@@ -103,7 +102,7 @@ pub async fn list_chat_sessions(
     q = q.bind(limit.unwrap_or(50));
 
     let rows = q
-        .fetch_all(db.inner())
+        .fetch_all(db)
         .await
         .map_err(|e| format!("DB error listing chat sessions: {e}"))?;
 
@@ -133,7 +132,7 @@ pub async fn list_chat_sessions(
 
 pub async fn get_chat_session_messages(
     session_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<ChatSessionMessage>, String> {
     let rows = sqlx::query(
         "SELECT id, session_id, role, content, agent_profile_id, created_at
@@ -142,7 +141,7 @@ pub async fn get_chat_session_messages(
          ORDER BY created_at ASC, id ASC",
     )
     .bind(&session_id)
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error loading chat session messages: {e}"))?;
 
@@ -164,7 +163,7 @@ pub async fn append_chat_session_message(
     role: String,
     content: String,
     agent_profile_id: Option<String>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     if content.trim().is_empty() {
         return Ok(());
@@ -186,13 +185,13 @@ pub async fn append_chat_session_message(
     .bind(&role)
     .bind(&content)
     .bind(agent_profile_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error appending chat message: {e}"))?;
 
     sqlx::query("UPDATE stories SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(&session_id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB error touching chat session timestamp: {e}"))?;
 

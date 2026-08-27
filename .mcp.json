@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rustyagent-board": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${RUSTYAGENT_MCP_TOKEN}"
+      }
+    }
+  }
+}

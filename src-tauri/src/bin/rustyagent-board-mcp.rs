@@ -1,39 +1,40 @@
-use std::env;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
-use std::path::PathBuf;
+//! Standalone MCP server over stdio.
+//!
+//! Serves everything backed by the database, so it works with the RustyAgent
+//! desktop app closed. Tools that need live in-app state (scheduler status,
+//! pipeline progress) are hidden here and refused if called — use the HTTP
+//! transport the app hosts for those.
+//!
+//! Diagnostics go to stderr only: stdout carries the framed protocol and
+//! nothing else.
 
-use api::ToolDefinition;
-use serde::Serialize;
-use serde_json::{json, Value};
-use tools::builtin::story::{
-    CreateStoryTool, DeleteStoryTool, GetStoryTool, ListStoriesTool, UpdateStoryStatusTool,
-    UpdateStoryTool,
+use std::{
+    env,
+    io::{self, BufReader},
+    path::PathBuf,
 };
-use tools::{ToolContext, ToolOutput, ToolRegistry};
 
-const JSON_RPC_VERSION: &str = "2.0";
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-const LIST_WORKSPACES_TOOL: &str = "list_workspaces";
-const GET_ACTIVE_WORKSPACE_TOOL: &str = "get_active_workspace";
-const USE_WORKSPACE_TOOL: &str = "use_workspace";
+use board_mcp::{transport::stdio, McpCtx};
 
-#[derive(Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+/// The app's Tauri config, embedded at compile time.
+///
+/// The app-data directory is named after the bundle identifier, so this binary
+/// has to agree with the app about it or the two open different databases.
+/// Reading it from the same file the app is built from makes that impossible to
+/// get wrong — a previously hardcoded identifier had already drifted, leaving
+/// this binary pointed at a stale database.
+const TAURI_CONF: &str = include_str!("../../tauri.conf.json");
+
+fn bundle_identifier() -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(TAURI_CONF)
+        .map_err(|error| format!("Failed to parse tauri.conf.json: {error}"))?
+        .get("identifier")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "tauri.conf.json has no \"identifier\" field".to_string())
 }
 
-#[derive(Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
+/// Locate the database, matching where the desktop app puts it.
 fn default_db_path() -> Result<PathBuf, String> {
     if let Ok(path) = env::var("RUSTYAGENT_DB_PATH") {
         if !path.trim().is_empty() {
@@ -41,434 +42,101 @@ fn default_db_path() -> Result<PathBuf, String> {
         }
     }
 
+    let identifier = bundle_identifier()?;
+
     if let Ok(appdata) = env::var("APPDATA") {
-        return Ok(PathBuf::from(appdata).join("com.rustyagent.dev").join("rustyagent.db"));
+        return Ok(PathBuf::from(appdata)
+            .join(&identifier)
+            .join("rustyagent.db"));
     }
-
     if let Ok(home) = env::var("HOME") {
-        return Ok(PathBuf::from(home).join(".local").join("share").join("com.rustyagent.dev").join("rustyagent.db"));
+        return Ok(PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join(&identifier)
+            .join("rustyagent.db"));
+    }
+    Err("Unable to determine the RustyAgent database path. Set RUSTYAGENT_DB_PATH.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bundle_identifier_is_read_from_the_apps_own_config() {
+        let identifier = bundle_identifier().expect("tauri.conf.json must declare an identifier");
+
+        assert!(!identifier.is_empty());
+        assert!(
+            identifier.contains("rustyagent"),
+            "unexpected identifier: {identifier}"
+        );
     }
 
-    Err("Unable to determine RustyAgent database path. Set RUSTYAGENT_DB_PATH.".to_string())
-}
+    #[test]
+    fn the_default_db_path_lands_under_the_bundle_identifier() {
+        // Guards the drift that pointed this binary at a stale database.
+        env::remove_var("RUSTYAGENT_DB_PATH");
+        let identifier = bundle_identifier().expect("identifier");
 
-async fn resolve_workspace_root(db: &db::DbPool) -> Option<PathBuf> {
-    if let Ok(path) = env::var("RUSTYAGENT_WORKSPACE_PATH") {
-        if !path.trim().is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    db::get_active_workspace_path(db).await
-}
+        let path = default_db_path().expect("db path");
 
-fn build_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(ListStoriesTool));
-    registry.register(Box::new(GetStoryTool));
-    registry.register(Box::new(CreateStoryTool));
-    registry.register(Box::new(UpdateStoryTool));
-    registry.register(Box::new(UpdateStoryStatusTool));
-    registry.register(Box::new(DeleteStoryTool));
-    registry
-}
-
-fn tool_to_mcp(definition: ToolDefinition) -> Value {
-    json!({
-        "name": definition.name,
-        "description": definition.description,
-        "inputSchema": definition.input_schema,
-    })
-}
-
-fn workspace_tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "name": LIST_WORKSPACES_TOOL,
-            "description": "List known RustyAgent workspaces ordered by most recently used. Use this before switching board scope.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": GET_ACTIVE_WORKSPACE_TOOL,
-            "description": "Return the workspace currently used for board CRUD in this MCP server session.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
-        json!({
-            "name": USE_WORKSPACE_TOOL,
-            "description": "Switch board CRUD to a specific workspace path for the rest of this MCP server session.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative filesystem path to the workspace folder to use."
-                    }
-                },
-                "required": ["path"]
-            }
-        }),
-    ]
-}
-
-fn normalize_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
-}
-
-fn resolve_workspace_input(path: &str) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return Err("Missing required field: path".to_string());
+        assert!(
+            path.to_string_lossy().contains(&identifier),
+            "{} should sit under {identifier}",
+            path.display()
+        );
+        assert!(path.ends_with("rustyagent.db"));
     }
 
-    let raw = PathBuf::from(trimmed);
-    let candidate = if raw.is_absolute() {
-        raw
-    } else {
-        env::current_dir()
-            .map_err(|error| format!("Failed to resolve relative workspace path: {error}"))?
-            .join(raw)
-    };
+    #[test]
+    fn an_explicit_db_path_overrides_the_default() {
+        env::set_var("RUSTYAGENT_DB_PATH", "/tmp/custom.db");
+        let path = default_db_path().expect("db path");
+        env::remove_var("RUSTYAGENT_DB_PATH");
 
-    if !candidate.exists() {
-        return Err(format!("Workspace path does not exist: {}", candidate.display()));
+        assert_eq!(path, PathBuf::from("/tmp/custom.db"));
     }
-    if !candidate.is_dir() {
-        return Err(format!("Workspace path is not a directory: {}", candidate.display()));
-    }
-
-    candidate
-        .canonicalize()
-        .map_err(|error| format!("Failed to normalize workspace path '{}': {error}", candidate.display()))
 }
 
-fn list_workspaces_result(
-    runtime: &tokio::runtime::Runtime,
-    db: &db::DbPool,
-    current_workspace_root: Option<&PathBuf>,
-) -> Result<Value, String> {
-    let current_path = current_workspace_root.map(|path| normalize_path(path));
-    let workspaces = runtime
-        .block_on(db::list_workspaces(db))
-        .map_err(|error| format!("Failed to list workspaces: {error}"))?;
+async fn run() -> Result<(), String> {
+    let db_path = default_db_path()?;
+    let app_data_dir = db_path.parent().map(PathBuf::from);
 
-    Ok(tool_output_to_result(ToolOutput::ok(
-        serde_json::to_string(&json!({
-            "workspaces": workspaces
-                .into_iter()
-                .map(|workspace| {
-                    json!({
-                        "id": workspace.id,
-                        "name": workspace.name,
-                        "path": workspace.path,
-                        "last_opened_at": workspace.last_opened_at,
-                        "created_at": workspace.created_at,
-                        "is_active": current_path.as_deref() == Some(workspace.path.as_str()),
-                    })
-                })
-                .collect::<Vec<_>>()
-        }))
-        .unwrap_or_else(|_| "{\"workspaces\":[]}".to_string()),
-    )))
-}
-
-fn get_active_workspace_result(current_workspace_root: Option<&PathBuf>) -> Value {
-    let workspace = current_workspace_root.map(|path| {
-        let normalized = normalize_path(path);
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&normalized)
-            .to_string();
-        json!({
-            "name": name,
-            "path": normalized,
-        })
-    });
-
-    tool_output_to_result(ToolOutput::ok(
-        serde_json::to_string(&json!({ "workspace": workspace }))
-            .unwrap_or_else(|_| "{\"workspace\":null}".to_string()),
-    ))
-}
-
-fn use_workspace_result(
-    runtime: &tokio::runtime::Runtime,
-    db: &db::DbPool,
-    params: &Value,
-    current_workspace_root: &mut Option<PathBuf>,
-) -> Result<Value, String> {
-    let path = params
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Missing required field: path".to_string())?;
-    let resolved = resolve_workspace_input(path)?;
-    let workspace = runtime
-        .block_on(db::touch_workspace(db, &resolved))
-        .map_err(|error| format!("Failed to activate workspace '{}': {error}", resolved.display()))?;
-
-    *current_workspace_root = Some(PathBuf::from(&workspace.path));
-
-    Ok(tool_output_to_result(ToolOutput::ok(
-        serde_json::to_string(&json!({
-            "workspace": {
-                "id": workspace.id,
-                "name": workspace.name,
-                "path": workspace.path,
-                "last_opened_at": workspace.last_opened_at,
-                "created_at": workspace.created_at,
-            }
-        }))
-        .unwrap_or_else(|_| "{\"workspace\":null}".to_string()),
-    )))
-}
-
-fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
-    let mut header_bytes = Vec::new();
-    let mut byte = [0_u8; 1];
-
-    loop {
-        let bytes = reader.read(&mut byte)?;
-        if bytes == 0 {
-            if header_bytes.is_empty() {
-                return Ok(None);
-            }
-
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Unexpected EOF while reading MCP headers",
-            ));
-        }
-
-        header_bytes.push(byte[0]);
-
-        if header_bytes.ends_with(b"\r\n\r\n") || header_bytes.ends_with(b"\n\n") {
-            break;
-        }
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create '{}': {error}", parent.display()))?;
     }
 
-    let header_text = String::from_utf8(header_bytes).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid MCP header encoding: {error}"))
-    })?;
+    let db = db::init_db(&db_path.to_string_lossy())
+        .await
+        .map_err(|error| format!("Failed to open the database: {error}"))?;
 
-    let mut content_length: Option<usize> = None;
-    for line in header_text.lines() {
-        let trimmed = line.trim_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            continue;
-        }
+    // No host bridge: this process is not the desktop app.
+    let ctx = McpCtx::new(db).with_app_data_dir(app_data_dir);
+    let registry = board_mcp::build_registry();
 
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if !name.trim().eq_ignore_ascii_case("Content-Length") {
-                continue;
-            }
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = io::stdout().lock();
 
-            let parsed = value.trim().parse::<usize>().map_err(|error| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("Invalid Content-Length: {error}"))
-            })?;
-            content_length = Some(parsed);
-        }
-    }
-
-    let length = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Missing Content-Length header")
-    })?;
-
-    let mut payload = vec![0_u8; length];
-    reader.read_exact(&mut payload)?;
-    let value = serde_json::from_slice::<Value>(&payload).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid JSON payload: {error}"))
-    })?;
-
-    Ok(Some(value))
-}
-
-fn write_message<W: Write>(writer: &mut W, body: &Value) -> io::Result<()> {
-    let payload = serde_json::to_vec(body)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to serialize JSON: {error}")))?;
-    write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
-    writer.write_all(&payload)?;
-    writer.flush()
-}
-
-fn success_response(id: Value, result: Value) -> Value {
-    serde_json::to_value(JsonRpcResponse {
-        jsonrpc: JSON_RPC_VERSION,
-        id,
-        result: Some(result),
-        error: None,
-    })
-    .unwrap_or_else(|_| json!({
-        "jsonrpc": JSON_RPC_VERSION,
-        "id": null,
-        "error": { "code": -32603, "message": "Failed to serialize response" }
-    }))
-}
-
-fn error_response(id: Value, code: i32, message: impl Into<String>) -> Value {
-    serde_json::to_value(JsonRpcResponse {
-        jsonrpc: JSON_RPC_VERSION,
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.into(),
-        }),
-    })
-    .unwrap_or_else(|_| json!({
-        "jsonrpc": JSON_RPC_VERSION,
-        "id": null,
-        "error": { "code": -32603, "message": "Failed to serialize response" }
-    }))
-}
-
-fn tool_output_to_result(output: ToolOutput) -> Value {
-    let parsed = serde_json::from_str::<Value>(&output.content).ok();
-    let text = if let Some(value) = parsed.as_ref() {
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| output.content.clone())
-    } else {
-        output.content.clone()
-    };
-
-    let mut result = json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text,
-            }
-        ],
-        "isError": output.is_error,
-    });
-
-    if let Some(value) = parsed {
-        result["structuredContent"] = value;
-    }
-
-    result
+    stdio::serve(&mut reader, &mut writer, ctx, &registry)
+        .await
+        .map_err(|error| format!("MCP stdio transport failed: {error}"))
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("rustyagent-board-mcp: {error}");
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Failed to start the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = runtime.block_on(run()) {
+        eprintln!("{error}");
         std::process::exit(1);
     }
-}
-
-fn run() -> Result<(), String> {
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| format!("Failed to create runtime: {error}"))?;
-    let db_path = default_db_path()?;
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create database directory '{}': {error}", parent.display()))?;
-    }
-    let db = runtime
-        .block_on(db::init_db(&db_path.to_string_lossy()))
-        .map_err(|error| format!("Failed to initialize database: {error}"))?;
-    let mut current_workspace_root = runtime.block_on(resolve_workspace_root(&db));
-    let registry = build_registry();
-
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = stdout.lock();
-
-    loop {
-        let Some(message) = read_message(&mut reader).map_err(|error| format!("Failed to read MCP message: {error}"))? else {
-            break;
-        };
-
-        let id = message.get("id").cloned().unwrap_or(Value::Null);
-        let method = message
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-
-        let response = match method.as_str() {
-            "initialize" => Some(success_response(id, json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {
-                    "tools": {
-                        "listChanged": false
-                    }
-                },
-                "serverInfo": {
-                    "name": "rustyagent-board-mcp",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }))),
-            "notifications/initialized" => None,
-            "ping" => Some(success_response(id, json!({}))),
-            "shutdown" => Some(success_response(id, Value::Null)),
-            "exit" => break,
-            "tools/list" => {
-                let mut tools = registry
-                    .all_definitions()
-                    .into_iter()
-                    .map(tool_to_mcp)
-                    .collect::<Vec<_>>();
-                tools.extend(workspace_tool_definitions());
-                Some(success_response(id, json!({ "tools": tools })))
-            }
-            "tools/call" => {
-                let tool_name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string());
-                let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-
-                match tool_name {
-                    Some(name) if name == LIST_WORKSPACES_TOOL => {
-                        match list_workspaces_result(&runtime, &db, current_workspace_root.as_ref()) {
-                            Ok(result) => Some(success_response(id, result)),
-                            Err(message) => Some(error_response(id, -32603, message)),
-                        }
-                    }
-                    Some(name) if name == GET_ACTIVE_WORKSPACE_TOOL => {
-                        Some(success_response(id, get_active_workspace_result(current_workspace_root.as_ref())))
-                    }
-                    Some(name) if name == USE_WORKSPACE_TOOL => {
-                        match use_workspace_result(&runtime, &db, &arguments, &mut current_workspace_root) {
-                            Ok(result) => Some(success_response(id, result)),
-                            Err(message) => Some(error_response(id, -32602, message)),
-                        }
-                    }
-                    Some(name) => {
-                        if let Some(tool) = registry.get_arc(&name) {
-                            let context = ToolContext {
-                                db: db.clone(),
-                                agent_profile_id: "rustyagent-board-mcp".to_string(),
-                                run_id: "rustyagent-board-mcp".to_string(),
-                                pipeline_run_id: None,
-                                pipeline_depth: 0,
-                                spawn_subtask: None,
-                                workspace_root: current_workspace_root.clone(),
-                            };
-                            let output = runtime.block_on(tool.execute(arguments, &context));
-                            Some(success_response(id, tool_output_to_result(output)))
-                        } else {
-                            Some(error_response(id, -32601, format!("Unknown tool: {name}")))
-                        }
-                    }
-                    None => Some(error_response(id, -32602, "Missing required field: params.name")),
-                }
-            }
-            _ if id.is_null() => None,
-            _ => Some(error_response(id, -32601, format!("Method not found: {method}"))),
-        };
-
-        if let Some(payload) = response {
-            write_message(&mut writer, &payload)
-                .map_err(|error| format!("Failed to write MCP response: {error}"))?;
-        }
-    }
-
-    Ok(())
 }

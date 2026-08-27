@@ -1,0 +1,36 @@
+[package]
+name = "board-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server exposing RustyAgent's board, run history, and agent state"
+
+[lib]
+name = "board_mcp"
+
+[dependencies]
+db = { path = "../db" }
+tools = { path = "../tools" }
+commands = { path = "../commands" }
+api = { path = "../api" }
+pipeline = { path = "../pipeline" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+
+# HTTP transport only.
+bytes = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+
+[features]
+default = []
+http = ["dep:bytes", "dep:http-body-util", "dep:hyper", "dep:hyper-util"]
+
+[dev-dependencies]
+db = { path = "../db", features = ["testing"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
+tempfile = "3"

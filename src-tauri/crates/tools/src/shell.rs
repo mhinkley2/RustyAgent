@@ -67,6 +67,29 @@ impl ShellCommandTool {
     }
 }
 
+/// Cap tool output at `MAX_OUTPUT_BYTES` to prevent context flooding.
+///
+/// The cut must land on a UTF-8 character boundary: slicing a `String` at a
+/// fixed byte offset panics whenever that offset falls mid-codepoint, which any
+/// command emitting non-ASCII output can trigger.
+fn truncate_output(combined: String) -> String {
+    if combined.len() <= MAX_OUTPUT_BYTES {
+        return combined;
+    }
+
+    let mut cut = MAX_OUTPUT_BYTES;
+    while cut > 0 && !combined.is_char_boundary(cut) {
+        cut -= 1;
+    }
+
+    format!(
+        "{}\n\n[Output truncated at {} KB. {} bytes omitted.]",
+        &combined[..cut],
+        MAX_OUTPUT_BYTES / 1024,
+        combined.len() - cut
+    )
+}
+
 #[async_trait]
 impl Tool for ShellCommandTool {
     fn name(&self) -> &str {
@@ -142,17 +165,7 @@ impl Tool for ShellCommandTool {
                     combined.push_str(&stderr);
                 }
 
-                // Cap output to prevent context flooding.
-                let truncated = if combined.len() > MAX_OUTPUT_BYTES {
-                    format!(
-                        "{}\n\n[Output truncated at {} KB. {} bytes omitted.]",
-                        &combined[..MAX_OUTPUT_BYTES],
-                        MAX_OUTPUT_BYTES / 1024,
-                        combined.len() - MAX_OUTPUT_BYTES
-                    )
-                } else {
-                    combined
-                };
+                let truncated = truncate_output(combined);
 
                 let exit_code = output.status.code().unwrap_or(-1);
                 if output.status.success() {
@@ -213,4 +226,333 @@ pub async fn load_for_agent(
             timeout_secs:     row.try_get::<i64, _>("timeout_secs").unwrap_or(30) as u64,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{make_ctx, make_test_pool};
+
+    fn tool(command: &str) -> ShellCommandTool {
+        ShellCommandTool {
+            id: "tool-1".into(),
+            tool_name: "run_it".into(),
+            tool_description: "runs it".into(),
+            command: command.into(),
+            working_dir: ".".into(),
+            timeout_secs: 30,
+        }
+    }
+
+    // -- output truncation --------------------------------------------------
+
+    #[test]
+    fn output_under_the_cap_is_returned_verbatim() {
+        let out = truncate_output("short output".to_string());
+        assert_eq!(out, "short output");
+    }
+
+    #[test]
+    fn output_exactly_at_the_cap_is_not_truncated() {
+        let payload = "a".repeat(MAX_OUTPUT_BYTES);
+        assert_eq!(truncate_output(payload.clone()), payload);
+    }
+
+    #[test]
+    fn output_over_the_cap_is_truncated_with_a_notice() {
+        let payload = "a".repeat(MAX_OUTPUT_BYTES + 500);
+        let out = truncate_output(payload);
+
+        assert!(out.contains("[Output truncated at 32 KB."));
+        assert!(out.contains("500 bytes omitted."));
+        assert!(out.starts_with(&"a".repeat(100)));
+    }
+
+    #[test]
+    fn output_over_32kb_is_truncated_without_panicking() {
+        // Regression: the cut was a fixed byte offset into a `String`, which
+        // panics when it lands mid-codepoint. "é" is two bytes, so a payload of
+        // them guarantees the boundary at MAX_OUTPUT_BYTES splits a character.
+        let payload = "é".repeat(MAX_OUTPUT_BYTES);
+        assert!(!payload.is_char_boundary(MAX_OUTPUT_BYTES + 1));
+
+        let out = truncate_output(payload);
+
+        assert!(out.contains("[Output truncated at 32 KB."));
+        // The kept prefix must still be valid UTF-8 made only of whole chars.
+        let kept = out.split("\n\n[Output truncated").next().unwrap();
+        assert!(kept.chars().all(|c| c == 'é'), "prefix was corrupted");
+    }
+
+    #[test]
+    fn a_multibyte_char_straddling_the_boundary_is_dropped_whole() {
+        // One ASCII byte short of the cap, then a 4-byte emoji straddling it.
+        let mut payload = "a".repeat(MAX_OUTPUT_BYTES - 1);
+        payload.push('🦀');
+        payload.push_str("trailing");
+
+        let out = truncate_output(payload);
+        let kept = out.split("\n\n[Output truncated").next().unwrap();
+
+        assert_eq!(kept.len(), MAX_OUTPUT_BYTES - 1);
+        assert!(!kept.contains('🦀'), "partial emoji must not be kept");
+    }
+
+    // -- argv splitting ------------------------------------------------------
+
+    #[test]
+    fn argv_splits_program_from_arguments() {
+        let (program, args) = tool("cargo test --workspace").argv().expect("argv");
+        assert_eq!(program, "cargo");
+        assert_eq!(args, vec!["test", "--workspace"]);
+    }
+
+    #[test]
+    fn argv_collapses_repeated_whitespace() {
+        let (program, args) = tool("  npm   run    build  ").argv().expect("argv");
+        assert_eq!(program, "npm");
+        assert_eq!(args, vec!["run", "build"]);
+    }
+
+    #[test]
+    fn argv_on_a_bare_program_yields_no_arguments() {
+        let (program, args) = tool("ls").argv().expect("argv");
+        assert_eq!(program, "ls");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn argv_on_an_empty_or_blank_command_is_none() {
+        assert!(tool("").argv().is_none());
+        assert!(tool("   \t  ").argv().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_returns_an_error_instead_of_executing() {
+        let ctx = make_ctx(make_test_pool().await);
+        let out = tool("").execute(json!({}), &ctx).await;
+
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("empty command"),
+            "got {:?}",
+            out.content
+        );
+    }
+
+    // -- working directory ---------------------------------------------------
+
+    #[test]
+    fn a_dot_working_dir_resolves_to_the_workspace_root() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = ".".into();
+
+        assert_eq!(t.resolve_working_dir(Some(&root)), root);
+    }
+
+    #[test]
+    fn an_empty_working_dir_resolves_to_the_workspace_root() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = String::new();
+
+        assert_eq!(t.resolve_working_dir(Some(&root)), root);
+    }
+
+    #[test]
+    fn a_relative_working_dir_is_joined_onto_the_workspace_root() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = "crates/api".into();
+
+        assert_eq!(
+            t.resolve_working_dir(Some(&root)),
+            PathBuf::from("/workspace/proj").join("crates/api")
+        );
+    }
+
+    #[test]
+    fn an_absolute_working_dir_overrides_the_workspace_root() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = if cfg!(windows) {
+            "C:\\elsewhere".into()
+        } else {
+            "/elsewhere".into()
+        };
+
+        assert_eq!(
+            t.resolve_working_dir(Some(&root)),
+            PathBuf::from(&t.working_dir)
+        );
+    }
+
+    // -- process outcomes ----------------------------------------------------
+
+    /// A command that exits non-zero on either platform.
+    fn failing_command() -> &'static str {
+        if cfg!(windows) {
+            "cmd /c exit 3"
+        } else {
+            "sh -c \"exit 3\""
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_command_with_no_output_reports_success() {
+        let ctx = make_ctx(make_test_pool().await);
+        let cmd = if cfg!(windows) {
+            "cmd /c rem"
+        } else {
+            "true"
+        };
+
+        let out = tool(cmd).execute(json!({}), &ctx).await;
+
+        assert!(!out.is_error, "got {:?}", out.content);
+        assert!(out.content.contains("completed successfully"));
+    }
+
+    #[tokio::test]
+    async fn a_nonzero_exit_is_an_error_carrying_the_exit_code() {
+        let ctx = make_ctx(make_test_pool().await);
+        let out = tool(failing_command()).execute(json!({}), &ctx).await;
+
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("exit code 3"),
+            "got {:?}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_program_is_an_error_not_a_panic() {
+        let ctx = make_ctx(make_test_pool().await);
+        let out = tool("definitely-not-a-real-program-xyz")
+            .execute(json!({}), &ctx)
+            .await;
+
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("Failed to start"),
+            "got {:?}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_exceeding_its_timeout_is_reported_as_a_timeout() {
+        let ctx = make_ctx(make_test_pool().await);
+        let mut t = tool(if cfg!(windows) {
+            // ping is the portable "sleep" on Windows without PowerShell.
+            "cmd /c ping -n 6 127.0.0.1"
+        } else {
+            "sleep 5"
+        });
+        t.timeout_secs = 1;
+
+        let out = t.execute(json!({}), &ctx).await;
+
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("timed out after 1 seconds"),
+            "got {:?}",
+            out.content
+        );
+    }
+
+    // -- loader --------------------------------------------------------------
+
+    async fn seed_tool(db: &db::DbPool, id: &str, name: &str, timeout_secs: i64) {
+        sqlx::query(
+            "INSERT INTO custom_tools (id, name, description, command, working_dir, timeout_secs)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind("seeded")
+        .bind("echo hi")
+        .bind(".")
+        .bind(timeout_secs)
+        .execute(db)
+        .await
+        .expect("seed custom_tools");
+    }
+
+    /// `agent_custom_tool_bindings` is a composite-PK junction table — no id column.
+    async fn bind_tool(db: &db::DbPool, profile_id: &str, tool_id: &str) {
+        sqlx::query(
+            "INSERT INTO agent_custom_tool_bindings (agent_profile_id, custom_tool_id)
+             VALUES (?, ?)",
+        )
+        .bind(profile_id)
+        .bind(tool_id)
+        .execute(db)
+        .await
+        .expect("seed binding");
+    }
+
+    #[tokio::test]
+    async fn load_for_agent_returns_only_bound_tools_ordered_by_name() {
+        let db = make_test_pool().await;
+        seed_tool(&db, "t-zeta", "zeta", 10).await;
+        seed_tool(&db, "t-alpha", "alpha", 10).await;
+        seed_tool(&db, "t-other", "other", 10).await;
+
+        bind_tool(&db, "agent-1", "t-zeta").await;
+        bind_tool(&db, "agent-1", "t-alpha").await;
+        bind_tool(&db, "agent-2", "t-other").await;
+
+        let loaded = load_for_agent("agent-1", &db).await.expect("load");
+
+        let names: Vec<_> = loaded.iter().map(|t| t.tool_name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn load_for_agent_with_no_bindings_returns_empty() {
+        let db = make_test_pool().await;
+        seed_tool(&db, "t-1", "alpha", 10).await;
+
+        let loaded = load_for_agent("agent-nobody", &db).await.expect("load");
+
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_for_agent_carries_through_the_stored_timeout() {
+        let db = make_test_pool().await;
+        seed_tool(&db, "t-1", "alpha", 90).await;
+        bind_tool(&db, "agent-1", "t-1").await;
+
+        let loaded = load_for_agent("agent-1", &db).await.expect("load");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].timeout_secs, 90);
+    }
+
+    #[tokio::test]
+    async fn an_omitted_timeout_falls_back_to_the_schema_default_of_30() {
+        // timeout_secs is NOT NULL DEFAULT 30, so the column can never be NULL —
+        // the default comes from the schema, not from load_for_agent's unwrap_or.
+        let db = make_test_pool().await;
+        sqlx::query(
+            "INSERT INTO custom_tools (id, name, description, command) VALUES (?, ?, ?, ?)",
+        )
+        .bind("t-1")
+        .bind("alpha")
+        .bind("seeded")
+        .bind("echo hi")
+        .execute(&db)
+        .await
+        .expect("seed custom_tools");
+        bind_tool(&db, "agent-1", "t-1").await;
+
+        let loaded = load_for_agent("agent-1", &db).await.expect("load");
+
+        assert_eq!(loaded[0].timeout_secs, 30);
+        assert_eq!(loaded[0].working_dir, ".");
+    }
 }

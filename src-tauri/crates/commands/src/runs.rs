@@ -3,7 +3,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -127,7 +126,7 @@ const SELECT_RUNS: &str = "
 pub async fn get_runs(
     filters: Option<RunFilters>,
     workspace_id: Option<String>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<StoryRun>, String> {
     let mut conditions: Vec<String> = Vec::new();
     let mut binds: Vec<String> = Vec::new();
@@ -175,7 +174,7 @@ pub async fn get_runs(
     }
 
     let rows = q
-        .fetch_all(db.inner())
+        .fetch_all(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
 
@@ -183,11 +182,11 @@ pub async fn get_runs(
 }
 
 /// Get a single run by ID.
-pub async fn get_run(id: String, db: State<'_, DbPool>) -> Result<StoryRun, String> {
+pub async fn get_run(id: String, db: &DbPool) -> Result<StoryRun, String> {
     let sql = format!("{} WHERE r.id = ?", SELECT_RUNS);
     let row = sqlx::query(&sql)
         .bind(&id)
-        .fetch_optional(db.inner())
+        .fetch_optional(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?
         .ok_or_else(|| format!("Run '{id}' not found"))?;
@@ -195,7 +194,7 @@ pub async fn get_run(id: String, db: State<'_, DbPool>) -> Result<StoryRun, Stri
 }
 
 /// Get all events for a run, ordered by sequence.
-pub async fn get_run_events(run_id: String, db: State<'_, DbPool>) -> Result<Vec<RunEvent>, String> {
+pub async fn get_run_events(run_id: String, db: &DbPool) -> Result<Vec<RunEvent>, String> {
     let rows = sqlx::query(
         "SELECT id, run_id, event_type, role, content, tool_name, tool_input, tool_output,
                 is_error, sequence_num, created_at
@@ -204,7 +203,7 @@ pub async fn get_run_events(run_id: String, db: State<'_, DbPool>) -> Result<Vec
          ORDER BY sequence_num ASC",
     )
     .bind(&run_id)
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -212,10 +211,10 @@ pub async fn get_run_events(run_id: String, db: State<'_, DbPool>) -> Result<Vec
 }
 
 /// Delete a run and all its events (cascade).
-pub async fn delete_run(id: String, db: State<'_, DbPool>) -> Result<(), String> {
+pub async fn delete_run(id: String, db: &DbPool) -> Result<(), String> {
     sqlx::query("DELETE FROM story_runs WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())
@@ -223,7 +222,7 @@ pub async fn delete_run(id: String, db: State<'_, DbPool>) -> Result<(), String>
 
 /// Export a run's events as a JSON array string (one object per event).
 /// The caller can write this to a .jsonl file on the frontend.
-pub async fn export_run_events(run_id: String, db: State<'_, DbPool>) -> Result<String, String> {
+pub async fn export_run_events(run_id: String, db: &DbPool) -> Result<String, String> {
     let events = get_run_events(run_id, db).await?;
     serde_json::to_string(&events).map_err(|e| format!("Serialization error: {e}"))
 }
@@ -231,12 +230,12 @@ pub async fn export_run_events(run_id: String, db: State<'_, DbPool>) -> Result<
 /// Fetch the git diff for a single run.
 /// `diff_output` is stored separately and excluded from `get_runs`/`get_run`
 /// because it can be arbitrarily large.
-pub async fn get_run_diff(run_id: String, db: State<'_, DbPool>) -> Result<RunDiff, String> {
+pub async fn get_run_diff(run_id: String, db: &DbPool) -> Result<RunDiff, String> {
     let row = sqlx::query(
         "SELECT id, before_sha, diff_output FROM story_runs WHERE id = ?"
     )
     .bind(&run_id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?
     .ok_or_else(|| format!("Run '{run_id}' not found"))?;

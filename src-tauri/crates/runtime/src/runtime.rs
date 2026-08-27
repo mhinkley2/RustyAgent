@@ -40,6 +40,27 @@ pub enum RunEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Event sink
+// ---------------------------------------------------------------------------
+
+/// Where a run's events go.
+///
+/// In the app this is the Tauri `AppHandle`. Tests substitute a recorder,
+/// because `tauri::test::mock_app()` yields an `AppHandle<MockRuntime>` which
+/// cannot stand in for the concrete `AppHandle<Wry>` the app uses.
+pub trait EventSink: Send + Sync + 'static {
+    fn emit_event(&self, name: &str, payload: serde_json::Value);
+}
+
+impl<R: tauri::Runtime> EventSink for tauri::AppHandle<R> {
+    fn emit_event(&self, name: &str, payload: serde_json::Value) {
+        if let Err(e) = self.emit(name, payload) {
+            warn!("Failed to emit '{name}': {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cancel flag — a simple shared bool so stop_run can signal the loop.
 // ---------------------------------------------------------------------------
 
@@ -93,7 +114,7 @@ pub struct ConversationRuntime {
     pub max_iterations: u32,
 
     pub db: DbPool,
-    pub app: tauri::AppHandle,
+    pub app: Arc<dyn EventSink>,
     pub cancel: CancelFlag,
     /// Semantic + episodic memory for this agent profile. None when the profile
     /// has `persistent_memory = false`.
@@ -131,7 +152,7 @@ impl ConversationRuntime {
         config: CompletionConfig,
         max_iterations: u32,
         db: DbPool,
-        app: tauri::AppHandle,
+        app: Arc<dyn EventSink>,
         cancel: CancelFlag,
         memory: Option<MemoryStore>,
         workspace_root: Option<std::path::PathBuf>,
@@ -157,7 +178,7 @@ impl ConversationRuntime {
         config: CompletionConfig,
         max_iterations: u32,
         db: DbPool,
-        app: tauri::AppHandle,
+        app: Arc<dyn EventSink>,
         cancel: CancelFlag,
         memory: Option<MemoryStore>,
         pipeline_run_id: Option<String>,
@@ -394,7 +415,9 @@ impl ConversationRuntime {
             }
         }
 
-        self.finish_run("completed").await;
+        // "done" — not "completed" — is the shared vocabulary: the pipeline
+        // engine writes it and the frontend's RunStatus union only knows it.
+        self.finish_run("done").await;
         Ok(())
     }
 
@@ -460,9 +483,7 @@ impl ConversationRuntime {
                         "runId": self.run_id,
                         "toolName": call.name,
                     });
-                    if let Err(e) = self.app.emit("approval-request-created", payload) {
-                        warn!(run_id = %self.run_id, "Failed to emit approval-request-created: {e}");
-                    }
+                    self.app.emit_event("approval-request-created", payload);
 
                     // Wait up to 5 minutes for the user to decide.
                     let decision = tokio::time::timeout(
@@ -589,17 +610,25 @@ impl ConversationRuntime {
             self.story_id, self.agent_profile_id, output
         );
 
-        // Cap at 1500 chars so embeddings are over meaningful but bounded content.
+        // Cap at 1500 bytes so embeddings are over meaningful but bounded
+        // content. The cut must land on a char boundary — slicing a String at a
+        // fixed byte offset panics mid-codepoint, and assistant output is
+        // routinely non-ASCII.
         if summary.len() > 1500 {
-            format!("{}…", &summary[..1497])
+            let mut cut = 1497;
+            while cut > 0 && !summary.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}…", &summary[..cut])
         } else {
             summary
         }
     }
 
     fn emit(&self, event: RunEvent) {
-        if let Err(e) = self.app.emit("run-event", &event) {
-            warn!(run_id = %self.run_id, "Failed to emit run-event: {e}");
+        match serde_json::to_value(&event) {
+            Ok(payload) => self.app.emit_event("run-event", payload),
+            Err(e) => warn!(run_id = %self.run_id, "Failed to serialize run-event: {e}"),
         }
     }
 

@@ -3,7 +3,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -35,7 +34,7 @@ pub struct AgentPermissions {
 /// receives a default `AgentPermissions` with all-allow semantics.
 pub async fn get_agent_permissions(
     profile_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<AgentPermissions, String> {
     let row = sqlx::query(
         "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths,
@@ -43,7 +42,7 @@ pub async fn get_agent_permissions(
          FROM agent_permissions WHERE profile_id = ?",
     )
     .bind(&profile_id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -83,7 +82,7 @@ pub async fn get_agent_permissions(
 /// Insert or replace the permission row for the given profile.
 pub async fn upsert_agent_permissions(
     perms: AgentPermissions,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     let to_json = |v: &[String]| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
 
@@ -109,7 +108,7 @@ pub async fn upsert_agent_permissions(
     .bind(to_json(&perms.allow_shell_commands))
     .bind(to_json(&perms.allow_network_hosts))
     .bind(perms.require_approval_on_write as i64)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 

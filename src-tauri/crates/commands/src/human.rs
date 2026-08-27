@@ -55,7 +55,7 @@ pub struct ApprovalRequest {
 
 /// Return all human-type stories that have not yet been answered.
 pub async fn get_pending_human_requests(
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<HumanRequest>, String> {
     let rows = sqlx::query(
         "SELECT s.id, s.title, s.status, s.parent_run_id, s.human_question, s.created_at
@@ -64,7 +64,7 @@ pub async fn get_pending_human_requests(
            AND s.status NOT IN ('done', 'failed')
          ORDER BY s.created_at DESC",
     )
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -96,14 +96,14 @@ pub async fn respond_to_human_request(
     story_id: String,
     response: String,
     app: AppHandle,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     // Fetch the parent_run_id before updating.
     let row = sqlx::query(
         "SELECT parent_run_id FROM stories WHERE id = ? AND story_type = 'human'",
     )
     .bind(&story_id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -120,7 +120,7 @@ pub async fn respond_to_human_request(
     )
     .bind(&response)
     .bind(&story_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -147,7 +147,7 @@ pub async fn create_human_request(
     question: String,
     context: Option<String>,
     app: AppHandle,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
     let title = if question.len() > 80 {
@@ -168,7 +168,7 @@ pub async fn create_human_request(
     .bind(&description)
     .bind(&run_id)
     .bind(&question)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -186,7 +186,7 @@ pub async fn create_human_request(
 
 /// Return approval requests that are still pending.
 pub async fn get_pending_approvals(
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<ApprovalRequest>, String> {
     let rows = sqlx::query(
         "SELECT ar.id, ar.run_id, ar.tool_name, ar.tool_input, ar.status, ar.created_at,
@@ -197,7 +197,7 @@ pub async fn get_pending_approvals(
          WHERE ar.status = 'pending'
          ORDER BY ar.created_at ASC",
     )
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -228,7 +228,7 @@ pub async fn create_approval_request(
     tool_name: String,
     tool_input: String,
     app: AppHandle,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
 
@@ -240,7 +240,7 @@ pub async fn create_approval_request(
     .bind(&run_id)
     .bind(&tool_name)
     .bind(&tool_input)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -268,7 +268,7 @@ pub async fn decide_approval(
     approved: bool,
     rejection_reason: Option<String>,
     app: AppHandle,
-    db: State<'_, DbPool>,
+    db: &DbPool,
     gate: State<'_, std::sync::Arc<ApprovalGate>>,
 ) -> Result<(), String> {
     let status = if approved { "approved" } else { "rejected" };
@@ -283,14 +283,14 @@ pub async fn decide_approval(
     .bind(status)
     .bind(&rejection_reason)
     .bind(&id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
     // Fetch run_id so the runtime knows which run to resume.
     let row = sqlx::query("SELECT run_id FROM approval_requests WHERE id = ?")
         .bind(&id)
-        .fetch_optional(db.inner())
+        .fetch_optional(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
 

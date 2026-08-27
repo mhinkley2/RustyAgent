@@ -477,6 +477,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "board-mcp"
+version = "0.1.0"
+dependencies = [
+ "api",
+ "async-trait",
+ "bytes",
+ "commands",
+ "db",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "pipeline",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tools",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,6 +724,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tauri",
+ "tempfile",
  "tokio",
  "tools",
  "tracing",
@@ -4752,6 +4776,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "api",
+ "async-trait",
  "chrono",
  "db",
  "futures",
@@ -4760,6 +4785,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tauri",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tools",
@@ -4841,12 +4867,9 @@ name = "rustyagentrustyagent"
 version = "0.1.0"
 dependencies = [
  "api",
- "bytes",
+ "board-mcp",
  "commands",
  "db",
- "http-body-util",
- "hyper",
- "hyper-util",
  "pipeline",
  "runtime",
  "scheduler",
@@ -6520,6 +6543,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

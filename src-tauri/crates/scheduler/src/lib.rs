@@ -781,7 +781,7 @@ async fn fire_run(
         config,
         max_iterations as u32,
         db.clone(),
-        app.clone(),
+        std::sync::Arc::new(app.clone()),
         cancel,
         memory,
         db::get_active_workspace_path(&db).await,

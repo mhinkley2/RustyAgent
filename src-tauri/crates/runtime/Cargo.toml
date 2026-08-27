@@ -19,3 +19,13 @@ chrono = { version = "0.4", features = ["serde"] }
 tauri = { workspace = true }
 futures = "0.3"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
+
+[features]
+# Exposes `runtime::testing` (a recording EventSink) to other crates.
+testing = []
+
+[dev-dependencies]
+api = { path = "../api" }
+async-trait = "0.1"
+db = { path = "../db", features = ["testing"] }
+tempfile = "3"

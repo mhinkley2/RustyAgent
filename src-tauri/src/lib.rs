@@ -1,5 +1,5 @@
 // Tauri entry point. Command handlers are implemented in the `commands` crate.
-mod board_mcp_http;
+mod mcp_host;
 
 use std::{
     fs,
@@ -99,7 +99,7 @@ async fn start_run(
     run_registry: tauri::State<'_, RunRegistry>,
     gate: tauri::State<'_, Arc<ApprovalGate>>,
 ) -> Result<String, String> {
-    commands::start_run(story_id, profile_id, app, db, run_registry, gate).await
+    commands::start_run(story_id, profile_id, app, db.inner(), run_registry, gate).await
 }
 
 #[tauri::command]
@@ -130,7 +130,7 @@ async fn start_chat_run(
         session_title,
         workspace_id,
         app,
-        db,
+        db.inner(),
         run_registry,
         gate,
     )
@@ -144,7 +144,7 @@ async fn list_chat_sessions(
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<Vec<commands::ChatSessionSummary>, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::chat_sessions::list_chat_sessions(workspace_id, limit, db).await
+    commands::chat_sessions::list_chat_sessions(workspace_id, limit, db.inner()).await
 }
 
 #[tauri::command]
@@ -154,7 +154,7 @@ async fn create_chat_session(
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<commands::ChatSessionSummary, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::chat_sessions::create_chat_session(workspace_id, title, db).await
+    commands::chat_sessions::create_chat_session(workspace_id, title, db.inner()).await
 }
 
 #[tauri::command]
@@ -162,7 +162,7 @@ async fn get_chat_session_messages(
     session_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::ChatSessionMessage>, String> {
-    commands::chat_sessions::get_chat_session_messages(session_id, db).await
+    commands::chat_sessions::get_chat_session_messages(session_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -178,7 +178,7 @@ async fn append_chat_session_message(
         role,
         content,
         agent_profile_id,
-        db,
+        db.inner(),
     )
     .await
 }
@@ -190,7 +190,8 @@ async fn get_profiles(
     db: tauri::State<'_, db::DbPool>,
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<Vec<commands::AgentProfile>, String> {
-    commands::agent_profiles::get_profiles(db, active_ws.get()).await
+    let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
+    commands::agent_profiles::get_profiles(db.inner(), workspace_id).await
 }
 
 #[tauri::command]
@@ -198,7 +199,7 @@ async fn get_profile(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::AgentProfile, String> {
-    commands::agent_profiles::get_profile(id, db).await
+    commands::agent_profiles::get_profile(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -207,7 +208,8 @@ async fn create_profile(
     db: tauri::State<'_, db::DbPool>,
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<commands::AgentProfile, String> {
-    commands::agent_profiles::create_profile(input, db, active_ws.get()).await
+    let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
+    commands::agent_profiles::create_profile(input, db.inner(), workspace_id).await
 }
 
 #[tauri::command]
@@ -216,7 +218,7 @@ async fn update_profile(
     input: commands::UpdateProfileInput,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::AgentProfile, String> {
-    commands::agent_profiles::update_profile(id, input, db).await
+    commands::agent_profiles::update_profile(id, input, db.inner()).await
 }
 
 #[tauri::command]
@@ -224,7 +226,7 @@ async fn delete_profile(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::agent_profiles::delete_profile(id, db).await
+    commands::agent_profiles::delete_profile(id, db.inner()).await
 }
 
 // ── Story CRUD ──────────────────────────────────────────────────────────────
@@ -235,7 +237,7 @@ async fn get_stories(
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<Vec<commands::Story>, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::stories::get_stories(db, workspace_id).await
+    commands::stories::get_stories(db.inner(), workspace_id).await
 }
 
 #[tauri::command]
@@ -243,7 +245,7 @@ async fn get_story(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::Story, String> {
-    commands::stories::get_story(id, db).await
+    commands::stories::get_story(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -253,7 +255,7 @@ async fn create_story(
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<commands::Story, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::stories::create_story(input, db, workspace_id).await
+    commands::stories::create_story(input, db.inner(), workspace_id).await
 }
 
 #[tauri::command]
@@ -264,7 +266,7 @@ async fn update_story(
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<commands::Story, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::stories::update_story(id, input, db, workspace_id).await
+    commands::stories::update_story(id, input, db.inner(), workspace_id).await
 }
 
 #[tauri::command]
@@ -272,7 +274,7 @@ async fn delete_story(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::stories::delete_story(id, db).await
+    commands::stories::delete_story(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -280,7 +282,7 @@ async fn batch_update_story_order(
     updates: Vec<commands::StoryOrderUpdate>,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::stories::batch_update_story_order(updates, db).await
+    commands::stories::batch_update_story_order(updates, db.inner()).await
 }
 
 // ── Run history ─────────────────────────────────────────────────────────────
@@ -291,7 +293,8 @@ async fn get_runs(
     db: tauri::State<'_, db::DbPool>,
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<Vec<commands::StoryRun>, String> {
-    commands::runs::get_runs(filters, active_ws.get(), db).await
+    let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
+    commands::runs::get_runs(filters, workspace_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -299,7 +302,7 @@ async fn get_run(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::StoryRun, String> {
-    commands::runs::get_run(id, db).await
+    commands::runs::get_run(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -307,7 +310,7 @@ async fn get_run_events(
     run_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::RunEvent>, String> {
-    commands::runs::get_run_events(run_id, db).await
+    commands::runs::get_run_events(run_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -315,7 +318,7 @@ async fn delete_run(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::runs::delete_run(id, db).await
+    commands::runs::delete_run(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -323,7 +326,7 @@ async fn export_run_events(
     run_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::runs::export_run_events(run_id, db).await
+    commands::runs::export_run_events(run_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -331,7 +334,7 @@ async fn get_run_diff(
     run_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::runs::RunDiff, String> {
-    commands::runs::get_run_diff(run_id, db).await
+    commands::runs::get_run_diff(run_id, db.inner()).await
 }
 
 // ── Human-in-the-loop ───────────────────────────────────────────────────────
@@ -340,7 +343,7 @@ async fn get_run_diff(
 async fn get_pending_human_requests(
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::HumanRequest>, String> {
-    commands::human::get_pending_human_requests(db).await
+    commands::human::get_pending_human_requests(db.inner()).await
 }
 
 #[tauri::command]
@@ -350,7 +353,7 @@ async fn respond_to_human_request(
     app: tauri::AppHandle,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::human::respond_to_human_request(story_id, response, app, db).await
+    commands::human::respond_to_human_request(story_id, response, app, db.inner()).await
 }
 
 #[tauri::command]
@@ -361,14 +364,14 @@ async fn create_human_request(
     app: tauri::AppHandle,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::human::create_human_request(run_id, question, context, app, db).await
+    commands::human::create_human_request(run_id, question, context, app, db.inner()).await
 }
 
 #[tauri::command]
 async fn get_pending_approvals(
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::ApprovalRequest>, String> {
-    commands::human::get_pending_approvals(db).await
+    commands::human::get_pending_approvals(db.inner()).await
 }
 
 #[tauri::command]
@@ -379,7 +382,7 @@ async fn create_approval_request(
     app: tauri::AppHandle,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::human::create_approval_request(run_id, tool_name, tool_input, app, db).await
+    commands::human::create_approval_request(run_id, tool_name, tool_input, app, db.inner()).await
 }
 
 #[tauri::command]
@@ -391,7 +394,7 @@ async fn decide_approval(
     db: tauri::State<'_, db::DbPool>,
     gate: tauri::State<'_, Arc<ApprovalGate>>,
 ) -> Result<(), String> {
-    commands::human::decide_approval(id, approved, rejection_reason, app, db, gate).await
+    commands::human::decide_approval(id, approved, rejection_reason, app, db.inner(), gate).await
 }
 
 // ── MCP Servers CRUD ────────────────────────────────────────────────────────
@@ -400,7 +403,7 @@ async fn decide_approval(
 async fn get_mcp_servers(
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::McpServer>, String> {
-    commands::mcp_servers::get_mcp_servers(db).await
+    commands::mcp_servers::get_mcp_servers(db.inner()).await
 }
 
 #[tauri::command]
@@ -408,7 +411,7 @@ async fn get_mcp_server(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::McpServer, String> {
-    commands::mcp_servers::get_mcp_server(id, db).await
+    commands::mcp_servers::get_mcp_server(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -416,7 +419,7 @@ async fn create_mcp_server(
     input: commands::CreateMcpServerInput,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::McpServer, String> {
-    commands::mcp_servers::create_mcp_server(input, db).await
+    commands::mcp_servers::create_mcp_server(input, db.inner()).await
 }
 
 #[tauri::command]
@@ -425,7 +428,7 @@ async fn update_mcp_server(
     input: commands::UpdateMcpServerInput,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::McpServer, String> {
-    commands::mcp_servers::update_mcp_server(id, input, db).await
+    commands::mcp_servers::update_mcp_server(id, input, db.inner()).await
 }
 
 #[tauri::command]
@@ -433,7 +436,7 @@ async fn delete_mcp_server(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::mcp_servers::delete_mcp_server(id, db).await
+    commands::mcp_servers::delete_mcp_server(id, db.inner()).await
 }
 
 // ── Tool Bindings ────────────────────────────────────────────────────────────
@@ -443,7 +446,7 @@ async fn get_tool_bindings(
     agent_profile_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::ToolBinding>, String> {
-    commands::mcp_servers::get_tool_bindings(agent_profile_id, db).await
+    commands::mcp_servers::get_tool_bindings(agent_profile_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -451,7 +454,7 @@ async fn create_tool_binding(
     input: commands::CreateToolBindingInput,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::ToolBinding, String> {
-    commands::mcp_servers::create_tool_binding(input, db).await
+    commands::mcp_servers::create_tool_binding(input, db.inner()).await
 }
 
 #[tauri::command]
@@ -459,7 +462,7 @@ async fn delete_tool_binding(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::mcp_servers::delete_tool_binding(id, db).await
+    commands::mcp_servers::delete_tool_binding(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -468,7 +471,7 @@ async fn update_tool_binding_allowed_tools(
     allowed_tools: Option<Vec<String>>,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::ToolBinding, String> {
-    commands::mcp_servers::update_tool_binding_allowed_tools(id, allowed_tools, db).await
+    commands::mcp_servers::update_tool_binding_allowed_tools(id, allowed_tools, db.inner()).await
 }
 
 // ── Agent Permissions ────────────────────────────────────────────────────────
@@ -478,7 +481,7 @@ async fn get_agent_permissions(
     profile_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::AgentPermissions, String> {
-    commands::permissions::get_agent_permissions(profile_id, db).await
+    commands::permissions::get_agent_permissions(profile_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -486,7 +489,7 @@ async fn upsert_agent_permissions(
     perms: commands::AgentPermissions,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::permissions::upsert_agent_permissions(perms, db).await
+    commands::permissions::upsert_agent_permissions(perms, db.inner()).await
 }
 
 // ── Custom Tools ──────────────────────────────────────────────────────────────
@@ -496,7 +499,7 @@ async fn get_custom_tools(
     workspace_id: Option<String>,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::CustomTool>, String> {
-    commands::custom_tools::get_custom_tools(workspace_id, db).await
+    commands::custom_tools::get_custom_tools(workspace_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -504,7 +507,7 @@ async fn create_custom_tool(
     input: commands::CreateCustomToolInput,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::CustomTool, String> {
-    commands::custom_tools::create_custom_tool(input, db).await
+    commands::custom_tools::create_custom_tool(input, db.inner()).await
 }
 
 #[tauri::command]
@@ -513,7 +516,7 @@ async fn update_custom_tool(
     input: commands::UpdateCustomToolInput,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::CustomTool, String> {
-    commands::custom_tools::update_custom_tool(id, input, db).await
+    commands::custom_tools::update_custom_tool(id, input, db.inner()).await
 }
 
 #[tauri::command]
@@ -521,7 +524,7 @@ async fn delete_custom_tool(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::custom_tools::delete_custom_tool(id, db).await
+    commands::custom_tools::delete_custom_tool(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -529,7 +532,7 @@ async fn get_custom_tool_bindings(
     agent_profile_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::CustomToolBinding>, String> {
-    commands::custom_tools::get_custom_tool_bindings(agent_profile_id, db).await
+    commands::custom_tools::get_custom_tool_bindings(agent_profile_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -538,7 +541,7 @@ async fn create_custom_tool_binding(
     custom_tool_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<commands::CustomToolBinding, String> {
-    commands::custom_tools::create_custom_tool_binding(agent_profile_id, custom_tool_id, db).await
+    commands::custom_tools::create_custom_tool_binding(agent_profile_id, custom_tool_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -547,7 +550,7 @@ async fn delete_custom_tool_binding(
     custom_tool_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::custom_tools::delete_custom_tool_binding(agent_profile_id, custom_tool_id, db).await
+    commands::custom_tools::delete_custom_tool_binding(agent_profile_id, custom_tool_id, db.inner()).await
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
@@ -572,7 +575,7 @@ async fn get_workspace_settings(
     workspace_id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<serde_json::Value, String> {
-    commands::settings::get_workspace_settings(workspace_id, db).await
+    commands::settings::get_workspace_settings(workspace_id, db.inner()).await
 }
 
 #[tauri::command]
@@ -581,7 +584,7 @@ async fn save_workspace_settings(
     overrides: serde_json::Value,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::settings::save_workspace_settings(workspace_id, overrides, db).await
+    commands::settings::save_workspace_settings(workspace_id, overrides, db.inner()).await
 }
 
 // ── Workspace ────────────────────────────────────────────────────────────────
@@ -593,14 +596,14 @@ async fn open_workspace(
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
     app: tauri::AppHandle,
 ) -> Result<commands::Workspace, String> {
-    commands::workspace::open_workspace(path, db, active_ws, app).await
+    commands::workspace::open_workspace(path, db.inner(), active_ws.inner(), app).await
 }
 
 #[tauri::command]
 async fn get_recent_workspaces(
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::Workspace>, String> {
-    commands::workspace::get_recent_workspaces(db).await
+    commands::workspace::get_recent_workspaces(db.inner()).await
 }
 
 #[tauri::command]
@@ -608,7 +611,7 @@ async fn remove_workspace(
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::workspace::remove_workspace(id, db).await
+    commands::workspace::remove_workspace(id, db.inner()).await
 }
 
 #[tauri::command]
@@ -618,7 +621,7 @@ async fn save_profile_toml(
     workspace_root: Option<String>,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::agent_profiles::save_profile_toml(id, scope, workspace_root, db).await
+    commands::agent_profiles::save_profile_toml(id, scope, workspace_root, db.inner()).await
 }
 
 #[tauri::command]
@@ -626,7 +629,7 @@ async fn sync_toml_profiles(
     workspace_root: Option<String>,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::agent_profiles::sync_toml_profiles(workspace_root, db).await
+    commands::agent_profiles::sync_toml_profiles(workspace_root, db.inner()).await
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
@@ -636,7 +639,7 @@ async fn list_directory(
     path: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<Vec<commands::FileEntry>, String> {
-    commands::filesystem::list_directory(path, db).await
+    commands::filesystem::list_directory(path, db.inner()).await
 }
 
 #[tauri::command]
@@ -644,7 +647,7 @@ async fn read_file_text(
     path: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::filesystem::read_file_text(path, db).await
+    commands::filesystem::read_file_text(path, db.inner()).await
 }
 
 #[tauri::command]
@@ -653,7 +656,7 @@ async fn write_file_text(
     content: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::filesystem::write_file_text(path, content, db).await
+    commands::filesystem::write_file_text(path, content, db.inner()).await
 }
 
 #[tauri::command]
@@ -662,7 +665,7 @@ async fn rename_path(
     new_name: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::filesystem::rename_path(old_path, new_name, db).await
+    commands::filesystem::rename_path(old_path, new_name, db.inner()).await
 }
 
 #[tauri::command]
@@ -670,7 +673,7 @@ async fn duplicate_file(
     path: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::filesystem::duplicate_file(path, db).await
+    commands::filesystem::duplicate_file(path, db.inner()).await
 }
 
 #[tauri::command]
@@ -678,7 +681,7 @@ async fn delete_path(
     path: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::filesystem::delete_path(path, db).await
+    commands::filesystem::delete_path(path, db.inner()).await
 }
 
 #[tauri::command]
@@ -686,7 +689,7 @@ async fn create_empty_file(
     path: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::filesystem::create_empty_file(path, db).await
+    commands::filesystem::create_empty_file(path, db.inner()).await
 }
 
 #[tauri::command]
@@ -694,7 +697,7 @@ async fn create_dir_fs(
     path: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<String, String> {
-    commands::filesystem::create_dir_fs(path, db).await
+    commands::filesystem::create_dir_fs(path, db.inner()).await
 }
 
 #[tauri::command]
@@ -844,8 +847,17 @@ pub fn run() {
             app.manage(sched_state);
             app.manage(pipeline_state);
 
-            board_mcp_http::spawn_board_mcp_http_server(app.handle().clone(), pool_clone.clone())
-                .map_err(|error| format!("Failed to start board MCP HTTP server: {error}"))?;
+            // A port conflict must not stop RustyAgent from launching: external
+            // MCP access is optional, the app is fully usable without it.
+            if let Err(error) = mcp_host::spawn(
+                app.handle().clone(),
+                pool_clone.clone(),
+                Some(app_data_dir.clone()),
+            ) {
+                tracing::warn!(
+                    "MCP server not started: {error}. RustyAgent will run normally                      without external MCP access."
+                );
+            }
 
             // Restore active workspace from the most-recently-opened entry.
             let pool_ws = pool_clone.clone();

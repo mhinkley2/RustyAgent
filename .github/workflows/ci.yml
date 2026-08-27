@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Test
+        # Shuffled so a test that depends on the order of another fails here
+        # rather than intermittently on someone's machine.
+        run: npx vitest run --coverage --sequence.shuffle
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Tauri's Linux build needs system GTK/webkit libraries.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      # The existing codebase is not rustfmt-formatted and carries ~26 clippy
+      # warnings, so neither is a gate yet — they report only. Once the tree is
+      # clean, turn these into `cargo fmt --check` and add `-- -D warnings`.
+      - name: Format (report only)
+        run: cargo fmt --check || true
+
+      - name: Clippy (report only)
+        run: cargo clippy --workspace --all-targets || true
+
+      - name: Test
+        run: cargo test --workspace

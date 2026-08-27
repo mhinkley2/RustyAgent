@@ -3,7 +3,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -104,7 +103,7 @@ const SELECT_STORIES: &str = "
 // ---------------------------------------------------------------------------
 
 pub async fn get_stories(
-    db: State<'_, DbPool>,
+    db: &DbPool,
     workspace_id: Option<String>,
 ) -> Result<Vec<Story>, String> {
     let rows = match workspace_id {
@@ -115,7 +114,7 @@ pub async fn get_stories(
             );
             sqlx::query(&sql)
                 .bind(ws_id)
-                .fetch_all(db.inner())
+                .fetch_all(db)
                 .await
                 .map_err(|e| format!("DB error: {e}"))?
         }
@@ -125,7 +124,7 @@ pub async fn get_stories(
                 SELECT_STORIES
             );
             sqlx::query(&sql)
-                .fetch_all(db.inner())
+                .fetch_all(db)
                 .await
                 .map_err(|e| format!("DB error: {e}"))?
         }
@@ -133,11 +132,11 @@ pub async fn get_stories(
     Ok(rows.iter().map(row_to_story).collect())
 }
 
-pub async fn get_story(id: String, db: State<'_, DbPool>) -> Result<Story, String> {
+pub async fn get_story(id: String, db: &DbPool) -> Result<Story, String> {
     let sql = format!("{} WHERE s.id = ?", SELECT_STORIES);
     let row = sqlx::query(&sql)
         .bind(&id)
-        .fetch_optional(db.inner())
+        .fetch_optional(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?
         .ok_or_else(|| format!("Story '{id}' not found"))?;
@@ -146,7 +145,7 @@ pub async fn get_story(id: String, db: State<'_, DbPool>) -> Result<Story, Strin
 
 pub async fn create_story(
     input: CreateStoryInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
     workspace_id: Option<String>,
 ) -> Result<Story, String> {
     let id = Uuid::new_v4().to_string();
@@ -167,7 +166,7 @@ pub async fn create_story(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM stories WHERE workspace_id IS ?",
     )
     .bind(&workspace_id)
-    .fetch_one(db.inner())
+    .fetch_one(db)
     .await
     .unwrap_or(0);
 
@@ -189,7 +188,7 @@ pub async fn create_story(
     .bind(&labels_json)
     .bind(sort_order)
     .bind(&workspace_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -199,10 +198,10 @@ pub async fn create_story(
 pub async fn update_story(
     id: String,
     input: UpdateStoryInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
     workspace_id: Option<String>,
 ) -> Result<Story, String> {
-    let current = get_story(id.clone(), db.clone()).await?;
+    let current = get_story(id.clone(), db).await?;
 
     let title             = input.title.unwrap_or(current.title);
     let description       = input.description.or(current.description);
@@ -241,17 +240,17 @@ pub async fn update_story(
     .bind(&labels_json)
     .bind(&workspace_id)
     .bind(&id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB update error: {e}"))?;
 
     get_story(id, db).await
 }
 
-pub async fn delete_story(id: String, db: State<'_, DbPool>) -> Result<(), String> {
+pub async fn delete_story(id: String, db: &DbPool) -> Result<(), String> {
     sqlx::query("DELETE FROM stories WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())
@@ -259,9 +258,9 @@ pub async fn delete_story(id: String, db: State<'_, DbPool>) -> Result<(), Strin
 
 pub async fn batch_update_story_order(
     updates: Vec<StoryOrderUpdate>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
-    let pool = db.inner();
+    let pool = db;
     let mut tx = pool.begin().await.map_err(|e| format!("DB error: {e}"))?;
     for u in &updates {
         sqlx::query("UPDATE stories SET sort_order = ? WHERE id = ?")

@@ -3,7 +3,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -103,7 +102,7 @@ fn row_to_profile(row: &sqlx::sqlite::SqliteRow) -> AgentProfile {
 // ---------------------------------------------------------------------------
 
 pub async fn get_profiles(
-    db: State<'_, DbPool>,
+    db: &DbPool,
     workspace_id: Option<String>,
 ) -> Result<Vec<AgentProfile>, String> {
     let rows = match workspace_id {
@@ -118,7 +117,7 @@ pub async fn get_profiles(
                  ORDER BY created_at ASC",
             )
             .bind(ws_id)
-            .fetch_all(db.inner())
+            .fetch_all(db)
             .await
             .map_err(|e| format!("DB error: {e}"))?
         }
@@ -131,7 +130,7 @@ pub async fn get_profiles(
                  FROM agent_profiles
                  ORDER BY created_at ASC",
             )
-            .fetch_all(db.inner())
+            .fetch_all(db)
             .await
             .map_err(|e| format!("DB error: {e}"))?
         }
@@ -140,7 +139,7 @@ pub async fn get_profiles(
     Ok(rows.iter().map(row_to_profile).collect())
 }
 
-pub async fn get_profile(id: String, db: State<'_, DbPool>) -> Result<AgentProfile, String> {
+pub async fn get_profile(id: String, db: &DbPool) -> Result<AgentProfile, String> {
     let row = sqlx::query(
         "SELECT id, name, description, system_prompt, provider, model, context_strategy,
                 persistent_memory, max_input_tokens, max_output_tokens, run_mode,
@@ -149,7 +148,7 @@ pub async fn get_profile(id: String, db: State<'_, DbPool>) -> Result<AgentProfi
          FROM agent_profiles WHERE id = ?",
     )
     .bind(&id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?
     .ok_or_else(|| format!("Profile '{id}' not found"))?;
@@ -159,7 +158,7 @@ pub async fn get_profile(id: String, db: State<'_, DbPool>) -> Result<AgentProfi
 
 pub async fn create_profile(
     input: CreateProfileInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
     workspace_id: Option<String>,
 ) -> Result<AgentProfile, String> {
     let id = Uuid::new_v4().to_string();
@@ -196,7 +195,7 @@ pub async fn create_profile(
     .bind(max_iter)
     .bind(&scope)
     .bind(&effective_ws_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -206,10 +205,10 @@ pub async fn create_profile(
 pub async fn update_profile(
     id: String,
     input: UpdateProfileInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<AgentProfile, String> {
     // Fetch current state so we only update provided fields.
-    let current = get_profile(id.clone(), db.clone()).await?;
+    let current = get_profile(id.clone(), db).await?;
 
     let name               = input.name.unwrap_or(current.name);
     let description        = input.description.or(current.description);
@@ -248,17 +247,17 @@ pub async fn update_profile(
     .bind(poll)
     .bind(max_iter)
     .bind(&id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB update error: {e}"))?;
 
     get_profile(id, db).await
 }
 
-pub async fn delete_profile(id: String, db: State<'_, DbPool>) -> Result<(), String> {
+pub async fn delete_profile(id: String, db: &DbPool) -> Result<(), String> {
     sqlx::query("DELETE FROM agent_profiles WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())
@@ -272,12 +271,12 @@ pub async fn save_profile_toml(
     id: String,
     scope: String,
     workspace_root: Option<String>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
     use workspace::{AgentToml, loader::write_profile_toml};
     use workspace::toml_profile::{BehaviorSection, LimitsSection, PermissionsSection, ProfileSection};
 
-    let profile = get_profile(id.clone(), db.clone()).await?;
+    let profile = get_profile(id.clone(), db).await?;
 
     // Fetch current permissions for this profile.
     let perms_row = sqlx::query(
@@ -285,7 +284,7 @@ pub async fn save_profile_toml(
          FROM agent_permissions WHERE profile_id = ?"
     )
     .bind(&id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -344,7 +343,7 @@ pub async fn save_profile_toml(
         .bind(&toml_path_str)
         .bind(&scope)
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
 
@@ -355,10 +354,10 @@ pub async fn save_profile_toml(
 /// Called on workspace open and by the live-reload watcher.
 pub async fn sync_toml_profiles(
     workspace_root: Option<String>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     let ws = workspace_root.as_deref().map(std::path::Path::new);
-    workspace::loader::sync_profiles(db.inner(), ws)
+    workspace::loader::sync_profiles(db, ws)
         .await
         .map_err(|e| format!("sync_profiles error: {e}"))
 }
