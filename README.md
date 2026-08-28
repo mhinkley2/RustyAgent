@@ -155,6 +155,29 @@ blocks a web page from reaching the server via DNS rebinding.
 **Live state (HTTP only)** — `get_agent_runtime_status`,
 `list_agent_runtime_statuses`, `get_pipeline_progress`, `list_active_pipelines`
 
+### Response size
+
+These tools answer into your agent's context window, not RustyAgent's, so the
+ones that could return unbounded text are capped and pageable.
+
+`read_file` returns at most 32 KB of file text — the same cap, the same 1-based
+`offset` / `limit` parameters, and the same truncation marker as the app's
+internal `file_read` tool. Over the cap, the `content` ends with a
+`[read_file TRUNCATED: …]` line stating the file's real size, the line range
+returned, and the `offset` to call again with; the reply also carries
+`truncated`, `complete` and `next_offset` fields. The separate 10 MB refusal is
+a memory guard and still applies.
+
+`get_run_events`, `get_chat_session_messages` and `list_directory` return a
+paged envelope — `{ <items>, offset, returned, total, complete, next_offset }`
+— rather than a bare array. They take `offset` and `limit`, stop early when a
+page would exceed 32 KB, and cap any single `content`, `tool_input` or
+`tool_output` value at 4 KB with a marker in place. A run's event log is the
+largest response on this surface: one autonomous run carries the full input and
+output of every tool call it made.
+
+`get_run_diff` is **not** capped — a single diff blob can be arbitrarily large.
+
 ### What is deliberately not exposed
 
 An MCP client cannot start agents, read secrets, or destroy data it cannot

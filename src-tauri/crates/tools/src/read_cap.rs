@@ -44,13 +44,17 @@ pub fn lines_with_endings(content: &str) -> Vec<&str> {
 }
 
 /// Read an optional 1-based positive integer parameter.
+///
+/// Shared by every paging tool so that "0" and "-1" are rejected identically
+/// wherever an `offset` or `limit` is accepted, rather than one surface
+/// silently treating 0 as 1.
 pub fn optional_positive(input: &Value, key: &str) -> Result<Option<usize>, String> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => match v.as_u64() {
             Some(n) if n >= 1 => Ok(Some(n as usize)),
             _ => Err(format!(
-                "Parameter '{key}' must be a positive integer (1-based line numbers); got {v}."
+                "Parameter '{key}' must be a positive integer (counting from 1); got {v}."
             )),
         },
     }

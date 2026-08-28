@@ -1,0 +1,342 @@
+//! Bounding the list-shaped responses on the MCP surface.
+//!
+//! The read tools here answer into an *external* agent's context — Claude
+//! Code, an editor, anything that speaks MCP — whose budget this process
+//! cannot see and cannot spend twice. A response that returns "every row" is
+//! therefore not a convenience but a defect: one long autonomous run's event
+//! log, with the full `tool_input` and `tool_output` of every call in it, is
+//! larger than any source file in the repository.
+//!
+//! Two independent limits apply, for the same reason they do on the file read
+//! path (see [`tools::read_cap`]):
+//!
+//! * a **row** limit, so the reply carries a countable number of records; and
+//! * a **byte** budget, because rows are not the same size — a hundred token
+//!   events are nothing and a single `tool_output` can be megabytes.
+//!
+//! A row cap alone would not bound bytes and a byte budget alone would not
+//! bound the work, so both are enforced, and both are reported back in the
+//! envelope so the caller can page.
+
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use tools::read_cap::{floor_char_boundary, optional_positive, MAX_READ_BYTES};
+
+/// Bytes of serialized rows a single response may carry.
+///
+/// The same 32 KB the file read path uses: it is this codebase's one number
+/// for "more tool output than a turn can carry".
+pub const MAX_PAGE_BYTES: usize = MAX_READ_BYTES;
+
+/// Bytes any single free-text column may carry.
+///
+/// Applied before the byte budget, so that one enormous `tool_output` costs a
+/// page a bounded amount rather than consuming it whole and starving every
+/// other row on it.
+pub const MAX_FIELD_BYTES: usize = 4 * 1024;
+
+/// A validated `offset` / `limit` pair, 1-based like the file read path.
+#[derive(Debug, Clone, Copy)]
+pub struct PageRequest {
+    /// 1-based index of the first row to return.
+    pub offset: usize,
+    /// Maximum rows to return, already clamped to the tool's documented
+    /// ceiling.
+    pub limit: usize,
+}
+
+/// Parse `offset` and `limit` from a tool's arguments.
+///
+/// An absent `limit` means `default_limit`, not "everything": the whole point
+/// is that a caller who does not think about paging still gets a bounded
+/// reply. A `limit` above `max_limit` is clamped rather than rejected, so a
+/// caller asking for more than the ceiling gets the ceiling and is told so by
+/// the envelope instead of an error it has to handle.
+pub fn page_request(
+    input: &Value,
+    default_limit: usize,
+    max_limit: usize,
+) -> Result<PageRequest, String> {
+    let offset = optional_positive(input, "offset")?.unwrap_or(1);
+    let limit = optional_positive(input, "limit")?
+        .unwrap_or(default_limit)
+        .min(max_limit);
+    Ok(PageRequest { offset, limit })
+}
+
+/// Cap the named string fields of a serialized row in place.
+///
+/// Cuts on a UTF-8 character boundary — a row holding a tool result full of
+/// box-drawing characters or CJK text is ordinary, and slicing at a fixed byte
+/// offset would panic on it. The marker names the tool and the field so the
+/// reader can tell a value that was shortened from one that was short.
+pub fn cap_text_fields(row: &mut Value, fields: &[&str], tool_name: &str) {
+    let Some(object) = row.as_object_mut() else {
+        return;
+    };
+    for field in fields {
+        let Some(Value::String(text)) = object.get(*field) else {
+            continue;
+        };
+        if text.len() <= MAX_FIELD_BYTES {
+            continue;
+        }
+        let full = text.len();
+        let cut = floor_char_boundary(text, MAX_FIELD_BYTES);
+        let capped = format!(
+            "{}\n[{tool_name} FIELD TRUNCATED: '{field}' is {full} bytes; the first {cut} are \
+             shown. The full value is not available over MCP — open the run in the RustyAgent \
+             app to see it.]",
+            &text[..cut]
+        );
+        object.insert((*field).to_string(), Value::String(capped));
+    }
+}
+
+/// One page of rows, wrapped in an envelope that says what it is.
+///
+/// The envelope is the whole point: a bare JSON array cannot say "there are
+/// four hundred more of these", so an external client that received one would
+/// have no way to tell a complete answer from a clipped one. Every response
+/// carries `total`, `returned` and `complete`, so the distinction is explicit
+/// even when nothing was cut.
+///
+/// `rows` must already be serialized and field-capped. Returns `Err` when
+/// `offset` points past the end.
+pub fn page_envelope(
+    rows: Vec<Value>,
+    request: PageRequest,
+    tool_name: &str,
+    item_key: &str,
+    subject: &str,
+) -> Result<Value, String> {
+    let total = rows.len();
+    // `.max(1)` so that asking for row 1 of an empty list is an empty page
+    // rather than an error: there is no row 1, but wanting it is not a mistake.
+    if request.offset > total.max(1) {
+        return Err(format!(
+            "Parameter 'offset' is {} but {subject} has {total} row(s).",
+            request.offset
+        ));
+    }
+
+    let start = request.offset - 1;
+    let mut page: Vec<Value> = Vec::new();
+    let mut bytes = 0usize;
+    for row in rows.into_iter().skip(start).take(request.limit) {
+        let size = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0);
+        // Always emit the first row even when it alone busts the budget.
+        // Otherwise a single oversized row would return an empty page whose
+        // `next_offset` pointed back at itself, and a paging client would spin
+        // there forever.
+        if !page.is_empty() && bytes + size > MAX_PAGE_BYTES {
+            break;
+        }
+        bytes += size;
+        page.push(row);
+    }
+
+    let returned = page.len();
+    let consumed = start + returned;
+    let next_offset = (consumed < total).then_some(consumed + 1);
+    let complete = request.offset == 1 && next_offset.is_none();
+
+    let mut envelope = Map::new();
+    envelope.insert(item_key.to_string(), Value::Array(page));
+    envelope.insert("offset".into(), json!(request.offset));
+    envelope.insert("returned".into(), json!(returned));
+    envelope.insert("total".into(), json!(total));
+    envelope.insert("complete".into(), json!(complete));
+    envelope.insert("next_offset".into(), json!(next_offset));
+    if let Some(next) = next_offset {
+        envelope.insert(
+            "notice".into(),
+            json!(format!(
+                "[{tool_name} PARTIAL: this is NOT the complete list. {subject} has {total} \
+                 {item_key}; this reply carries {}-{consumed}. Call {tool_name} again with \
+                 \"offset\": {next} to continue.]",
+                request.offset
+            )),
+        );
+    }
+    Ok(Value::Object(envelope))
+}
+
+/// Serialize, field-cap, and page a list of rows in one step.
+pub fn paged_rows<T: Serialize>(
+    rows: Vec<T>,
+    request: PageRequest,
+    tool_name: &str,
+    item_key: &str,
+    subject: &str,
+    text_fields: &[&str],
+) -> Result<Value, String> {
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut value =
+            serde_json::to_value(row).map_err(|error| format!("Failed to serialize: {error}"))?;
+        if !text_fields.is_empty() {
+            cap_text_fields(&mut value, text_fields, tool_name);
+        }
+        values.push(value);
+    }
+    page_envelope(values, request, tool_name, item_key, subject)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(offset: usize, limit: usize) -> PageRequest {
+        PageRequest { offset, limit }
+    }
+
+    fn rows(n: usize) -> Vec<Value> {
+        (0..n).map(|i| json!({ "i": i })).collect()
+    }
+
+    #[test]
+    fn an_absent_limit_still_bounds_the_reply() {
+        let parsed = page_request(&json!({}), 50, 200).expect("defaults");
+        assert_eq!(parsed.offset, 1);
+        assert_eq!(parsed.limit, 50);
+    }
+
+    #[test]
+    fn a_limit_above_the_ceiling_is_clamped_not_rejected() {
+        let parsed = page_request(&json!({ "limit": 10_000 }), 50, 200).expect("clamped");
+        assert_eq!(parsed.limit, 200);
+    }
+
+    #[test]
+    fn a_zero_offset_is_rejected_rather_than_read_as_one() {
+        let error = page_request(&json!({ "offset": 0 }), 50, 200).expect_err("rejected");
+        assert!(error.contains("positive integer"), "got {error}");
+    }
+
+    #[test]
+    fn a_complete_page_says_so_and_offers_no_next_offset() {
+        let envelope = page_envelope(rows(3), req(1, 50), "t", "items", "the list").expect("page");
+        assert_eq!(envelope["complete"], json!(true));
+        assert_eq!(envelope["next_offset"], Value::Null);
+        assert_eq!(envelope["total"], json!(3));
+        assert_eq!(envelope["returned"], json!(3));
+        assert!(envelope.get("notice").is_none());
+    }
+
+    #[test]
+    fn a_row_limited_page_reports_where_to_resume() {
+        let envelope = page_envelope(rows(10), req(1, 4), "t", "items", "the list").expect("page");
+        assert_eq!(envelope["returned"], json!(4));
+        assert_eq!(envelope["next_offset"], json!(5));
+        assert_eq!(envelope["complete"], json!(false));
+        assert!(envelope["notice"]
+            .as_str()
+            .expect("notice")
+            .contains("\"offset\": 5"));
+        // ...and resuming there really does continue where this page stopped.
+        let next = page_envelope(rows(10), req(5, 4), "t", "items", "the list").expect("page");
+        assert_eq!(next["items"][0]["i"], json!(4));
+    }
+
+    #[test]
+    fn the_last_page_is_not_marked_complete_when_it_started_past_row_one() {
+        // `complete` means "this reply is the whole list", not "there is
+        // nothing after it" — a caller that resumed at row 5 did not receive
+        // rows 1-4 and must not be told it holds everything.
+        let envelope = page_envelope(rows(6), req(5, 50), "t", "items", "the list").expect("page");
+        assert_eq!(envelope["next_offset"], Value::Null);
+        assert_eq!(envelope["complete"], json!(false));
+    }
+
+    #[test]
+    fn the_byte_budget_cuts_a_page_short_before_the_row_limit_does() {
+        // Rows of roughly 1 KB: the row limit would allow 200, the byte budget
+        // allows about 32.
+        let fat: Vec<Value> = (0..200)
+            .map(|i| json!({ "i": i, "text": "x".repeat(1024) }))
+            .collect();
+
+        let envelope = page_envelope(fat, req(1, 200), "t", "items", "the list").expect("page");
+
+        let returned = envelope["returned"].as_u64().expect("returned") as usize;
+        assert!(returned < 200, "the byte budget did not bite: {returned}");
+        assert!(returned > 1, "the budget was far too tight: {returned}");
+        let serialized = serde_json::to_string(&envelope["items"]).expect("serialize");
+        assert!(
+            serialized.len() <= MAX_PAGE_BYTES + 1024,
+            "the page overran its budget: {}",
+            serialized.len()
+        );
+        assert_eq!(envelope["next_offset"], json!(returned + 1));
+    }
+
+    #[test]
+    fn a_single_row_larger_than_the_whole_budget_is_still_returned() {
+        // Otherwise the page comes back empty with `next_offset` pointing at
+        // the row that was skipped, and a paging client loops on it forever.
+        let huge = vec![
+            json!({ "text": "x".repeat(MAX_PAGE_BYTES * 2) }),
+            json!({ "text": "small" }),
+        ];
+
+        let envelope = page_envelope(huge, req(1, 50), "t", "items", "the list").expect("page");
+
+        assert_eq!(envelope["returned"], json!(1));
+        assert_eq!(envelope["next_offset"], json!(2));
+    }
+
+    #[test]
+    fn an_offset_past_the_end_is_an_error_naming_the_row_count() {
+        let error =
+            page_envelope(rows(3), req(9, 50), "t", "items", "the list").expect_err("out of range");
+        assert!(error.contains("has 3 row(s)"), "got {error}");
+    }
+
+    #[test]
+    fn offset_one_of_an_empty_list_is_an_empty_page_not_an_error() {
+        let envelope = page_envelope(vec![], req(1, 50), "t", "items", "the list").expect("page");
+        assert_eq!(envelope["items"], json!([]));
+        assert_eq!(envelope["complete"], json!(true));
+    }
+
+    #[test]
+    fn a_long_text_field_is_capped_and_says_which_field_was_cut() {
+        let mut row = json!({ "content": "y".repeat(MAX_FIELD_BYTES * 2), "role": "user" });
+
+        cap_text_fields(&mut row, &["content", "tool_output"], "get_run_events");
+
+        let content = row["content"].as_str().expect("content");
+        assert!(content.starts_with(&"y".repeat(MAX_FIELD_BYTES)));
+        assert!(content.contains("[get_run_events FIELD TRUNCATED: 'content' is 8192 bytes"));
+        assert_eq!(row["role"], json!("user"), "other fields are untouched");
+    }
+
+    #[test]
+    fn capping_a_text_field_never_splits_a_codepoint() {
+        // MAX_FIELD_BYTES is 4096, which 3 does not divide, so the cut lands
+        // inside a "€". Slicing there would panic.
+        let mut row = json!({ "content": "\u{20AC}".repeat(4000) });
+
+        cap_text_fields(&mut row, &["content"], "t");
+
+        let content = row["content"].as_str().expect("content");
+        let expected = (MAX_FIELD_BYTES / 3) * 3;
+        assert!(content.starts_with(&"\u{20AC}".repeat(expected / 3)));
+        assert!(content.contains(&format!("the first {expected} are shown")));
+    }
+
+    #[test]
+    fn a_field_at_exactly_the_cap_is_left_alone() {
+        let mut row = json!({ "content": "y".repeat(MAX_FIELD_BYTES) });
+        cap_text_fields(&mut row, &["content"], "t");
+        assert!(!row["content"].as_str().expect("content").contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn capping_ignores_absent_and_non_string_fields() {
+        let mut row = json!({ "content": Value::Null, "is_error": true });
+        cap_text_fields(&mut row, &["content", "tool_output", "is_error"], "t");
+        assert_eq!(row, json!({ "content": Value::Null, "is_error": true }));
+    }
+}
