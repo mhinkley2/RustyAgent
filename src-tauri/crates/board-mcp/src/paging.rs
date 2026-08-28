@@ -233,6 +233,23 @@ pub fn paged_rows<T: Serialize>(
     // return fifty would double the in-memory footprint of the entire run for
     // no benefit, which is the opposite of what capping is for.
     let start = request.offset.saturating_sub(1);
+
+    // Refuse an out-of-range offset up front, on the two numbers it depends on.
+    //
+    // The saving is smaller than it looks and worth stating honestly: this
+    // function owns `rows`, so every element is dropped when it returns either
+    // way, and on this path nothing was serialized regardless — `take` yields
+    // nothing once `skip` has exhausted the iterator. What it avoids is the
+    // element-by-element walk `skip` performs to get there. It is kept mainly
+    // because failing on a comparison, before building anything, is the clearer
+    // shape for a precondition.
+    if request.offset > total.max(1) {
+        return Err(format!(
+            "Parameter 'offset' is {} but {subject} has {total} row(s).",
+            request.offset
+        ));
+    }
+
     let window = rows.into_iter().skip(start).take(request.limit);
 
     let mut values = Vec::with_capacity(request.limit.min(total.saturating_sub(start)));
@@ -320,6 +337,37 @@ mod tests {
         assert_eq!(envelope["returned"], json!(50));
         assert_eq!(envelope["offset"], json!(401));
         assert_eq!(seen.load(Ordering::SeqCst), 50);
+    }
+
+    /// An offset past the end is refused, and nothing is serialized to say so.
+    ///
+    /// Deliberately not asserting that the rows go undropped: `paged_rows` owns
+    /// the `Vec`, so every element is dropped when it returns whichever branch
+    /// it takes. What is observable — and what matters — is that the error
+    /// names the offset and no row was ever converted.
+    #[test]
+    fn an_offset_past_the_end_is_refused_before_any_row_is_serialized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Counted(Arc<AtomicUsize>);
+        impl Serialize for Counted {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                s.serialize_u64(0)
+            }
+        }
+
+        let serialized = Arc::new(AtomicUsize::new(0));
+        let rows: Vec<Counted> = (0..1_000)
+            .map(|_| Counted(Arc::clone(&serialized)))
+            .collect();
+
+        let error = paged_rows(rows, req(5_000, 50), "t", "items", "the list", &[])
+            .expect_err("an offset past the end must fail");
+
+        assert!(error.contains("offset"), "got {error}");
+        assert_eq!(serialized.load(Ordering::SeqCst), 0);
     }
 
     /// The clamped limit is reported, so a caller can tell a ceiling from a

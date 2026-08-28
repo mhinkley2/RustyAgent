@@ -468,9 +468,13 @@ fn seed_padded_lines(root: &std::path::Path, name: &str, count: usize) -> String
     content
 }
 
-/// The 32 KB cap in `tools::read_cap`, restated so the assertions can do
-/// arithmetic with it.
-const CAP: usize = 32 * 1024;
+/// The cap these assertions do arithmetic against.
+///
+/// Taken from `tools::read_cap`, not restated. A second copy of the number
+/// would keep passing after the real one changed — which is the exact drift
+/// this whole change exists to remove, so it would be a poor place to
+/// reintroduce it.
+const CAP: usize = tools::read_cap::MAX_READ_BYTES;
 
 /// The file bytes of a reply, with the trailing marker removed.
 ///

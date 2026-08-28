@@ -131,6 +131,11 @@ pub struct ReadPage {
     /// 1-based line number of the first line in `text`.
     pub first_line: usize,
     /// 1-based line number of the last line in `text`.
+    ///
+    /// Zero for an empty file, which is the one case where this is *not* a
+    /// line number: a file with no lines has no last line, and reporting `1`
+    /// would name a line the caller cannot read. Callers must not assume
+    /// `last_line >= 1` on every successful read.
     pub last_line: usize,
     /// Lines in the whole file.
     pub total_lines: usize,
