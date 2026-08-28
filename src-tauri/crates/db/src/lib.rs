@@ -72,8 +72,8 @@ pub async fn init_db(db_path: &str) -> Result<DbPool> {
 ///
 /// The `created_at` tiebreak matches [`list_workspaces`] exactly. `last_opened_at`
 /// has millisecond resolution, so two workspaces touched in the same millisecond
-/// tie — and with no tiebreak SQLite may order them either way, letting this
-/// function and `list_workspaces` disagree about which workspace is active.
+/// can tie; ordering by `created_at` keeps this function consistent with
+/// `list_workspaces` when that happens.
 pub async fn get_active_workspace_path(db: &DbPool) -> Option<std::path::PathBuf> {
     let row = sqlx::query(
         "SELECT path FROM workspaces ORDER BY last_opened_at DESC, created_at DESC LIMIT 1"
