@@ -119,6 +119,7 @@ struct Harness {
     track_history: bool,
     event_retention_runs: u32,
     context_policy: ContextPolicy,
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl Harness {
@@ -146,6 +147,7 @@ impl Harness {
             track_history: true,
             event_retention_runs: 0,
             context_policy: ContextPolicy::default(),
+            workspace_root: None,
         }
     }
 
@@ -170,7 +172,7 @@ impl Harness {
             self.sink.handle(),
             self.cancel.clone(),
             None, // memory
-            None, // workspace_root
+            self.workspace_root.clone(),
             self.track_history,
             self.event_retention_runs,
         )
@@ -1500,4 +1502,318 @@ async fn a_provider_reporting_more_input_than_estimated_tightens_the_budget() {
     // differs, and now the second call is compacted.
     assert_eq!(compaction_events(&h.sink).len(), 1);
     assert_eq!(h.status(&run_id).await, "done");
+}
+
+// ---------------------------------------------------------------------------
+// Run isolation
+// ---------------------------------------------------------------------------
+//
+// End-to-end cover for the worktree feature: a real `ConversationRuntime`,
+// driving a real tool that writes a real file, against a throwaway git
+// repository in a temp directory. Never this repository's own checkout.
+
+mod isolation {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use tempfile::TempDir;
+
+    /// A tool that writes a file inside the run's workspace root — the thing an
+    /// agent actually does, and the thing isolation has to contain.
+    struct FileWritingTool {
+        rel: String,
+        contents: String,
+    }
+
+    #[async_trait]
+    impl Tool for FileWritingTool {
+        fn name(&self) -> &str {
+            "write_a_file"
+        }
+        fn description(&self) -> &str {
+            "writes a file into the workspace"
+        }
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "required": [] })
+        }
+        async fn execute(&self, _input: Value, ctx: &ToolContext) -> ToolOutput {
+            let Some(root) = ctx.workspace_root.as_ref() else {
+                return ToolOutput::err("no workspace root");
+            };
+            let path = root.join(&self.rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, &self.contents) {
+                Ok(()) => ToolOutput::ok(format!("wrote {}", path.display())),
+                Err(e) => ToolOutput::err(format!("write failed: {e}")),
+            }
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A throwaway repository with one commit, plus a worktrees directory.
+    fn repo() -> (TempDir, PathBuf, PathBuf) {
+        let root = TempDir::new().expect("temp dir");
+        let repo = root.path().join("repo");
+        let worktrees = root.path().join("worktrees");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        git(&repo, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        // Line endings pinned so the suite behaves the same on a Windows box
+        // whose global core.autocrlf is on as it does on Linux CI.
+        git(&repo, &["config", "core.autocrlf", "false"]);
+        git(&repo, &["config", "core.eol", "lf"]);
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &[
+                "-c", "user.name=Fixture",
+                "-c", "user.email=fixture@localhost",
+                "commit", "-q", "--no-verify", "-m", "initial",
+            ],
+        );
+        (root, repo, worktrees)
+    }
+
+    /// One run's isolation columns.
+    async fn isolation_row(
+        db: &DbPool,
+        run_id: &str,
+    ) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT worktree_path, branch_name, after_sha, isolation_status \
+             FROM story_runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(db)
+        .await
+        .expect("fetch isolation row");
+        (
+            row.try_get("worktree_path").ok().flatten(),
+            row.try_get("branch_name").ok().flatten(),
+            row.try_get("after_sha").ok().flatten(),
+            row.try_get("isolation_status").ok().flatten(),
+        )
+    }
+
+    async fn diff_output(db: &DbPool, run_id: &str) -> Option<String> {
+        use sqlx::Row;
+        sqlx::query("SELECT diff_output FROM story_runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(db)
+            .await
+            .expect("fetch diff")
+            .try_get("diff_output")
+            .ok()
+            .flatten()
+    }
+
+    /// A harness whose runs write `created.txt` and stop.
+    async fn writing_harness(workspace_root: PathBuf) -> Harness {
+        let mut h = Harness::new(vec![
+            MockResponse::tool_call("call-1", "write_a_file", json!({})),
+            MockResponse::text("done"),
+        ])
+        .await
+        .with_tool(Box::new(FileWritingTool {
+            rel: "created.txt".to_string(),
+            contents: "written by the agent\n".to_string(),
+        }))
+        .await;
+        h.workspace_root = Some(workspace_root);
+        h
+    }
+
+    #[tokio::test]
+    async fn a_run_executes_in_a_worktree_and_records_where() {
+        let (_tmp, repo, worktrees) = repo();
+        let h = writing_harness(repo.clone()).await;
+        let mut rt = h.build().await;
+        let run_id = rt.run_id.clone();
+
+        rt.isolate(&worktrees).await;
+        let root = rt.workspace_root.clone().expect("workspace root");
+        rt.run().await.expect("run");
+
+        let (path, branch, _after, status) = isolation_row(&h.db, &run_id).await;
+        assert_eq!(status.as_deref(), Some("isolated"));
+        assert_eq!(path.as_deref(), Some(root.to_string_lossy().as_ref()));
+        assert!(
+            branch.as_deref().unwrap().starts_with("rustyagent/run-"),
+            "unexpected branch: {branch:?}"
+        );
+        // The run's own root is the worktree, not the user's checkout.
+        assert_ne!(root, repo);
+        assert!(root.starts_with(&worktrees));
+    }
+
+    #[tokio::test]
+    async fn a_file_the_agent_writes_stays_out_of_the_users_checkout() {
+        let (_tmp, repo, worktrees) = repo();
+        let h = writing_harness(repo.clone()).await;
+        let mut rt = h.build().await;
+
+        rt.isolate(&worktrees).await;
+        let root = rt.workspace_root.clone().expect("workspace root");
+        rt.run().await.expect("run");
+
+        assert!(root.join("created.txt").exists(), "the agent's file is missing");
+        assert!(
+            !repo.join("created.txt").exists(),
+            "the agent's file leaked into the user's checkout"
+        );
+        assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_leaves_its_changes_committed_on_its_branch() {
+        let (_tmp, repo, worktrees) = repo();
+        let h = writing_harness(repo.clone()).await;
+        let mut rt = h.build().await;
+        let run_id = rt.run_id.clone();
+
+        rt.isolate(&worktrees).await;
+        rt.run().await.expect("run");
+
+        let (_path, branch, after, _status) = isolation_row(&h.db, &run_id).await;
+        let after = after.expect("a run that wrote a file must record a commit");
+        let branch = branch.expect("branch");
+        assert_eq!(git(&repo, &["rev-parse", &branch]), after);
+        // The commit carries the file.
+        assert!(git(&repo, &["show", "--name-only", "--format=", &after]).contains("created.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_only_action_is_creating_a_file_records_it_in_the_diff() {
+        // The old `git diff <sha>` omitted untracked files entirely, so this —
+        // the most common thing an agent does — produced an empty diff.
+        let (_tmp, repo, worktrees) = repo();
+        let h = writing_harness(repo).await;
+        let mut rt = h.build().await;
+        let run_id = rt.run_id.clone();
+
+        rt.isolate(&worktrees).await;
+        rt.run().await.expect("run");
+
+        let diff = diff_output(&h.db, &run_id).await.expect("a created file is a change");
+        assert!(diff.contains("created.txt"), "diff omits the new file:\n{diff}");
+        assert!(diff.contains("written by the agent"), "diff omits its content:\n{diff}");
+    }
+
+    #[tokio::test]
+    async fn a_non_git_workspace_is_recorded_and_announced_not_silently_accepted() {
+        let tmp = TempDir::new().expect("temp dir");
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        let h = writing_harness(plain.clone()).await;
+        let mut rt = h.build().await;
+        let run_id = rt.run_id.clone();
+
+        let outcome = rt.isolate(&tmp.path().join("worktrees")).await;
+        rt.run().await.expect("run");
+
+        assert!(outcome.worktree().is_none());
+        let (path, branch, _after, status) = isolation_row(&h.db, &run_id).await;
+        assert_eq!(status.as_deref(), Some("not_a_git_repo"));
+        assert_eq!(path, None);
+        assert_eq!(branch, None);
+
+        // And it is in the timeline the operator reads, not just a column.
+        let events = h.events(&run_id).await;
+        let warning = events
+            .iter()
+            .find(|(kind, _)| kind == "isolation")
+            .map(|(_, content)| content.clone())
+            .expect("an un-isolated run must say so in its event log");
+        assert!(warning.contains("not a git repository"), "unhelpful warning: {warning}");
+
+        // It still ran, in the user's directory — degraded, not refused.
+        assert_eq!(h.status(&run_id).await, "done");
+        assert!(plain.join("created.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn the_isolation_warning_survives_history_tracking_being_off() {
+        // Whether a run was isolated decides whether it can be undone at all,
+        // so it is recorded even where the messages are not.
+        let tmp = TempDir::new().expect("temp dir");
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        let mut h = writing_harness(plain).await;
+        h.track_history = false;
+        let mut rt = h.build().await;
+        let run_id = rt.run_id.clone();
+
+        rt.isolate(&tmp.path().join("worktrees")).await;
+
+        let events = h.events(&run_id).await;
+        assert!(events.iter().any(|(kind, _)| kind == "isolation"));
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_workspace_at_all_says_so_rather_than_pretending() {
+        let tmp = TempDir::new().expect("temp dir");
+        let h = Harness::new(vec![MockResponse::text("done")]).await;
+        let mut rt = h.build().await;
+        let run_id = rt.run_id.clone();
+
+        rt.isolate(&tmp.path().join("worktrees")).await;
+
+        let (_p, _b, _a, status) = isolation_row(&h.db, &run_id).await;
+        assert_eq!(status.as_deref(), Some("no_workspace"));
+        assert!(h.events(&run_id).await.iter().any(|(kind, _)| kind == "isolation"));
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_never_isolated_keeps_the_old_behaviour() {
+        // `isolate` is opt-in per caller. Forgetting it must degrade to the
+        // previous, un-isolated run rather than breaking the run outright.
+        let (_tmp, repo, _worktrees) = repo();
+        let h = writing_harness(repo.clone()).await;
+        let run_id = h.run().await;
+
+        assert_eq!(h.status(&run_id).await, "done");
+        assert!(repo.join("created.txt").exists());
+        let (_p, _b, _a, status) = isolation_row(&h.db, &run_id).await;
+        assert_eq!(status, None);
+    }
+
+    #[tokio::test]
+    async fn two_runs_isolated_from_the_same_repository_get_separate_checkouts() {
+        let (_tmp, repo, worktrees) = repo();
+        let h = writing_harness(repo.clone()).await;
+
+        let mut first = h.build().await;
+        first.isolate(&worktrees).await;
+        let first_root = first.workspace_root.clone().expect("root");
+
+        let mut second = h.build().await;
+        second.isolate(&worktrees).await;
+        let second_root = second.workspace_root.clone().expect("root");
+
+        assert_ne!(first_root, second_root);
+        std::fs::write(first_root.join("shared.txt"), "from the first run\n").expect("write");
+        std::fs::write(second_root.join("shared.txt"), "from the second run\n").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(first_root.join("shared.txt")).unwrap(),
+            "from the first run\n"
+        );
+        assert!(!repo.join("shared.txt").exists());
+    }
 }
