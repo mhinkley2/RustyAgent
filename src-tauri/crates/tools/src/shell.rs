@@ -15,9 +15,36 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::paths::{is_within, resolve_existing_prefix, resolve_for_containment};
+use crate::{Tool, ToolContext, ToolOutput, ToolPermissionInfo};
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024; // 32 KB
+
+/// Environment variables that carry an LLM provider credential.
+///
+/// A custom tool inherits the parent environment, which is what makes
+/// `cargo test` behave the way it does in a terminal. That inheritance also
+/// hands every command the agent can invoke any provider key the operator
+/// happened to export, so these names are removed before the process starts.
+///
+/// This is not full containment and should not be sold as such: RustyAgent
+/// stores its own provider keys in the settings file, and a shell command with
+/// read access to the disk can still read them. It closes the exported-key
+/// case, which costs nothing to close.
+const PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+];
+
+/// Strip provider credentials from a command's environment.
+fn scrub_provider_credentials(cmd: &mut Command) {
+    for name in PROVIDER_CREDENTIAL_ENV_VARS {
+        cmd.env_remove(name);
+    }
+}
 
 /// A user-defined tool that runs a fixed shell command.
 ///
@@ -97,20 +124,45 @@ impl ShellCommandTool {
         Some((program, parts))
     }
 
-    /// Resolve the working directory against the workspace root.
-    fn resolve_working_dir(&self, workspace_root: Option<&PathBuf>) -> PathBuf {
-        let rel = Path::new(&self.working_dir);
-        if rel == Path::new(".") || self.working_dir.is_empty() {
-            workspace_root
-                .cloned()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        } else if rel.is_absolute() {
-            rel.to_path_buf()
-        } else {
-            workspace_root
-                .map(|r| r.join(rel))
-                .unwrap_or_else(|| rel.to_path_buf())
+    /// Resolve the working directory against the workspace root, rejecting any
+    /// result that lands outside it.
+    ///
+    /// This used to honour an absolute `working_dir` verbatim, which made the
+    /// workspace root advisory: a custom tool could name any directory on the
+    /// machine and its command would run there. A `..` chain in a relative
+    /// `working_dir` did the same thing more quietly. Both are now refused.
+    ///
+    /// With no workspace root there is nothing to be outside of, so the path is
+    /// taken as given. That is the "no workspace open" case, not a bypass.
+    fn resolve_working_dir(
+        &self,
+        workspace_root: Option<&PathBuf>,
+    ) -> Result<PathBuf, String> {
+        let is_default = self.working_dir.is_empty()
+            || Path::new(&self.working_dir) == Path::new(".");
+
+        let Some(root) = workspace_root else {
+            return Ok(if is_default {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            } else {
+                PathBuf::from(&self.working_dir)
+            });
+        };
+
+        let canonical_root = resolve_existing_prefix(root);
+        if is_default {
+            return Ok(canonical_root);
         }
+
+        let resolved = resolve_for_containment(&self.working_dir, Some(root));
+        if !is_within(&resolved, &canonical_root) {
+            return Err(format!(
+                "Working directory '{}' resolves outside the workspace root '{}'. A custom tool may only run inside the workspace.",
+                self.working_dir,
+                root.display()
+            ));
+        }
+        Ok(resolved)
     }
 }
 
@@ -147,6 +199,23 @@ impl Tool for ShellCommandTool {
         &self.tool_description
     }
 
+    /// A shell command is the least constrained thing an agent can reach for:
+    /// it can read and write anywhere the RustyAgent process can, and it takes
+    /// no path input that a path allow-list could be checked against.
+    ///
+    /// Declaring it as both a read and a write is what puts it behind
+    /// `require_approval_on_write`, and what makes `allow_file_read_paths` /
+    /// `allow_file_write_paths` refuse it outright instead of waving it
+    /// through unchecked. See `PermissionPolicy::check_tool`.
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo {
+            reads_files: true,
+            writes_files: true,
+            path_inputs: &[],
+            shell_program: self.argv().map(|(program, _)| program),
+        }
+    }
+
     /// No agent-supplied parameters — the command is fully defined by the user.
     fn input_schema(&self) -> Value {
         json!({
@@ -162,7 +231,10 @@ impl Tool for ShellCommandTool {
             None => return ToolOutput::err("Custom tool has an empty command — cannot execute."),
         };
 
-        let cwd = self.resolve_working_dir(ctx.workspace_root.as_ref());
+        let cwd = match self.resolve_working_dir(ctx.workspace_root.as_ref()) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::err(e),
+        };
 
         let mut cmd = Command::new(&program);
         cmd.args(&args)
@@ -170,9 +242,9 @@ impl Tool for ShellCommandTool {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // Never allow the process to read from stdin.
-            .stdin(std::process::Stdio::null())
-            // Ensure env is inherited (no extra injection from us).
-            ;
+            .stdin(std::process::Stdio::null());
+        // The rest of the environment is inherited, minus provider credentials.
+        scrub_provider_credentials(&mut cmd);
 
         // Spawn and apply timeout.
         let result = timeout(
@@ -437,50 +509,211 @@ mod tests {
 
     // -- working directory ---------------------------------------------------
 
+    /// A path that is absolute on both platforms, given a leaf name.
+    fn absolute_outside(leaf: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{leaf}")
+        } else {
+            format!("/{leaf}")
+        }
+    }
+
+    /// Compare two paths as the filesystem sees them.
+    ///
+    /// Not `assert_eq!` on the raw values: `/workspace/proj` really does mean
+    /// `C:\workspace\proj` on Windows, so a resolved path and the literal it
+    /// came from are equal on Unix and unequal there. These tests use a real
+    /// directory and compare canonical forms, which is true on both.
+    fn assert_same_dir(left: &Path, right: &Path) {
+        let l = std::fs::canonicalize(left).unwrap_or_else(|e| panic!("{left:?}: {e}"));
+        let r = std::fs::canonicalize(right).unwrap_or_else(|e| panic!("{right:?}: {e}"));
+        assert_eq!(l, r);
+    }
+
     #[test]
     fn a_dot_working_dir_resolves_to_the_workspace_root() {
-        let root = PathBuf::from("/workspace/proj");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
         let mut t = tool("ls");
         t.working_dir = ".".into();
 
-        assert_eq!(t.resolve_working_dir(Some(&root)), root);
+        assert_same_dir(&t.resolve_working_dir(Some(&root)).expect("inside"), &root);
     }
 
     #[test]
     fn an_empty_working_dir_resolves_to_the_workspace_root() {
-        let root = PathBuf::from("/workspace/proj");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
         let mut t = tool("ls");
         t.working_dir = String::new();
 
-        assert_eq!(t.resolve_working_dir(Some(&root)), root);
+        assert_same_dir(&t.resolve_working_dir(Some(&root)).expect("inside"), &root);
     }
 
     #[test]
     fn a_relative_working_dir_is_joined_onto_the_workspace_root() {
-        let root = PathBuf::from("/workspace/proj");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let nested = root.join("crates").join("api");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
         let mut t = tool("ls");
         t.working_dir = "crates/api".into();
 
+        assert_same_dir(&t.resolve_working_dir(Some(&root)).expect("inside"), &nested);
+    }
+
+    /// Changed deliberately. This previously asserted that an absolute
+    /// `working_dir` *overrode* the workspace root, which meant a custom tool
+    /// could run its command anywhere on the machine.
+    #[test]
+    fn an_absolute_working_dir_outside_the_workspace_root_is_rejected() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = absolute_outside("elsewhere");
+
+        let err = t
+            .resolve_working_dir(Some(&root))
+            .expect_err("an escape must be refused");
+        assert!(err.contains("outside the workspace root"), "got {err}");
+    }
+
+    #[test]
+    fn an_absolute_working_dir_inside_the_workspace_root_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let nested = root.join("crates");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
+        let mut t = tool("ls");
+        t.working_dir = nested.to_string_lossy().into_owned();
+
+        assert_same_dir(&t.resolve_working_dir(Some(&root)).expect("inside"), &nested);
+    }
+
+    #[test]
+    fn a_relative_working_dir_that_climbs_out_of_the_workspace_is_rejected() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = "crates/../../../etc".into();
+
+        let err = t
+            .resolve_working_dir(Some(&root))
+            .expect_err("a traversal must be refused");
+        assert!(err.contains("outside the workspace root"), "got {err}");
+    }
+
+    /// A sibling directory whose name merely starts with the root's is not
+    /// inside it — the containment check is on components, not characters.
+    #[test]
+    fn a_sibling_directory_sharing_a_name_prefix_is_rejected() {
+        let root = PathBuf::from("/workspace/proj");
+        let mut t = tool("ls");
+        t.working_dir = "/workspace/proj-other".into();
+
+        let err = t
+            .resolve_working_dir(Some(&root))
+            .expect_err("a name-prefix sibling must be refused");
+        assert!(err.contains("outside the workspace root"), "got {err}");
+    }
+
+    /// With no workspace open there is no root to be outside of, so the
+    /// directory is taken as written. This is the pre-existing behaviour and is
+    /// not a bypass of the check above.
+    #[test]
+    fn without_a_workspace_root_the_working_dir_is_taken_as_given() {
+        let mut t = tool("ls");
+        t.working_dir = absolute_outside("elsewhere");
+
         assert_eq!(
-            t.resolve_working_dir(Some(&root)),
-            PathBuf::from("/workspace/proj").join("crates/api")
+            t.resolve_working_dir(None).expect("no root to escape"),
+            PathBuf::from(&t.working_dir)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_working_dir_outside_the_workspace_fails_the_call_instead_of_running() {
+        let mut ctx = make_ctx(make_test_pool().await);
+        ctx.workspace_root = Some(PathBuf::from("/workspace/proj"));
+        let mut t = tool(if cfg!(windows) { "cmd /c rem" } else { "true" });
+        t.working_dir = absolute_outside("elsewhere");
+
+        let out = t.execute(json!({}), &ctx).await;
+
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("outside the workspace root"),
+            "got {:?}",
+            out.content
+        );
+    }
+
+    // -- environment ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_provider_credential_is_not_visible_to_the_spawned_command() {
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c", "echo %ANTHROPIC_API_KEY%"])
+        } else {
+            ("sh", vec!["-c", "echo $ANTHROPIC_API_KEY"])
+        };
+
+        let mut cmd = Command::new(program);
+        cmd.args(&args).env("ANTHROPIC_API_KEY", "sk-do-not-leak");
+        scrub_provider_credentials(&mut cmd);
+
+        let out = cmd.output().await.expect("run echo");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+        assert!(
+            !stdout.contains("sk-do-not-leak"),
+            "the key reached the command: {stdout:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_environment_variable_still_reaches_the_command() {
+        // The scrub is a named list, not a blanket wipe — a command that needs
+        // its normal environment must keep it.
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/c", "echo %RUSTYAGENT_SCRUB_PROBE%"])
+        } else {
+            ("sh", vec!["-c", "echo $RUSTYAGENT_SCRUB_PROBE"])
+        };
+
+        let mut cmd = Command::new(program);
+        cmd.args(&args).env("RUSTYAGENT_SCRUB_PROBE", "kept");
+        scrub_provider_credentials(&mut cmd);
+
+        let out = cmd.output().await.expect("run echo");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+        assert!(stdout.contains("kept"), "got {stdout:?}");
+    }
+
+    // -- permission declaration ----------------------------------------------
+
+    #[test]
+    fn a_custom_shell_tool_declares_itself_as_reading_and_writing() {
+        let info = tool("cargo test --workspace").permission_info();
+
+        assert!(info.writes_files, "a shell command can write anywhere");
+        assert!(info.reads_files, "a shell command can read anything");
+        assert!(
+            info.path_inputs.is_empty(),
+            "there is no path input a path allow-list could check"
         );
     }
 
     #[test]
-    fn an_absolute_working_dir_overrides_the_workspace_root() {
-        let root = PathBuf::from("/workspace/proj");
-        let mut t = tool("ls");
-        t.working_dir = if cfg!(windows) {
-            "C:\\elsewhere".into()
-        } else {
-            "/elsewhere".into()
-        };
+    fn the_declared_shell_program_is_the_program_not_the_argument_text() {
+        let info = tool("git commit -m 'npm run build'").permission_info();
+        assert_eq!(info.shell_program.as_deref(), Some("git"));
+    }
 
-        assert_eq!(
-            t.resolve_working_dir(Some(&root)),
-            PathBuf::from(&t.working_dir)
-        );
+    #[test]
+    fn an_empty_command_declares_no_shell_program() {
+        assert_eq!(tool("").permission_info().shell_program, None);
     }
 
     // -- process outcomes ----------------------------------------------------

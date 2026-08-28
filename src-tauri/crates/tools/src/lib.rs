@@ -2,6 +2,7 @@
 // See RUSTYAGE-5 for implementation details.
 
 pub mod builtin;
+pub mod paths;
 pub mod shell;
 
 use std::sync::Arc;
@@ -70,12 +71,47 @@ impl ToolOutput {
 // Tool trait
 // ---------------------------------------------------------------------------
 
+/// What a tool tells the permission policy about itself.
+///
+/// The policy lives in the `runtime` crate and only ever sees a tool *name* and
+/// a JSON blob of inputs. That is not enough to decide anything: it cannot know
+/// that `file_list` reads the filesystem, that a particular custom tool shells
+/// out to `git`, or which input key of an arbitrary tool holds a path. So each
+/// tool declares it here and the policy reads the declaration.
+///
+/// The default is "inert" — a tool that touches neither the filesystem nor a
+/// subprocess. That is the right default for the story, memory, notification
+/// and subtask tools, and a tool that forgets to override it is treated as
+/// harmless only because it also cannot be *reached* by any of the gates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolPermissionInfo {
+    /// The tool reads file contents or directory listings.
+    pub reads_files: bool,
+    /// The tool mutates the filesystem.
+    pub writes_files: bool,
+    /// Input keys whose values are filesystem paths.
+    ///
+    /// Every one of them is checked, so a tool is not required to name its
+    /// path parameter `path` to be covered.
+    pub path_inputs: &'static [&'static str],
+    /// The program a shell-style tool will execute, already separated from its
+    /// arguments so that argument text cannot smuggle a match past an
+    /// allow-list.
+    pub shell_program: Option<String>,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn input_schema(&self) -> serde_json::Value;
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolOutput;
+
+    /// How the permission policy should treat this tool. See
+    /// [`ToolPermissionInfo`].
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +142,16 @@ impl ToolRegistry {
     /// tool across an `.await` without keeping the registry lock held.
     pub fn get_arc(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name).cloned()
+    }
+
+    /// The permission declaration of a registered tool, or `None` when no tool
+    /// of that name is registered.
+    ///
+    /// `None` is what makes the policy fail closed: a call the registry cannot
+    /// identify cannot be classified, and an unclassifiable call must not slip
+    /// past a restriction the operator configured.
+    pub fn permission_info(&self, name: &str) -> Option<ToolPermissionInfo> {
+        self.get(name).map(|t| t.permission_info())
     }
 
     pub fn all_definitions(&self) -> Vec<api::ToolDefinition> {
