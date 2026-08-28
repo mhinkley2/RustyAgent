@@ -370,3 +370,60 @@ describe("RunDetailPanel run isolation", () => {
     expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
   });
 });
+
+describe("RunDetailPanel interrupted runs", () => {
+  // Closing the app mid-run used to leave the row saying "running" forever.
+  // It now ends as a plain `failed` run, so the only thing that distinguishes
+  // "the agent broke" from "the app went away" is this timeline entry — which
+  // means it has to actually reach the screen.
+  const INTERRUPTED_MESSAGE =
+    "RustyAgent exited while this run was still executing, so it was marked failed on " +
+    "the next startup.";
+
+  function interruptedEvent() {
+    return {
+      id: "e1",
+      run_id: "run-1",
+      event_type: "interrupted",
+      role: null,
+      content: INTERRUPTED_MESSAGE,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      sequence_num: 3,
+      created_at: "2026-04-13T00:00:30Z",
+    };
+  }
+
+  function renderInterrupted(run: Partial<StoryRun> = {}) {
+    tauriMock.handleAll({
+      get_run_events: () => [interruptedEvent()],
+      get_run_diff: () => ({ run_id: "run-1", before_sha: null, diff_output: null }),
+    });
+    return render(
+      <RunDetailPanel run={makeRun({ status: "failed", ...run })} onClose={() => {}} />,
+    );
+  }
+
+  it("tells the operator a restart ended the run, not the agent", async () => {
+    renderInterrupted();
+
+    expect(await screen.findByText(new RegExp(INTERRUPTED_MESSAGE))).toBeInTheDocument();
+  });
+
+  it("labels the entry so it is distinguishable from an agent error", async () => {
+    renderInterrupted();
+
+    expect(await screen.findByText("interrupted")).toBeInTheDocument();
+  });
+
+  it("still reports the iterations the run got through before it was cut off", async () => {
+    // The sweep leaves `iteration_count` alone precisely so this is not zero.
+    renderInterrupted({ iterationCount: 4 });
+
+    await waitFor(async () => {
+      expect(await statValue("Iterations")).toBe("4");
+    });
+  });
+});
