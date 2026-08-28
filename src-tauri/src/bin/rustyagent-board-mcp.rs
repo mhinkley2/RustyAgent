@@ -138,7 +138,11 @@ mod tests {
         let sweep = concat!("reconcile_", "orphaned_runs");
         let call_sites: Vec<&str> = OWN_SOURCE
             .lines()
-            .filter(|line| line.contains(sweep) && !line.trim_start().starts_with("///"))
+            // Every line-comment form is skipped, not just `///`. The rule being
+            // enforced is "no executable call site"; a `//` note explaining why,
+            // or a commented-out snippet, is not one, and failing on those would
+            // make the guard punish documentation.
+            .filter(|line| line.contains(sweep) && !line.trim_start().starts_with("//"))
             .collect();
 
         assert!(

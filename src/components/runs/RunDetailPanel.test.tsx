@@ -409,7 +409,10 @@ describe("RunDetailPanel interrupted runs", () => {
   it("tells the operator a restart ended the run, not the agent", async () => {
     renderInterrupted();
 
-    expect(await screen.findByText(new RegExp(INTERRUPTED_MESSAGE))).toBeInTheDocument();
+    // Matched as a literal string, not a RegExp: the message ends in a full
+    // stop, which as a pattern matches any character, so a rendered message
+    // with the wrong last character would still have passed.
+    expect(await screen.findByText(INTERRUPTED_MESSAGE)).toBeInTheDocument();
   });
 
   it("labels the entry so it is distinguishable from an agent error", async () => {
