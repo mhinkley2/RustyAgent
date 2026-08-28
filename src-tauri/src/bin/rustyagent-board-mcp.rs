@@ -34,33 +34,74 @@ fn bundle_identifier() -> Result<String, String> {
         .ok_or_else(|| "tauri.conf.json has no \"identifier\" field".to_string())
 }
 
-/// Locate the database, matching where the desktop app puts it.
-fn default_db_path() -> Result<PathBuf, String> {
-    if let Ok(path) = env::var("RUSTYAGENT_DB_PATH") {
-        if !path.trim().is_empty() {
-            return Ok(PathBuf::from(path));
-        }
-    }
+/// The data directory and database this process should use.
+struct Paths {
+    /// `None` when nothing resolved a data directory and `RUSTYAGENT_DB_PATH`
+    /// alone said where the database is.
+    data_dir: Option<db::paths::DataDir>,
+    db_path: PathBuf,
+}
 
-    let identifier = bundle_identifier()?;
+impl Paths {
+    /// The directory the MCP context reports as the app data directory.
+    ///
+    /// Falls back to the database's own parent, which is what this binary used
+    /// before it understood a directory-level override.
+    fn app_data_dir(&self) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.path.clone())
+            .or_else(|| self.db_path.parent().map(PathBuf::from))
+    }
+}
 
-    if let Ok(appdata) = env::var("APPDATA") {
-        return Ok(PathBuf::from(appdata)
-            .join(&identifier)
-            .join("rustyagent.db"));
-    }
-    if let Ok(home) = env::var("HOME") {
-        return Ok(PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join(&identifier)
-            .join("rustyagent.db"));
-    }
-    Err("Unable to determine the RustyAgent database path. Set RUSTYAGENT_DB_PATH.".to_string())
+/// Locate the data directory and database, matching where the desktop app puts
+/// them.
+///
+/// The resolution itself lives in `db::paths` -- shared with the app so the two
+/// binaries cannot drift apart again -- and the precedence between
+/// `RUSTYAGENT_DB_PATH` and `RUSTYAGENT_DATA_DIR` is documented there.
+fn resolve_paths() -> Result<Paths, String> {
+    // Read both overrides up front, database first, before any other work.
+    // Either can answer the question on its own, and the bundle identifier
+    // below is only needed to build the platform default.
+    let db_override = db::paths::db_path_override();
+    let dir_override = db::paths::data_dir_override();
+
+    let platform_default = match dir_override {
+        Some(_) => None,
+        None => db::paths::platform_data_dir(
+            env::var("APPDATA").ok().as_deref(),
+            env::var("HOME").ok().as_deref(),
+            &bundle_identifier()?,
+        ),
+    };
+
+    let data_dir = db::paths::resolve_data_dir(dir_override.as_deref(), platform_default).ok();
+
+    let db_path = match &data_dir {
+        Some(dir) => db::paths::resolve_db_path(db_override.as_deref(), &dir.path),
+        // No data directory anywhere, but an explicit database path still
+        // fully determines where to open the database.
+        None => match &db_override {
+            Some(path) => PathBuf::from(path),
+            None => {
+                return Err(format!(
+                    "Unable to determine the RustyAgent database path. Set {} or {}.",
+                    db::paths::DATA_DIR_ENV,
+                    db::paths::DB_PATH_ENV
+                ))
+            }
+        },
+    };
+
+    Ok(Paths { data_dir, db_path })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -74,40 +115,74 @@ mod tests {
         );
     }
 
+    /// Every environment case in one test, deliberately.
+    ///
+    /// `env::set_var` is process-global, so two tests owning the same variable
+    /// in one binary race — this binary has already been bitten by exactly
+    /// that. The resolution *logic* is covered without touching the
+    /// environment at all in `db::paths`; what is left to check here is only
+    /// that this binary reads the variables it documents, and that is one
+    /// sequential story, not several concurrent ones.
     #[test]
-    fn the_default_db_path_lands_under_the_bundle_identifier() {
-        // Guards the drift that pointed this binary at a stale database.
+    fn the_binary_reads_the_documented_environment_overrides() {
         env::remove_var("RUSTYAGENT_DB_PATH");
+        env::remove_var("RUSTYAGENT_DATA_DIR");
+
+        // Unset: the database lands under the bundle identifier. Guards the
+        // drift that once pointed this binary at a stale database.
         let identifier = bundle_identifier().expect("identifier");
-
-        let path = default_db_path().expect("db path");
-
+        let default = resolve_paths().expect("paths");
         assert!(
-            path.to_string_lossy().contains(&identifier),
+            default.db_path.to_string_lossy().contains(&identifier),
             "{} should sit under {identifier}",
-            path.display()
+            default.db_path.display()
         );
-        assert!(path.ends_with("rustyagent.db"));
-    }
+        assert!(default.db_path.ends_with("rustyagent.db"));
 
-    #[test]
-    fn an_explicit_db_path_overrides_the_default() {
+        // RUSTYAGENT_DATA_DIR moves the whole directory, database included.
+        env::set_var("RUSTYAGENT_DATA_DIR", "/branch/data");
+        let moved = resolve_paths().expect("paths");
+        assert_eq!(moved.app_data_dir(), Some(PathBuf::from("/branch/data")));
+        assert_eq!(
+            moved.db_path,
+            Path::new("/branch/data").join("rustyagent.db")
+        );
+
+        // RUSTYAGENT_DB_PATH is the more specific of the two, so it takes the
+        // database and leaves the rest of the directory where it was.
         env::set_var("RUSTYAGENT_DB_PATH", "/tmp/custom.db");
-        let path = default_db_path().expect("db path");
-        env::remove_var("RUSTYAGENT_DB_PATH");
+        let split = resolve_paths().expect("paths");
+        assert_eq!(split.db_path, PathBuf::from("/tmp/custom.db"));
+        assert_eq!(split.app_data_dir(), Some(PathBuf::from("/branch/data")));
 
-        assert_eq!(path, PathBuf::from("/tmp/custom.db"));
+        // ...and on its own it still points the database wherever it says.
+        env::remove_var("RUSTYAGENT_DATA_DIR");
+        let db_only = resolve_paths().expect("paths");
+        assert_eq!(db_only.db_path, PathBuf::from("/tmp/custom.db"));
+
+        env::remove_var("RUSTYAGENT_DB_PATH");
     }
 }
 
 async fn run() -> Result<(), String> {
-    let db_path = default_db_path()?;
-    let app_data_dir = db_path.parent().map(PathBuf::from);
+    let paths = resolve_paths()?;
+    let app_data_dir = paths.app_data_dir();
+    let db_path = &paths.db_path;
 
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create '{}': {error}", parent.display()))?;
+    // Refuse to start rather than fall back to the shared default: an override
+    // that silently does nothing is the bug reading an override is meant to
+    // avoid.
+    if let Some(dir) = &paths.data_dir {
+        db::paths::prepare_data_dir(dir)?;
     }
+    db::paths::prepare_db_parent(db_path)?;
+
+    // Diagnostics on stderr: stdout carries the framed protocol.
+    match app_data_dir.as_deref() {
+        Some(dir) => eprintln!("Data directory: {}", dir.display()),
+        None => eprintln!("Data directory: (none)"),
+    }
+    eprintln!("Database: {}", db_path.display());
 
     let db = db::init_db(&db_path.to_string_lossy())
         .await

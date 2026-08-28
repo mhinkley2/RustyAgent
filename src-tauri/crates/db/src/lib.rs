@@ -7,8 +7,15 @@ use tracing::info;
 
 pub type DbPool = SqlitePool;
 
+/// Where the data directory and the database live, and how the environment
+/// overrides them. Shared by the desktop app and the standalone MCP binary.
+pub mod paths;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+
+#[cfg(test)]
+mod paths_tests;
 
 pub struct WorkspaceRecord {
     pub id: String,

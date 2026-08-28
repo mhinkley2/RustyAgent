@@ -845,16 +845,47 @@ pub fn run() {
         .manage(Arc::new(ApprovalGate::new()))
         .manage(commands::ActiveWorkspace::new())
         .setup(|app| {
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("Failed to resolve app data directory");
-            std::fs::create_dir_all(&app_data_dir)
-                .expect("Failed to create app data directory");
+            // Resolve where everything lives before anything is opened, and
+            // abort loudly if the answer is unusable. Falling back to the
+            // default when an override was asked for is the failure this
+            // guards against: two builds would silently share one database,
+            // and the first migration on either would brick the other.
+            //
+            // These panics reach stderr only -- the log file lives in the
+            // directory being resolved, so there is nowhere else to put them.
+            let data_dir = db::paths::data_dir(app.path().app_data_dir().ok())
+                .unwrap_or_else(|error| panic!("{error}"));
+            db::paths::prepare_data_dir(&data_dir).unwrap_or_else(|error| panic!("{error}"));
+            let app_data_dir = data_dir.path.clone();
+
             let log_state = init_logging(&app_data_dir.join("logs"))
                 .expect("Failed to initialize application logs");
             app.manage(log_state);
-            let db_path = app_data_dir.join("rustyagent.db");
+
+            let db_path = db::paths::db_path(&app_data_dir);
+            db::paths::prepare_db_parent(&db_path).unwrap_or_else(|error| panic!("{error}"));
+
+            // The first diagnostic question when two builds disagree about
+            // their data is which files each one actually opened.
+            if data_dir.is_overridden() {
+                tracing::info!(
+                    "Data directory: {} (overridden by {})",
+                    app_data_dir.display(),
+                    db::paths::DATA_DIR_ENV
+                );
+            } else {
+                tracing::info!("Data directory: {}", app_data_dir.display());
+            }
+            if !db_path.exists() {
+                // An empty override is indistinguishable from data loss unless
+                // the first run against it says so out loud.
+                tracing::info!(
+                    "No database at {} yet - creating one (first run for this data directory)",
+                    db_path.display()
+                );
+            }
+            tracing::info!("Database: {}", db_path.display());
+
             let db_path_str = db_path.to_string_lossy().into_owned();
             let pool = tauri::async_runtime::block_on(db::init_db(&db_path_str))
                 .expect("Failed to initialize database");

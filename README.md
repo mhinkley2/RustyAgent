@@ -15,6 +15,57 @@ npm install
 npm run tauri dev
 ```
 
+## Data directory
+
+Everything RustyAgent writes lives under one directory: `rustyagent.db`, `logs/`,
+`settings.json`, the MCP auth token, and the per-run git worktrees. By default it
+is the Tauri app-data directory named after the bundle identifier —
+`%APPDATA%/com.rustyagent.app` on Windows, `~/.local/share/com.rustyagent.app`
+elsewhere.
+
+Two environment variables move it. Most specific wins:
+
+| Variable | Moves | Notes |
+|---|---|---|
+| `RUSTYAGENT_DATA_DIR` | the whole directory — database, logs, worktrees, settings, MCP token | what you want per branch |
+| `RUSTYAGENT_DB_PATH` | the database file only | pre-existing, honoured by both binaries; everything else stays with the data directory |
+
+Both the desktop app and the `rustyagent-board-mcp` binary resolve them through
+the same helper (`src-tauri/crates/db/src/paths.rs`), so the two never disagree
+about which database they opened. Each logs the directory and database it
+resolved at startup — the app to its log file, the stdio binary to stderr.
+
+If the directory cannot be created or written to, startup fails with a message
+naming the path and the variable. It never falls back to the default: a silent
+fallback is indistinguishable from the override having worked.
+
+### Per-branch databases
+
+Migrations only move forward, and sqlx refuses to start when a migration is
+recorded in `_sqlx_migrations` but missing from the build. So running a branch
+that adds a migration against the default database leaves every other build
+unable to launch, with no forward path. Give each branch its own directory:
+
+```bash
+# bash / Git Bash
+RUSTYAGENT_DATA_DIR="$HOME/.rustyagent/$(git branch --show-current)" npm run tauri dev
+```
+
+```powershell
+# PowerShell
+$env:RUSTYAGENT_DATA_DIR = "$HOME\.rustyagent\$(git branch --show-current)"
+npm run tauri dev
+```
+
+The directory is created on first use, and the app logs that it is starting an
+empty database so a fresh board is never mistaken for lost data. Separating dev
+from release builds works the same way — point each profile at its own
+directory.
+
+The variable is read from the launching environment, so `npm run tauri dev`
+picks up a shell export but a release build started from the desktop will not.
+That is deliberate: the default has to stay correct for normal users.
+
 ## MCP Server
 
 RustyAgent exposes its board, run history, agent configuration, and workspace
