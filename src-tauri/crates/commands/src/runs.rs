@@ -34,6 +34,22 @@ pub struct StoryRun {
     pub duration_secs: Option<f64>,
     /// Git HEAD SHA at run start (None if workspace is not a git repo).
     pub before_sha: Option<String>,
+    /// Absolute path of the isolated worktree the run executed in.
+    ///
+    /// Kept on the row after cleanup as part of the record; `isolation_status`
+    /// says whether the directory still exists.
+    pub worktree_path: Option<String>,
+    /// Branch the run's worktree had checked out.
+    pub branch_name: Option<String>,
+    /// Commit made on that branch when the run finished, or None when the run
+    /// changed nothing.
+    pub after_sha: Option<String>,
+    /// `isolated` | `not_a_git_repo` | `unavailable` | `no_workspace` |
+    /// `accepted` | `reverted`. None for runs predating worktree isolation.
+    pub isolation_status: Option<String>,
+    /// Why a run was not isolated, or what was surprising about the one that
+    /// was. Shown to the operator verbatim.
+    pub isolation_note: Option<String>,
 }
 
 /// Git diff payload — fetched separately from StoryRun due to potentially large size.
@@ -97,6 +113,11 @@ fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> StoryRun {
         finished_at,
         duration_secs,
         before_sha:          row.try_get("before_sha").ok().flatten(),
+        worktree_path:       row.try_get("worktree_path").ok().flatten(),
+        branch_name:         row.try_get("branch_name").ok().flatten(),
+        after_sha:           row.try_get("after_sha").ok().flatten(),
+        isolation_status:    row.try_get("isolation_status").ok().flatten(),
+        isolation_note:      row.try_get("isolation_note").ok().flatten(),
     }
 }
 
@@ -123,7 +144,9 @@ const SELECT_RUNS: &str = "
            r.status, r.input_tokens, r.output_tokens,
            r.cache_read_input_tokens, r.cache_creation_input_tokens,
            r.estimated_cost_usd, r.iteration_count,
-           r.started_at, r.finished_at, r.before_sha
+           r.started_at, r.finished_at, r.before_sha,
+           r.worktree_path, r.branch_name, r.after_sha,
+           r.isolation_status, r.isolation_note
     FROM story_runs r
     LEFT JOIN stories s ON s.id = r.story_id
     LEFT JOIN agent_profiles a ON a.id = r.agent_profile_id";
@@ -255,4 +278,204 @@ pub async fn get_run_diff(run_id: String, db: &DbPool) -> Result<RunDiff, String
         before_sha:  row.try_get("before_sha").ok().flatten(),
         diff_output: row.try_get("diff_output").ok().flatten(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Accept / revert
+// ---------------------------------------------------------------------------
+
+/// The isolation record of one run — what accept and revert operate on.
+#[derive(Debug, Clone)]
+struct RunIsolation {
+    status: String,
+    worktree_path: String,
+    branch_name: String,
+    run_status: String,
+    story_id: String,
+}
+
+/// Load and validate the isolation record, or explain why the run cannot be
+/// accepted or reverted.
+async fn load_isolation(run_id: &str, db: &DbPool) -> Result<RunIsolation, String> {
+    let row = sqlx::query(
+        "SELECT status, story_id, worktree_path, branch_name, isolation_status \
+         FROM story_runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("DB error: {e}"))?
+    .ok_or_else(|| format!("Run '{run_id}' not found"))?;
+
+    let run_status: String = row.try_get("status").unwrap_or_default();
+    if run_status == "running" {
+        return Err(
+            "This run is still going. Stop it first — its changes are not finished or committed \
+             yet."
+                .to_string(),
+        );
+    }
+
+    let status: Option<String> = row.try_get("isolation_status").ok().flatten();
+    let worktree_path: Option<String> = row.try_get("worktree_path").ok().flatten();
+    let branch_name: Option<String> = row.try_get("branch_name").ok().flatten();
+
+    match (status.as_deref(), worktree_path, branch_name) {
+        (Some(runtime::worktree::STATUS_ISOLATED), Some(path), Some(branch)) => Ok(RunIsolation {
+            status: runtime::worktree::STATUS_ISOLATED.to_string(),
+            worktree_path: path,
+            branch_name: branch,
+            run_status,
+            story_id: row.try_get("story_id").unwrap_or_default(),
+        }),
+        (Some("accepted"), ..) => Err(
+            "This run has already been accepted; its worktree and branch are gone.".to_string(),
+        ),
+        (Some("reverted"), ..) => {
+            Err("This run has already been reverted; there is nothing left to undo.".to_string())
+        }
+        _ => Err(
+            "This run was not isolated, so RustyAgent has nothing of its own to accept or throw \
+             away. Its changes — if any — are already in your working tree, and reverting them is \
+             yours to do with git."
+                .to_string(),
+        ),
+    }
+}
+
+/// The repository the run's worktree belongs to.
+///
+/// Asked of git first, since the worktree knows its own main tree. Falls back
+/// to the run's workspace record for the case where the directory is gone.
+async fn main_repo_for(iso: &RunIsolation, db: &DbPool) -> Result<std::path::PathBuf, String> {
+    let worktree = std::path::Path::new(&iso.worktree_path);
+    if let Some(main) = runtime::worktree::main_worktree_root(worktree) {
+        return Ok(main);
+    }
+
+    let row = sqlx::query(
+        "SELECT w.path FROM stories s JOIN workspaces w ON w.id = s.workspace_id WHERE s.id = ?",
+    )
+    .bind(&iso.story_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("DB error: {e}"))?;
+
+    let from_story: Option<String> = row.and_then(|r| r.try_get("path").ok());
+    from_story
+        .map(std::path::PathBuf::from)
+        .or(db::get_active_workspace_path(db).await)
+        .ok_or_else(|| {
+            "Could not work out which repository this run belongs to — its worktree is gone and \
+             its workspace is no longer registered."
+                .to_string()
+        })
+}
+
+async fn set_isolation_status(run_id: &str, status: &str, note: &str, db: &DbPool) {
+    let _ = sqlx::query("UPDATE story_runs SET isolation_status = ?, isolation_note = ? WHERE id = ?")
+        .bind(status)
+        .bind(note)
+        .bind(run_id)
+        .execute(db)
+        .await;
+}
+
+/// Bring a finished run's changes into the user's working tree.
+///
+/// The merge is a `git merge --squash`, so the changes land staged and
+/// uncommitted for the user to review, and git aborts rather than overwriting
+/// uncommitted local work. Nothing is cleaned up unless the merge succeeded:
+/// a failed accept leaves the worktree and branch exactly where they were, so
+/// it can be retried or reverted instead.
+pub async fn accept_run(run_id: String, db: &DbPool) -> Result<String, String> {
+    let iso = load_isolation(&run_id, db).await?;
+    let main = main_repo_for(&iso, db).await?;
+
+    runtime::worktree::apply_to_main(&main, &iso.branch_name)?;
+
+    // Only now that the changes are safely in the user's tree.
+    let cleanup = cleanup_worktree(&main, &iso);
+    let note = format!(
+        "Accepted into {} from branch '{}'. The changes are staged but not committed.{}",
+        main.display(),
+        iso.branch_name,
+        cleanup
+            .as_ref()
+            .map(|e| format!(" Cleanup warning: {e}"))
+            .unwrap_or_default()
+    );
+    set_isolation_status(&run_id, "accepted", &note, db).await;
+    Ok(note)
+}
+
+/// Throw a finished run's changes away.
+///
+/// This deletes the run's own worktree and its own branch, and nothing else.
+/// The user's working tree is never read, written, reset, or cleaned — the run
+/// never wrote there in the first place, which is what makes the undo exact
+/// rather than best-effort.
+pub async fn revert_run(run_id: String, db: &DbPool) -> Result<String, String> {
+    let iso = load_isolation(&run_id, db).await?;
+    let main = main_repo_for(&iso, db).await?;
+
+    if let Some(error) = cleanup_worktree(&main, &iso) {
+        return Err(error);
+    }
+
+    let note = format!(
+        "Reverted: worktree '{}' and branch '{}' were deleted. Your working tree was not touched.",
+        iso.worktree_path, iso.branch_name
+    );
+    set_isolation_status(&run_id, "reverted", &note, db).await;
+    Ok(note)
+}
+
+/// Remove the run's worktree and branch. Returns the first error, if any.
+fn cleanup_worktree(main: &std::path::Path, iso: &RunIsolation) -> Option<String> {
+    debug_assert_eq!(iso.status, runtime::worktree::STATUS_ISOLATED);
+    debug_assert_ne!(iso.run_status, "running");
+    let worktree = std::path::Path::new(&iso.worktree_path);
+    runtime::worktree::remove(main, worktree)
+        .err()
+        .or_else(|| runtime::worktree::delete_branch(main, &iso.branch_name).err())
+}
+
+// ---------------------------------------------------------------------------
+// Startup sweep
+// ---------------------------------------------------------------------------
+
+/// Delete worktree directories that no run in the database claims.
+///
+/// Called once at startup. A run that finished but has not been accepted or
+/// reverted still claims its worktree and is left alone — the user has not
+/// decided about it yet, and the whole point of keeping it is that they can.
+pub async fn sweep_orphaned_worktrees(
+    worktrees_dir: &std::path::Path,
+    db: &DbPool,
+) -> Result<usize, String> {
+    // Only a run still in the `isolated` state claims its directory. Accepted
+    // and reverted runs keep `worktree_path` for the record, but the directory
+    // it names is meant to be gone — if a cleanup half-failed, the sweep is
+    // what finishes the job.
+    let rows = sqlx::query(
+        "SELECT worktree_path FROM story_runs          WHERE worktree_path IS NOT NULL AND isolation_status = 'isolated'",
+    )
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("DB error: {e}"))?;
+
+    let claimed: std::collections::HashSet<String> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("worktree_path").ok())
+        .collect();
+
+    let swept = runtime::worktree::sweep_orphans(worktrees_dir, &claimed);
+    for entry in &swept {
+        match &entry.error {
+            Some(e) => tracing::warn!("Could not sweep worktree '{}': {e}", entry.path.display()),
+            None => tracing::info!("Swept orphaned worktree '{}'", entry.path.display()),
+        }
+    }
+    Ok(swept.iter().filter(|e| e.error.is_none()).count())
 }

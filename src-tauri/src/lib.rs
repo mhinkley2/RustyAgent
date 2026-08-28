@@ -337,6 +337,29 @@ async fn get_run_diff(
     commands::runs::get_run_diff(run_id, db.inner()).await
 }
 
+/// Bring a finished run's changes into the user's working tree.
+///
+/// Staged, not committed, and git refuses the merge rather than overwriting
+/// uncommitted local work.
+#[tauri::command]
+async fn accept_run(
+    run_id: String,
+    db: tauri::State<'_, db::DbPool>,
+) -> Result<String, String> {
+    commands::runs::accept_run(run_id, db.inner()).await
+}
+
+/// Throw a finished run's changes away by deleting its worktree and branch.
+///
+/// The user's working tree is not touched: the run never wrote there.
+#[tauri::command]
+async fn revert_run(
+    run_id: String,
+    db: tauri::State<'_, db::DbPool>,
+) -> Result<String, String> {
+    commands::runs::revert_run(run_id, db.inner()).await
+}
+
 // ── Human-in-the-loop ───────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -865,6 +888,20 @@ pub fn run() {
                 app.state::<commands::ActiveWorkspace>().set(Some(ws.id));
             }
 
+            // Drop worktrees no run claims any more. A run that finished but
+            // has not been accepted or reverted still claims its own, and is
+            // left alone — the user has not decided about it yet. Nothing
+            // outside `<app data>/worktrees` is ever considered.
+            let pool_sweep = pool_clone.clone();
+            let worktrees_dir = app_data_dir.join("worktrees");
+            tauri::async_runtime::spawn(async move {
+                match commands::runs::sweep_orphaned_worktrees(&worktrees_dir, &pool_sweep).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("Swept {n} orphaned run worktree(s) at startup"),
+                    Err(e) => tracing::warn!("Worktree sweep failed: {e}"),
+                }
+            });
+
             // Restore continuous/scheduled profiles in the background
             tauri::async_runtime::spawn(async move {
                 scheduler::restore_schedulers(sched_clone, pool_clone, app_handle).await;
@@ -895,6 +932,8 @@ pub fn run() {
             delete_run,
             export_run_events,
             get_run_diff,
+            accept_run,
+            revert_run,
             get_pending_human_requests,
             respond_to_human_request,
             create_human_request,

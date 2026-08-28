@@ -10,6 +10,9 @@ pub use stories::{Story, CreateStoryInput, UpdateStoryInput, StoryOrderUpdate};
 pub mod runs;
 pub use runs::{StoryRun, RunEvent, RunFilters};
 
+#[cfg(test)]
+mod runs_tests;
+
 pub mod human;
 pub use human::{HumanRequest, ApprovalRequest};
 
@@ -267,6 +270,14 @@ pub async fn start_run(
     // still gets `recent` compaction at a per-model budget.
     runtime.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
+
+    // Move the run into its own git worktree before the loop starts, so the
+    // agent's file tools are pointed at an isolated checkout rather than the
+    // user's. A workspace that cannot be isolated records why on the run row
+    // and in the timeline; it never proceeds silently.
+    if let Some(dir) = runtime::worktree::dir_for(&app) {
+        runtime.isolate(&dir).await;
+    }
 
     let run_id = runtime.run_id.clone();
 
