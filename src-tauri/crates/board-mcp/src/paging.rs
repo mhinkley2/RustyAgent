@@ -83,10 +83,13 @@ pub fn cap_text_fields(row: &mut Value, fields: &[&str], tool_name: &str) {
         }
         let full = text.len();
         let cut = floor_char_boundary(text, MAX_FIELD_BYTES);
+        // The marker names the app, not "the run": this helper also caps chat
+        // messages and directory entries, which are not runs, and a marker that
+        // names the wrong thing sends the reader somewhere their value is not.
         let capped = format!(
             "{}\n[{tool_name} FIELD TRUNCATED: '{field}' is {full} bytes; the first {cut} are \
-             shown. The full value is not available over MCP — open the run in the RustyAgent \
-             app to see it.]",
+             shown. The full value is not available over MCP — view it in the RustyAgent \
+             app.]",
             &text[..cut]
         );
         object.insert((*field).to_string(), Value::String(capped));
@@ -111,6 +114,25 @@ pub fn page_envelope(
     subject: &str,
 ) -> Result<Value, String> {
     let total = rows.len();
+    let start = request.offset.saturating_sub(1);
+    let window: Vec<Value> = rows.into_iter().skip(start).collect();
+    page_envelope_of(window, total, request, tool_name, item_key, subject)
+}
+
+/// As [`page_envelope`], but taking rows already narrowed to the window that
+/// starts at `request.offset`, plus the `total` there were before narrowing.
+///
+/// Splitting it this way is what lets [`paged_rows`] serialize and field-cap
+/// one page rather than the entire list: a caller that already knows the
+/// window does not have to materialise four hundred rows to return fifty.
+fn page_envelope_of(
+    rows: Vec<Value>,
+    total: usize,
+    request: PageRequest,
+    tool_name: &str,
+    item_key: &str,
+    subject: &str,
+) -> Result<Value, String> {
     // `.max(1)` so that asking for row 1 of an empty list is an empty page
     // rather than an error: there is no row 1, but wanting it is not a mistake.
     if request.offset > total.max(1) {
@@ -123,7 +145,7 @@ pub fn page_envelope(
     let start = request.offset - 1;
     let mut page: Vec<Value> = Vec::new();
     let mut bytes = 0usize;
-    for row in rows.into_iter().skip(start).take(request.limit) {
+    for row in rows.into_iter().take(request.limit) {
         let size = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0);
         // Always emit the first row even when it alone busts the budget.
         // Otherwise a single oversized row would return an empty page whose
@@ -171,8 +193,19 @@ pub fn paged_rows<T: Serialize>(
     subject: &str,
     text_fields: &[&str],
 ) -> Result<Value, String> {
-    let mut values = Vec::with_capacity(rows.len());
-    for row in rows {
+    let total = rows.len();
+    // Narrow to the requested window *before* serializing and field-capping.
+    //
+    // The rows arrive already fetched — the underlying command is deliberately
+    // unpaged, because the app's own detail views read it and want the whole
+    // log. Converting all of them to `Value` and capping every text field to
+    // return fifty would double the in-memory footprint of the entire run for
+    // no benefit, which is the opposite of what capping is for.
+    let start = request.offset.saturating_sub(1);
+    let window = rows.into_iter().skip(start).take(request.limit);
+
+    let mut values = Vec::with_capacity(request.limit.min(total.saturating_sub(start)));
+    for row in window {
         let mut value =
             serde_json::to_value(row).map_err(|error| format!("Failed to serialize: {error}"))?;
         if !text_fields.is_empty() {
@@ -180,7 +213,7 @@ pub fn paged_rows<T: Serialize>(
         }
         values.push(value);
     }
-    page_envelope(values, request, tool_name, item_key, subject)
+    page_envelope_of(values, total, request, tool_name, item_key, subject)
 }
 
 #[cfg(test)]
@@ -193,6 +226,69 @@ mod tests {
 
     fn rows(n: usize) -> Vec<Value> {
         (0..n).map(|i| json!({ "i": i })).collect()
+    }
+
+    /// Only the requested window is converted and field-capped.
+    ///
+    /// The rows arrive already fetched, so serializing all of them to return a
+    /// page doubles the in-memory footprint of the whole list — for a long run's
+    /// event log, exactly the flooding this module exists to prevent. The
+    /// counter is owned by the test rather than a static, so it cannot race
+    /// another test in the same binary.
+    #[test]
+    fn only_the_requested_window_is_serialized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Counted(usize, Arc<AtomicUsize>);
+        impl Serialize for Counted {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                s.serialize_u64(self.0 as u64)
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let rows: Vec<Counted> =
+            (0..1_000).map(|i| Counted(i, Arc::clone(&seen))).collect();
+
+        let envelope =
+            paged_rows(rows, req(1, 10), "t", "items", "the list", &[]).expect("page");
+
+        assert_eq!(envelope["returned"], json!(10));
+        assert_eq!(envelope["total"], json!(1_000));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            10,
+            "serialized the whole list to return ten rows"
+        );
+    }
+
+    /// The same holds partway in: a window at an offset converts only its own
+    /// rows, not everything before it.
+    #[test]
+    fn a_window_at_an_offset_does_not_serialize_what_precedes_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Counted(usize, Arc<AtomicUsize>);
+        impl Serialize for Counted {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                s.serialize_u64(self.0 as u64)
+            }
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let rows: Vec<Counted> =
+            (0..500).map(|i| Counted(i, Arc::clone(&seen))).collect();
+
+        let envelope =
+            paged_rows(rows, req(401, 50), "t", "items", "the list", &[]).expect("page");
+
+        assert_eq!(envelope["returned"], json!(50));
+        assert_eq!(envelope["offset"], json!(401));
+        assert_eq!(seen.load(Ordering::SeqCst), 50);
     }
 
     #[test]
