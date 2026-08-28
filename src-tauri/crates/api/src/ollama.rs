@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::{
     error::ApiError,
     provider::{EventStream, LlmProvider},
-    types::{ChatMessage, CompletionConfig, MessageRole, StreamEvent, ToolCall, ToolDefinition},
+    types::{ChatMessage, CompletionConfig, MessageRole, StreamEvent, ToolCall, ToolDefinition, Usage},
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -49,6 +49,10 @@ struct OllamaStreamChunk {
     message: Option<OllamaMessage>,
     done: bool,
     done_reason: Option<String>,
+    /// Ollama's name for input tokens. Present only on the final chunk.
+    prompt_eval_count: Option<u64>,
+    /// Ollama's name for generated tokens. Present only on the final chunk.
+    eval_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,7 +147,14 @@ pub(crate) fn decode_line(line: &str, call_seq: &mut u32) -> Result<(Vec<StreamE
 
     if parsed.done {
         let reason = parsed.done_reason.unwrap_or_else(|| "stop".to_string());
-        out.push(StreamEvent::Done { stop_reason: reason });
+        // Ollama has no prompt cache to report, so both cache counters stay
+        // zero; a chunk that omits the counters entirely reports no usage at
+        // all rather than zero tokens.
+        let usage = match (parsed.prompt_eval_count, parsed.eval_count) {
+            (None, None) => None,
+            (input, output) => Some(Usage::new(input.unwrap_or(0), output.unwrap_or(0))),
+        };
+        out.push(StreamEvent::Done { stop_reason: reason, usage });
         return Ok((out, true));
     }
 
@@ -292,7 +303,14 @@ mod tests {
 
     fn as_done(e: &StreamEvent) -> &str {
         match e {
-            StreamEvent::Done { stop_reason } => stop_reason,
+            StreamEvent::Done { stop_reason, .. } => stop_reason,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    fn done_usage(e: &StreamEvent) -> Option<Usage> {
+        match e {
+            StreamEvent::Done { usage, .. } => *usage,
             other => panic!("expected Done, got {other:?}"),
         }
     }
@@ -387,6 +405,44 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(as_done(&events[0]), "stop");
+    }
+
+    // -- usage ---------------------------------------------------------------
+
+    #[test]
+    fn eval_counts_on_the_final_chunk_become_usage() {
+        let events = drive(&[
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"done\":false}\n",
+            "{\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":412,\"eval_count\":38}\n",
+        ]);
+
+        let usage = done_usage(events.last().expect("a Done event")).expect("usage reported");
+        assert_eq!(usage.input_tokens, 412);
+        assert_eq!(usage.output_tokens, 38);
+        assert_eq!(
+            usage.cache_read_input_tokens, 0,
+            "ollama reports no prompt cache"
+        );
+    }
+
+    #[test]
+    fn a_final_chunk_without_eval_counts_reports_no_usage() {
+        let events = drive(&["{\"done\":true,\"done_reason\":\"stop\"}\n"]);
+
+        assert_eq!(
+            done_usage(&events[0]),
+            None,
+            "an unmeasured turn must not look like a zero-token one"
+        );
+    }
+
+    #[test]
+    fn a_partially_counted_final_chunk_still_reports_what_it_has() {
+        let events = drive(&["{\"done\":true,\"eval_count\":7}\n"]);
+
+        let usage = done_usage(&events[0]).expect("usage reported");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
     }
 
     #[test]

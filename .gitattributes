@@ -1,0 +1,14 @@
+# Normalise text in the repository, and let Git pick the working-tree ending.
+* text=auto
+
+# SQL migrations must stay LF in the working tree.
+#
+# sqlx records a checksum of each migration when it is applied. With
+# core.autocrlf=true a checked-out migration gains CRLF endings, its checksum
+# stops matching the one recorded in the local database, and startup hard-fails
+# with "migration <version> was previously applied but has been modified" —
+# fixable only by editing the database or wiping it.
+*.sql text eol=lf
+
+# Shell scripts are executed on Linux CI; CRLF breaks the shebang line.
+*.sh text eol=lf

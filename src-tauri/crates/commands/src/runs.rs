@@ -17,8 +17,15 @@ pub struct StoryRun {
     pub agent_profile_id: String,
     pub agent_name: Option<String>,
     pub status: String,             // 'running' | 'done' | 'failed' | 'cancelled'
+    /// Input tokens billed at the full rate. Cached input is counted in the
+    /// two cache columns instead, so the context a run read is the sum of all
+    /// three.
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    /// An estimate from the per-model price table, not a bill. Stays 0.0 when
+    /// the model is not in the table.
     pub estimated_cost_usd: f64,
     pub iteration_count: i64,
     pub started_at: String,
@@ -82,6 +89,8 @@ fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> StoryRun {
         status:              row.try_get("status").unwrap_or_default(),
         input_tokens:        row.try_get("input_tokens").unwrap_or(0),
         output_tokens:       row.try_get("output_tokens").unwrap_or(0),
+        cache_read_input_tokens:     row.try_get("cache_read_input_tokens").unwrap_or(0),
+        cache_creation_input_tokens: row.try_get("cache_creation_input_tokens").unwrap_or(0),
         estimated_cost_usd:  row.try_get("estimated_cost_usd").unwrap_or(0.0),
         iteration_count:     row.try_get("iteration_count").unwrap_or(0),
         started_at,
@@ -112,6 +121,7 @@ const SELECT_RUNS: &str = "
     SELECT r.id, r.story_id, s.title AS story_title,
            r.agent_profile_id, a.name AS agent_name,
            r.status, r.input_tokens, r.output_tokens,
+           r.cache_read_input_tokens, r.cache_creation_input_tokens,
            r.estimated_cost_usd, r.iteration_count,
            r.started_at, r.finished_at, r.before_sha
     FROM story_runs r

@@ -18,8 +18,14 @@ export interface StoryRun {
   agentProfileId: string;
   agentName: string | null;
   status: RunStatus;
+  /** Input tokens billed at the full rate; cached input is counted separately. */
   inputTokens: number;
   outputTokens: number;
+  /** Input tokens served from the provider's prompt cache. */
+  cacheReadTokens: number;
+  /** Input tokens written into the provider's prompt cache. */
+  cacheCreationTokens: number;
+  /** Estimate from the per-model price table; 0 when the model is unpriced. */
   estimatedCostUsd: number;
   iterationCount: number;
   startedAt: Date;
@@ -64,6 +70,32 @@ export function formatCost(usd: number): string {
   if (usd === 0) return "$0.00";
   if (usd < 0.01) return `$${usd.toFixed(4)}`;
   return `$${usd.toFixed(2)}`;
+}
+
+/**
+ * Every input token the run's provider calls read, cached or not.
+ *
+ * `inputTokens` alone is only the uncached remainder, so a run with a warm
+ * prompt cache would otherwise appear to have read almost nothing.
+ */
+export function totalInputTokens(run: StoryRun): number {
+  return run.inputTokens + run.cacheReadTokens + run.cacheCreationTokens;
+}
+
+export function totalTokens(run: StoryRun): number {
+  return totalInputTokens(run) + run.outputTokens;
+}
+
+/**
+ * Cost for display, distinguishing "free" from "not priced".
+ *
+ * A run on a model missing from the price table records real tokens against no
+ * cost. Rendering that as $0.00 would state a number the app does not know, so
+ * it shows an em dash instead.
+ */
+export function formatEstimatedCost(run: StoryRun): string {
+  if (run.estimatedCostUsd === 0 && totalTokens(run) > 0) return "—";
+  return formatCost(run.estimatedCostUsd);
 }
 
 export function formatTokens(n: number): string {

@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::{
     error::ApiError,
     provider::{EventStream, LlmProvider},
-    types::{ChatMessage, CompletionConfig, MessageRole, StreamEvent, ToolCall, ToolDefinition},
+    types::{ChatMessage, CompletionConfig, MessageRole, StreamEvent, ToolCall, ToolDefinition, Usage},
 };
 
 const BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -83,7 +83,7 @@ impl AnthropicClient {
             })
             .collect();
 
-        let api_tools: Vec<Value> = tools
+        let mut api_tools: Vec<Value> = tools
             .iter()
             .map(|t| {
                 json!({
@@ -94,6 +94,14 @@ impl AnthropicClient {
             })
             .collect();
 
+        // Anthropic caches everything *up to and including* the marked block,
+        // and renders tools before the system prompt, so one breakpoint on the
+        // final tool covers the whole tool schema. Without this the full tool
+        // list is re-billed at the uncached rate on every iteration of a run.
+        if let Some(last) = api_tools.last_mut() {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
+
         let mut body = json!({
             "model": config.model,
             "max_tokens": config.max_tokens,
@@ -102,7 +110,13 @@ impl AnthropicClient {
         });
 
         if let Some(sys) = system {
-            body["system"] = json!(sys);
+            // The system prompt must be a content-block array to carry a
+            // cache_control marker; a bare string cannot.
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": { "type": "ephemeral" },
+            }]);
         }
         if let Some(temp) = config.temperature {
             body["temperature"] = json!(temp);
@@ -146,11 +160,50 @@ pub(crate) fn split_sse_blocks(buf: &mut String) -> Vec<String> {
     blocks
 }
 
+/// Fold a wire `usage` object into the running total for a stream.
+///
+/// Anthropic reports usage *cumulatively*: `message_start` carries the input
+/// and cache counts, `message_delta` restates the running output count. Every
+/// field is therefore an absolute, and must be assigned rather than summed —
+/// adding the deltas would make the output count grow quadratically.
+///
+/// A payload carrying none of the four fields leaves `total` untouched, so
+/// "the provider said nothing" stays distinguishable from "the provider said
+/// zero".
+fn merge_usage(total: &mut Option<Usage>, raw: &Value) {
+    let field = |name: &str| raw.get(name).and_then(Value::as_u64);
+    let (input, output, cache_read, cache_write) = (
+        field("input_tokens"),
+        field("output_tokens"),
+        field("cache_read_input_tokens"),
+        field("cache_creation_input_tokens"),
+    );
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return;
+    }
+
+    let usage = total.get_or_insert_with(Usage::default);
+    if let Some(v) = input {
+        usage.input_tokens = v;
+    }
+    if let Some(v) = output {
+        usage.output_tokens = v;
+    }
+    if let Some(v) = cache_read {
+        usage.cache_read_input_tokens = v;
+    }
+    if let Some(v) = cache_write {
+        usage.cache_creation_input_tokens = v;
+    }
+}
+
 /// Turn one SSE block into zero or more `StreamEvent`s, updating the in-flight
-/// tool accumulators keyed by content-block index.
+/// tool accumulators keyed by content-block index and the stream's running
+/// token usage.
 pub(crate) fn decode_block(
     block: &str,
     tools: &mut HashMap<u32, ToolAccum>,
+    usage: &mut Option<Usage>,
 ) -> Result<Vec<StreamEvent>, ApiError> {
     let mut event_type = String::new();
     let mut data_line = String::new();
@@ -221,14 +274,24 @@ pub(crate) fn decode_block(
                 out.push(finish_tool_call(acc));
             }
         }
+        "message_start" => {
+            // Input and cache counts are only ever reported here.
+            if let Some(u) = parsed.get("message").and_then(|m| m.get("usage")) {
+                merge_usage(usage, u);
+            }
+        }
         "message_delta" => {
+            // The final output count rides alongside the stop reason.
+            if let Some(u) = parsed.get("usage") {
+                merge_usage(usage, u);
+            }
             if let Some(delta) = parsed.get("delta") {
                 let stop_reason = delta
                     .get("stop_reason")
                     .and_then(|v| v.as_str())
                     .unwrap_or("end_turn")
                     .to_string();
-                out.push(StreamEvent::Done { stop_reason });
+                out.push(StreamEvent::Done { stop_reason, usage: *usage });
             }
         }
         "error" => {
@@ -316,6 +379,8 @@ impl LlmProvider for AnthropicClient {
         let stream = try_stream! {
             // In-flight tool_use blocks, keyed by content-block index.
             let mut tools: HashMap<u32, ToolAccum> = HashMap::new();
+            // Running token usage; None until the provider reports any.
+            let mut usage: Option<Usage> = None;
             let mut leftover = String::new();
 
             while let Some(chunk) = byte_stream.next().await {
@@ -323,7 +388,7 @@ impl LlmProvider for AnthropicClient {
                 leftover.push_str(&String::from_utf8_lossy(&chunk));
 
                 for block in split_sse_blocks(&mut leftover) {
-                    for event in decode_block(&block, &mut tools)? {
+                    for event in decode_block(&block, &mut tools, &mut usage)? {
                         yield event;
                     }
                 }
@@ -357,13 +422,19 @@ mod tests {
 
     /// Feed chunks through the same split/decode loop `stream_completion` uses.
     fn drive(chunks: &[&str]) -> Vec<StreamEvent> {
+        let mut usage = None;
+        drive_with_usage(chunks, &mut usage)
+    }
+
+    /// As `drive`, but exposes the stream's accumulated usage to the caller.
+    fn drive_with_usage(chunks: &[&str], usage: &mut Option<Usage>) -> Vec<StreamEvent> {
         let mut tools: HashMap<u32, ToolAccum> = HashMap::new();
         let mut leftover = String::new();
         let mut out = Vec::new();
         for chunk in chunks {
             leftover.push_str(chunk);
             for block in split_sse_blocks(&mut leftover) {
-                out.extend(decode_block(&block, &mut tools).expect("decode failed"));
+                out.extend(decode_block(&block, &mut tools, usage).expect("decode failed"));
             }
         }
         out
@@ -387,7 +458,14 @@ mod tests {
 
     fn as_done(e: &StreamEvent) -> &str {
         match e {
-            StreamEvent::Done { stop_reason } => stop_reason,
+            StreamEvent::Done { stop_reason, .. } => stop_reason,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    fn done_usage(e: &StreamEvent) -> Option<Usage> {
+        match e {
+            StreamEvent::Done { usage, .. } => *usage,
             other => panic!("expected Done, got {other:?}"),
         }
     }
@@ -714,7 +792,7 @@ mod tests {
     #[test]
     fn malformed_data_line_is_a_hard_error() {
         let mut tools = HashMap::new();
-        let err = decode_block("event: ping\ndata: {not json}", &mut tools)
+        let err = decode_block("event: ping\ndata: {not json}", &mut tools, &mut None)
             .expect_err("malformed JSON should abort the stream");
 
         assert!(matches!(err, ApiError::Serialization(_)), "got {err:?}");
@@ -786,7 +864,7 @@ mod tests {
             &config,
         );
 
-        assert_eq!(body["system"], json!("from config"));
+        assert_eq!(body["system"][0]["text"], json!("from config"));
         // The system message must not leak into the messages array.
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["messages"][0]["role"], json!("user"));
@@ -803,7 +881,7 @@ mod tests {
             &cfg(),
         );
 
-        assert_eq!(body["system"], json!("from message"));
+        assert_eq!(body["system"][0]["text"], json!("from message"));
     }
 
     #[test]
@@ -827,13 +905,140 @@ mod tests {
 
         let body = AnthropicClient::build_request_body(&[ChatMessage::user("hi")], &tools, &cfg());
 
+        assert_eq!(body["tools"][0]["name"], json!("get_story"));
+        assert_eq!(body["tools"][0]["description"], json!("Fetch a story"));
         assert_eq!(
-            body["tools"][0],
-            json!({
-                "name": "get_story",
-                "description": "Fetch a story",
-                "input_schema": { "type": "object", "properties": { "id": { "type": "string" } } },
-            })
+            body["tools"][0]["input_schema"],
+            json!({ "type": "object", "properties": { "id": { "type": "string" } } })
         );
+    }
+
+    // -- prompt caching ------------------------------------------------------
+
+    #[test]
+    fn the_system_prompt_is_sent_as_a_cacheable_block() {
+        let mut config = cfg();
+        config.system_prompt = Some("a long standing instruction".into());
+
+        let body = AnthropicClient::build_request_body(&[ChatMessage::user("hi")], &[], &config);
+
+        assert_eq!(
+            body["system"],
+            json!([{
+                "type": "text",
+                "text": "a long standing instruction",
+                "cache_control": { "type": "ephemeral" },
+            }])
+        );
+    }
+
+    #[test]
+    fn only_the_final_tool_definition_carries_the_cache_breakpoint() {
+        // Anthropic caches the prefix up to the marked block, so one marker on
+        // the last tool covers them all - and a request may not spend more than
+        // four breakpoints in total.
+        let tools: Vec<ToolDefinition> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|name| ToolDefinition {
+                name: (*name).into(),
+                description: "t".into(),
+                input_schema: json!({ "type": "object" }),
+            })
+            .collect();
+
+        let body = AnthropicClient::build_request_body(&[ChatMessage::user("hi")], &tools, &cfg());
+
+        let sent = body["tools"].as_array().expect("tools array");
+        assert_eq!(sent.len(), 3);
+        assert!(sent[0].get("cache_control").is_none(), "body was {body}");
+        assert!(sent[1].get("cache_control").is_none(), "body was {body}");
+        assert_eq!(sent[2]["cache_control"], json!({ "type": "ephemeral" }));
+    }
+
+    // -- usage ---------------------------------------------------------------
+
+    #[test]
+    fn usage_is_assembled_from_message_start_and_message_delta() {
+        // Input and cache counts arrive on message_start, output on
+        // message_delta; the Done event has to carry both halves.
+        let events = drive(&[
+            &sse(
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":120,"output_tokens":1,"cache_read_input_tokens":900,"cache_creation_input_tokens":40}}}"#,
+            ),
+            &sse(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            ),
+            &sse(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":57}}"#,
+            ),
+        ]);
+
+        let usage = done_usage(events.last().expect("a Done event")).expect("usage reported");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 57, "the message_delta count is final");
+        assert_eq!(usage.cache_read_input_tokens, 900);
+        assert_eq!(usage.cache_creation_input_tokens, 40);
+    }
+
+    #[test]
+    fn cumulative_output_counts_are_taken_not_summed() {
+        // Anthropic restates a running total on every message_delta. Summing
+        // them would make the reported output grow quadratically.
+        let events = drive(&[
+            &sse(
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            &sse(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":5}}"#,
+            ),
+            &sse(
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
+            ),
+        ]);
+
+        let usage = done_usage(events.last().expect("a Done event")).expect("usage reported");
+        assert_eq!(usage.output_tokens, 9, "5 + 9 would be double counting");
+    }
+
+    #[test]
+    fn a_stream_that_never_reports_usage_yields_none_rather_than_zeros() {
+        let events = drive(&[&sse(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        )]);
+
+        assert_eq!(
+            done_usage(&events[0]),
+            None,
+            "unmeasured usage must not masquerade as zero tokens"
+        );
+    }
+
+    #[test]
+    fn input_counts_survive_a_message_delta_that_only_restates_output() {
+        let mut usage = None;
+        drive_with_usage(
+            &[
+                &sse(
+                    "message_start",
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":77}}}"#,
+                ),
+                &sse(
+                    "message_delta",
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+                ),
+            ],
+            &mut usage,
+        );
+
+        let usage = usage.expect("usage reported");
+        assert_eq!(usage.input_tokens, 77, "message_delta must not clear it");
+        assert_eq!(usage.output_tokens, 3);
     }
 }

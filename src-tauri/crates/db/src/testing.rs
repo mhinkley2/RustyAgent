@@ -97,6 +97,38 @@ pub async fn run_status(db: &DbPool, run_id: &str) -> String {
         .get::<String, _>("status")
 }
 
+/// One run's persisted token accounting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub estimated_cost_usd: f64,
+}
+
+/// Read the token and cost columns of one `story_runs` row.
+pub async fn run_usage(db: &DbPool, run_id: &str) -> RunUsage {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT input_tokens, output_tokens, cache_read_input_tokens,
+                cache_creation_input_tokens, estimated_cost_usd
+         FROM story_runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await
+    .expect("fetch run usage");
+
+    RunUsage {
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cache_read_input_tokens: row.get("cache_read_input_tokens"),
+        cache_creation_input_tokens: row.get("cache_creation_input_tokens"),
+        estimated_cost_usd: row.get("estimated_cost_usd"),
+    }
+}
+
 /// Read every `run_events` row for a run as `(event_type, content)`, in
 /// insertion order.
 pub async fn run_events(db: &DbPool, run_id: &str) -> Vec<(String, String)> {

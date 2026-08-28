@@ -5,7 +5,20 @@ use async_trait::async_trait;
 use crate::{
     error::ApiError,
     provider::{EventStream, LlmProvider},
-    types::{ChatMessage, CompletionConfig, StreamEvent, ToolCall, ToolDefinition},
+    types::{ChatMessage, CompletionConfig, StreamEvent, ToolCall, ToolDefinition, Usage},
+};
+
+/// Token usage every scripted response reports unless overridden.
+///
+/// Fixed, and deliberately made of four distinct non-round numbers, so a test
+/// asserting on a total can tell which field a wrong sum came from — and so a
+/// multi-call run's total is unmistakably a sum rather than the last call's
+/// figures.
+pub const DEFAULT_MOCK_USAGE: Usage = Usage {
+    input_tokens: 100,
+    output_tokens: 20,
+    cache_read_input_tokens: 7,
+    cache_creation_input_tokens: 3,
 };
 
 /// A scripted response for use with [`MockLlmProvider`].
@@ -75,6 +88,7 @@ pub struct MockLlmProvider {
     queue: Arc<Mutex<Vec<MockResponse>>>,
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     available_models: Vec<String>,
+    usage: Option<Usage>,
 }
 
 impl MockLlmProvider {
@@ -83,11 +97,26 @@ impl MockLlmProvider {
             queue: Arc::new(Mutex::new(responses)),
             calls: Arc::new(Mutex::new(Vec::new())),
             available_models: vec!["mock-model".to_string()],
+            usage: Some(DEFAULT_MOCK_USAGE),
         }
     }
 
     pub fn with_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    /// Report `usage` on every scripted response instead of
+    /// [`DEFAULT_MOCK_USAGE`].
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Report no usage at all, standing in for a provider or an endpoint that
+    /// does not measure tokens.
+    pub fn without_usage(mut self) -> Self {
+        self.usage = None;
         self
     }
 
@@ -142,31 +171,32 @@ impl LlmProvider for MockLlmProvider {
             return Err(ApiError::Provider(msg));
         }
 
+        let usage = self.usage;
         let stream = try_stream! {
             match response {
                 MockResponse::Text(text) => {
                     yield StreamEvent::TextDelta(text);
-                    yield StreamEvent::Done { stop_reason: "end_turn".to_string() };
+                    yield StreamEvent::Done { stop_reason: "end_turn".to_string(), usage };
                 }
                 MockResponse::TextChunks(chunks) => {
                     for chunk in chunks {
                         yield StreamEvent::TextDelta(chunk);
                     }
-                    yield StreamEvent::Done { stop_reason: "end_turn".to_string() };
+                    yield StreamEvent::Done { stop_reason: "end_turn".to_string(), usage };
                 }
                 MockResponse::ToolCall { id, name, input } => {
                     yield StreamEvent::ToolCallDelta(ToolCall { id, name, input });
-                    yield StreamEvent::Done { stop_reason: "tool_use".to_string() };
+                    yield StreamEvent::Done { stop_reason: "tool_use".to_string(), usage };
                 }
                 MockResponse::ToolCalls(calls) => {
                     for call in calls {
                         yield StreamEvent::ToolCallDelta(call);
                     }
-                    yield StreamEvent::Done { stop_reason: "tool_use".to_string() };
+                    yield StreamEvent::Done { stop_reason: "tool_use".to_string(), usage };
                 }
                 MockResponse::Error(msg) => {
                     yield StreamEvent::Error(msg);
-                    yield StreamEvent::Done { stop_reason: "error".to_string() };
+                    yield StreamEvent::Done { stop_reason: "error".to_string(), usage };
                 }
                 // Handled above, before the stream is built.
                 MockResponse::ProviderError(_) => unreachable!(),

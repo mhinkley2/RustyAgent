@@ -6,7 +6,13 @@ import { RunDetailPanel } from "../components/runs/RunDetailPanel";
 import { useRuns } from "../hooks/useRuns";
 import { useAgents } from "../hooks/useAgents";
 import type { StoryRun, RunFilters, RunStatus } from "../types/runs";
-import { formatCost, formatTokens, formatDuration, RUN_STATUS_LABELS } from "../types/runs";
+import {
+  formatEstimatedCost,
+  formatTokens,
+  formatDuration,
+  totalTokens,
+  RUN_STATUS_LABELS,
+} from "../types/runs";
 
 // ---------------------------------------------------------------------------
 // Status filter options
@@ -211,10 +217,10 @@ export default function RunsPage() {
                       {run.iterationCount}
                     </td>
                     <td className="runs-table__cell runs-table__cell--num">
-                      {formatTokens(run.inputTokens + run.outputTokens)}
+                      {formatTokens(totalTokens(run))}
                     </td>
                     <td className="runs-table__cell runs-table__cell--num">
-                      {formatCost(run.estimatedCostUsd)}
+                      {formatEstimatedCost(run)}
                     </td>
                     <td className="runs-table__cell runs-table__cell--num">
                       {formatDuration(run.durationSecs)}
@@ -260,7 +266,7 @@ function TableHead() {
       <th className="runs-table__th">Status</th>
       <th className="runs-table__th runs-table__th--num">Iterations</th>
       <th className="runs-table__th runs-table__th--num">Tokens</th>
-      <th className="runs-table__th runs-table__th--num">Cost</th>
+      <th className="runs-table__th runs-table__th--num">Est. cost</th>
       <th className="runs-table__th runs-table__th--num">Duration</th>
       <th className="runs-table__th">Started</th>
       <th className="runs-table__th" />

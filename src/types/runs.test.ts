@@ -4,10 +4,36 @@ import { describe, expect, it } from "vitest";
 import {
   formatCost,
   formatDuration,
+  formatEstimatedCost,
   formatTokens,
+  totalInputTokens,
+  totalTokens,
   RUN_STATUS_LABELS,
   type RunStatus,
+  type StoryRun,
 } from "./runs";
+
+function run(overrides: Partial<StoryRun> = {}): StoryRun {
+  return {
+    id: "run-1",
+    storyId: "story-1",
+    storyTitle: "A story",
+    agentProfileId: "agent-1",
+    agentName: "Agent One",
+    status: "done",
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    estimatedCostUsd: 0,
+    iterationCount: 1,
+    startedAt: new Date("2026-04-13T00:00:00Z"),
+    finishedAt: new Date("2026-04-13T00:01:00Z"),
+    durationSecs: 60,
+    beforeSha: null,
+    ...overrides,
+  };
+}
 
 describe("formatCost", () => {
   it("renders exactly zero as $0.00", () => {
@@ -99,5 +125,46 @@ describe("RUN_STATUS_LABELS", () => {
     // What the bug looked like from the UI's side.
     const stale = "completed" as unknown as RunStatus;
     expect(RUN_STATUS_LABELS[stale]).toBeUndefined();
+  });
+});
+
+describe("token totals", () => {
+  it("counts cached input alongside uncached input", () => {
+    // The uncached count alone makes a cache-warm run look like it read
+    // almost nothing.
+    const r = run({ inputTokens: 100, cacheReadTokens: 800, cacheCreationTokens: 100 });
+
+    expect(totalInputTokens(r)).toBe(1000);
+  });
+
+  it("adds output on top for the grand total", () => {
+    const r = run({ inputTokens: 10, cacheReadTokens: 5, outputTokens: 2 });
+
+    expect(totalTokens(r)).toBe(17);
+  });
+
+  it("is zero for a run that reported nothing", () => {
+    expect(totalInputTokens(run())).toBe(0);
+    expect(totalTokens(run())).toBe(0);
+  });
+});
+
+describe("formatEstimatedCost", () => {
+  it("renders a priced run's estimate", () => {
+    const r = run({ inputTokens: 100, outputTokens: 20, estimatedCostUsd: 0.0012 });
+
+    expect(formatEstimatedCost(r)).toBe("$0.0012");
+  });
+
+  it("shows a dash, not $0.00, when tokens were spent but no price is known", () => {
+    // An unpriced model records real tokens against no cost; rendering that as
+    // $0.00 would assert a number the app does not have.
+    const r = run({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: 0 });
+
+    expect(formatEstimatedCost(r)).toBe("—");
+  });
+
+  it("still shows $0.00 for a run that never spent a token", () => {
+    expect(formatEstimatedCost(run())).toBe("$0.00");
   });
 });

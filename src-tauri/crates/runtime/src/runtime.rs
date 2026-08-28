@@ -11,7 +11,7 @@ use tauri::Emitter;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use api::{ChatMessage, CompletionConfig, LlmProvider, StreamEvent, ToolCall};
+use api::{ChatMessage, CompletionConfig, LlmProvider, StreamEvent, ToolCall, Usage};
 use tools::{ToolContext, ToolRegistry};
 use memory::MemoryStore;
 
@@ -137,6 +137,21 @@ pub struct ConversationRuntime {
     pub sequence_counter: Arc<AtomicU32>,
     /// Git HEAD SHA captured at run start (None if workspace is not a git repo).
     pub before_sha: Option<String>,
+
+    /// Token usage summed over every provider call this run has made.
+    ///
+    /// A run is many calls, so this is a running total, not the last call's
+    /// figures. It is persisted to `story_runs` whenever the run reaches a
+    /// terminal state — including failure and cancellation, where it accounts
+    /// for the work already paid for.
+    pub usage_total: Usage,
+    /// Usage reported by the most recent provider call, or `None` before the
+    /// first call completes or when the provider does not measure tokens.
+    ///
+    /// Unlike `usage_total` this does not accumulate: its
+    /// `total_input_tokens()` is the size of the context that was last sent,
+    /// which is the figure a context budget has to be measured against.
+    pub last_usage: Option<Usage>,
 }
 
 impl ConversationRuntime {
@@ -233,6 +248,8 @@ impl ConversationRuntime {
             event_retention_runs,
             sequence_counter: Arc::new(AtomicU32::new(0)),
             before_sha,
+            usage_total: Usage::default(),
+            last_usage: None,
         })
     }
 
@@ -351,7 +368,10 @@ impl ConversationRuntime {
                     Ok(StreamEvent::ToolCallDelta(call)) => {
                         pending_tool_calls.push(call);
                     }
-                    Ok(StreamEvent::Done { stop_reason }) => {
+                    Ok(StreamEvent::Done { stop_reason, usage }) => {
+                        if let Some(u) = usage {
+                            self.record_usage(u);
+                        }
                         final_stop_reason = stop_reason;
                         break;
                     }
@@ -625,6 +645,22 @@ impl ConversationRuntime {
         }
     }
 
+    /// Fold one provider call's usage into the run.
+    ///
+    /// Summed, never overwritten: a run makes one call per iteration and the
+    /// cost of the run is all of them, not the last one.
+    fn record_usage(&mut self, usage: Usage) {
+        self.usage_total += usage;
+        self.last_usage = Some(usage);
+        debug!(
+            run_id = %self.run_id,
+            input = usage.input_tokens,
+            output = usage.output_tokens,
+            cache_read = usage.cache_read_input_tokens,
+            "Provider reported usage"
+        );
+    }
+
     fn emit(&self, event: RunEvent) {
         match serde_json::to_value(&event) {
             Ok(payload) => self.app.emit_event("run-event", payload),
@@ -696,11 +732,39 @@ impl ConversationRuntime {
         .await;
     }
 
+    /// Mark the run terminal and write down what it spent.
+    ///
+    /// Called on every exit path — completion, failure, cancellation — because
+    /// a run that died halfway still consumed the tokens it consumed, and a
+    /// cost that only lands on the happy path is an undercount.
     async fn finish_run(&self, status: &str) {
+        let usage = self.usage_total;
+        // `None` for a model the price table does not know. COALESCE then
+        // leaves the column at its default rather than asserting $0.00 — the
+        // token counts are still recorded, only the price is withheld.
+        let cost = api::pricing::estimate_cost_usd(&self.config.model, &usage);
+        if cost.is_none() && !usage.is_zero() {
+            debug!(
+                run_id = %self.run_id,
+                model = %self.config.model,
+                "No price table entry; recording tokens without a cost estimate"
+            );
+        }
+
         let _ = sqlx::query(
-            "UPDATE story_runs SET status = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?"
+            "UPDATE story_runs \
+             SET status = ?, finished_at = CURRENT_TIMESTAMP, \
+                 input_tokens = ?, output_tokens = ?, \
+                 cache_read_input_tokens = ?, cache_creation_input_tokens = ?, \
+                 estimated_cost_usd = COALESCE(?, estimated_cost_usd) \
+             WHERE id = ?"
         )
         .bind(status)
+        .bind(usage.input_tokens as i64)
+        .bind(usage.output_tokens as i64)
+        .bind(usage.cache_read_input_tokens as i64)
+        .bind(usage.cache_creation_input_tokens as i64)
+        .bind(cost)
         .bind(&self.run_id)
         .execute(&self.db)
         .await;

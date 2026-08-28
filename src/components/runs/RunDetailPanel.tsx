@@ -3,7 +3,13 @@ import { ChevronDown, ChevronRight, Copy, Download, Trash2 } from "lucide-react"
 import { SlidePanel } from "../forms";
 import { ConfirmDialog } from "../forms";
 import type { StoryRun, RunEvent, RunDiff } from "../../types/runs";
-import { formatCost, formatTokens, formatDuration, RUN_STATUS_LABELS } from "../../types/runs";
+import {
+  formatEstimatedCost,
+  formatTokens,
+  formatDuration,
+  totalInputTokens,
+  RUN_STATUS_LABELS,
+} from "../../types/runs";
 import { useRunEvents, useRunDiff, exportRun } from "../../hooks/useRuns";
 
 // ---------------------------------------------------------------------------
@@ -276,12 +282,21 @@ export function RunDetailPanel({ run, onClose, onDelete }: RunDetailPanelProps) 
               <div className="run-detail__stat">
                 <span className="run-detail__stat-label">Tokens</span>
                 <span className="run-detail__stat-value">
-                  {formatTokens(run.inputTokens)} in · {formatTokens(run.outputTokens)} out
+                  {formatTokens(totalInputTokens(run))} in · {formatTokens(run.outputTokens)} out
                 </span>
               </div>
               <div className="run-detail__stat">
-                <span className="run-detail__stat-label">Cost</span>
-                <span className="run-detail__stat-value">{formatCost(run.estimatedCostUsd)}</span>
+                <span className="run-detail__stat-label">Cached</span>
+                <span className="run-detail__stat-value">
+                  {formatTokens(run.cacheReadTokens)} read
+                  {run.cacheCreationTokens > 0
+                    ? ` · ${formatTokens(run.cacheCreationTokens)} written`
+                    : ""}
+                </span>
+              </div>
+              <div className="run-detail__stat">
+                <span className="run-detail__stat-label">Est. cost</span>
+                <span className="run-detail__stat-value">{formatEstimatedCost(run)}</span>
               </div>
               <div className="run-detail__stat">
                 <span className="run-detail__stat-label">Iterations</span>

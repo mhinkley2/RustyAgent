@@ -16,6 +16,8 @@ interface RawRun {
   status: string;
   input_tokens: number;
   output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
   estimated_cost_usd: number;
   iteration_count: number;
   started_at: string;
@@ -52,6 +54,8 @@ function mapRun(r: RawRun): StoryRun {
     status:           r.status as StoryRun["status"],
     inputTokens:      r.input_tokens,
     outputTokens:     r.output_tokens,
+    cacheReadTokens:     r.cache_read_input_tokens,
+    cacheCreationTokens: r.cache_creation_input_tokens,
     estimatedCostUsd: r.estimated_cost_usd,
     iterationCount:   r.iteration_count,
     startedAt:        new Date(r.started_at),
