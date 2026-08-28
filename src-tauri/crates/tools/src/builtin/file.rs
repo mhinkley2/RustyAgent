@@ -303,13 +303,18 @@ impl Tool for FileReadTool {
             out.push('\n');
         }
         if truncated {
+            // What is left to fetch, which is what the reader is about to act
+            // on — not `total_bytes - shown.len()`. With an `offset`, `shown`
+            // starts at byte `start`, so that form counts the skipped prefix as
+            // outstanding and overstates the remainder by exactly the bytes
+            // already behind the reader.
+            let remaining = total_bytes.saturating_sub(start + shown.len());
             out.push_str(&format!(
                 "\n[file_read TRUNCATED: the text above is NOT the complete file. \
                  '{requested}' is {total_bytes} bytes / {total_lines} lines; this reply \
-                 carries lines {first_line}-{last_shown} ({} bytes) and omits {} bytes. \
-                 Call file_read again with \"offset\": {} to continue.]",
+                 carries lines {first_line}-{last_shown} ({} bytes) and {remaining} bytes \
+                 remain after it. Call file_read again with \"offset\": {} to continue.]",
                 shown.len(),
-                total_bytes - shown.len(),
                 last_shown + 1,
             ));
         } else {
@@ -994,9 +999,44 @@ mod tests {
         assert!(out.content.contains("is NOT the complete file"));
         assert!(out.content.contains("38400 bytes / 600 lines"), "got {:?}", out.content);
         assert!(out.content.contains("lines 1-512"), "got {:?}", out.content);
-        assert!(out.content.contains("omits 5632 bytes"), "got {:?}", out.content);
+        assert!(out.content.contains("5632 bytes remain after it"), "got {:?}", out.content);
         // ...and how to ask for the rest.
         assert!(out.content.contains("\"offset\": 513"), "got {:?}", out.content);
+    }
+
+    /// The remainder must be counted from the end of what was sent, not from
+    /// the start of the file.
+    ///
+    /// With an `offset`, the returned slice begins partway in, so
+    /// `total_bytes - shown.len()` counts the skipped prefix as still
+    /// outstanding — overstating what is left by exactly the bytes the caller
+    /// has already moved past, in the one number a paginating reader acts on.
+    #[tokio::test]
+    async fn a_truncated_read_at_an_offset_counts_only_what_follows_it() {
+        let (_dir, ctx) = rooted_ctx().await;
+        // 1200 * 64 = 76800 bytes, so a read starting at line 100 still has
+        // more than the cap left to give.
+        seed_padded_lines(&root_of(&ctx), "big.txt", 1200);
+
+        let out = FileReadTool
+            .execute(json!({ "path": "big.txt", "offset": 100 }), &ctx)
+            .await;
+
+        assert!(!out.is_error, "got {:?}", out.content);
+        assert!(out.content.contains("[file_read TRUNCATED:"), "got {:?}", out.content);
+
+        // start = 99 * 64 = 6336; shown = 32768 (512 whole lines).
+        // Remaining is 76800 - 6336 - 32768 = 37696, not 76800 - 32768 = 44032.
+        assert!(
+            out.content.contains("37696 bytes remain after it"),
+            "remainder must exclude the skipped prefix; got {:?}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("44032"),
+            "counted from the start of the file rather than the end of the reply: {:?}",
+            out.content
+        );
     }
 
     #[tokio::test]
