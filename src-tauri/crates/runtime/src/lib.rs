@@ -12,6 +12,9 @@ pub mod testing;
 mod context_tests;
 
 #[cfg(test)]
+mod permission_tests;
+
+#[cfg(test)]
 mod runtime_tests;
 
 #[cfg(test)]
@@ -19,6 +22,6 @@ mod worktree_tests;
 
 pub use approval_gate::ApprovalGate;
 pub use context::{ContextPolicy, ContextStrategy};
-pub use permission::{PermissionPolicy, PolicyDecision};
+pub use permission::{PermissionPolicy, PolicyDecision, ToolRequest};
 pub use runtime::{CancelFlag, ConversationRuntime, RunEvent};
 pub use worktree::{Isolation, RunWorktree};

@@ -376,4 +376,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&second_dir);
         cleanup(&path);
     }
+
+    async fn column_names(db: &DbPool, table: &str) -> Vec<String> {
+        sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(db)
+            .await
+            .expect("table_info")
+            .into_iter()
+            .map(|r| r.try_get::<String, _>("name").expect("name"))
+            .collect()
+    }
+
+    /// `allow_network_hosts` was stored and rendered but never read by any
+    /// decision. It is gone from the schema; the controls that are actually
+    /// enforced are not.
+    #[tokio::test]
+    async fn agent_permissions_carries_only_the_enforced_controls() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        let columns = column_names(&db, "agent_permissions").await;
+
+        assert!(
+            !columns.iter().any(|c| c == "allow_network_hosts"),
+            "allow_network_hosts should have been dropped; found {columns:?}"
+        );
+        for kept in [
+            "profile_id",
+            "allowed_tools",
+            "allow_file_read_paths",
+            "allow_file_write_paths",
+            "allow_shell_commands",
+            "require_approval_on_write",
+        ] {
+            assert!(columns.iter().any(|c| c == kept), "missing '{kept}' in {columns:?}");
+        }
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// Dropping a column from a table that already holds rows must not take the
+    /// rows, or the other columns' values, with it. This rebuilds the
+    /// pre-migration shape and applies the same statement the migration does.
+    #[tokio::test]
+    async fn dropping_allow_network_hosts_preserves_existing_permission_rows() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+
+        sqlx::query(
+            "CREATE TABLE agent_permissions (
+                 profile_id TEXT PRIMARY KEY NOT NULL,
+                 allowed_tools TEXT NOT NULL DEFAULT '[]',
+                 allow_file_read_paths TEXT NOT NULL DEFAULT '[]',
+                 allow_file_write_paths TEXT NOT NULL DEFAULT '[]',
+                 allow_shell_commands TEXT NOT NULL DEFAULT '[]',
+                 allow_network_hosts TEXT NOT NULL DEFAULT '[]',
+                 require_approval_on_write INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create pre-migration table");
+
+        sqlx::query(
+            "INSERT INTO agent_permissions
+                 (profile_id, allowed_tools, allow_file_read_paths, allow_file_write_paths,
+                  allow_shell_commands, allow_network_hosts, require_approval_on_write)
+             VALUES ('agent-1', '[\"file_read\"]', '[\"docs\"]', '[\"src\"]',
+                     '[\"git\"]', '[\"api.github.com\"]', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed a profile that configured a network allow-list");
+
+        sqlx::query("ALTER TABLE agent_permissions DROP COLUMN allow_network_hosts")
+            .execute(&pool)
+            .await
+            .expect("drop column");
+
+        let row = sqlx::query(
+            "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths,
+                    allow_shell_commands, require_approval_on_write
+             FROM agent_permissions WHERE profile_id = 'agent-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the row must survive the drop");
+
+        assert_eq!(row.try_get::<String, _>("allowed_tools").unwrap(), "[\"file_read\"]");
+        assert_eq!(row.try_get::<String, _>("allow_file_read_paths").unwrap(), "[\"docs\"]");
+        assert_eq!(row.try_get::<String, _>("allow_file_write_paths").unwrap(), "[\"src\"]");
+        assert_eq!(row.try_get::<String, _>("allow_shell_commands").unwrap(), "[\"git\"]");
+        assert_eq!(row.try_get::<i64, _>("require_approval_on_write").unwrap(), 1);
+    }
 }

@@ -18,10 +18,8 @@ pub struct AgentPermissions {
     pub allow_file_read_paths: Vec<String>,
     /// Absolute path prefixes for allowed file writes (empty = no restriction).
     pub allow_file_write_paths: Vec<String>,
-    /// Shell command name prefixes permitted (empty = no restriction).
+    /// Program names permitted for shell tools (empty = no restriction).
     pub allow_shell_commands: Vec<String>,
-    /// Network hostname allow-list (empty = no restriction).
-    pub allow_network_hosts: Vec<String>,
     /// When true, every write-tool call requires human approval.
     pub require_approval_on_write: bool,
 }
@@ -38,7 +36,7 @@ pub async fn get_agent_permissions(
 ) -> Result<AgentPermissions, String> {
     let row = sqlx::query(
         "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths,
-                allow_shell_commands, allow_network_hosts, require_approval_on_write
+                allow_shell_commands, require_approval_on_write
          FROM agent_permissions WHERE profile_id = ?",
     )
     .bind(&profile_id)
@@ -56,7 +54,6 @@ pub async fn get_agent_permissions(
             let reads: String = r.try_get("allow_file_read_paths").unwrap_or_else(|_| "[]".into());
             let writes: String = r.try_get("allow_file_write_paths").unwrap_or_else(|_| "[]".into());
             let cmds: String = r.try_get("allow_shell_commands").unwrap_or_else(|_| "[]".into());
-            let hosts: String = r.try_get("allow_network_hosts").unwrap_or_else(|_| "[]".into());
             let approval: i64 = r.try_get("require_approval_on_write").unwrap_or(0);
             Ok(AgentPermissions {
                 profile_id,
@@ -64,7 +61,6 @@ pub async fn get_agent_permissions(
                 allow_file_read_paths: parse_list(&reads),
                 allow_file_write_paths: parse_list(&writes),
                 allow_shell_commands: parse_list(&cmds),
-                allow_network_hosts: parse_list(&hosts),
                 require_approval_on_write: approval != 0,
             })
         }
@@ -89,15 +85,14 @@ pub async fn upsert_agent_permissions(
     sqlx::query(
         "INSERT INTO agent_permissions
              (profile_id, allowed_tools, allow_file_read_paths, allow_file_write_paths,
-              allow_shell_commands, allow_network_hosts, require_approval_on_write,
+              allow_shell_commands, require_approval_on_write,
               updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(profile_id) DO UPDATE SET
              allowed_tools           = excluded.allowed_tools,
              allow_file_read_paths   = excluded.allow_file_read_paths,
              allow_file_write_paths  = excluded.allow_file_write_paths,
              allow_shell_commands    = excluded.allow_shell_commands,
-             allow_network_hosts     = excluded.allow_network_hosts,
              require_approval_on_write = excluded.require_approval_on_write,
              updated_at              = excluded.updated_at",
     )
@@ -106,7 +101,6 @@ pub async fn upsert_agent_permissions(
     .bind(to_json(&perms.allow_file_read_paths))
     .bind(to_json(&perms.allow_file_write_paths))
     .bind(to_json(&perms.allow_shell_commands))
-    .bind(to_json(&perms.allow_network_hosts))
     .bind(perms.require_approval_on_write as i64)
     .execute(db)
     .await

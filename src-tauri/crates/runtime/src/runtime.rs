@@ -644,7 +644,21 @@ impl ConversationRuntime {
         for call in calls {
             // Full permission check (defend in depth — tools are pre-filtered but
             // the policy may impose path restrictions or require approval).
-            match self.permission_policy.check_tool(&call.name, &call.input) {
+            //
+            // The tool's own declaration comes from the registry: the policy
+            // cannot know from a name and a JSON blob that `file_list` reads the
+            // disk, that a custom tool shells out to `git`, or which input key
+            // holds a path. A name the registry does not know yields `None`,
+            // which the policy treats as unclassifiable and fails closed on.
+            let permission_info = {
+                let registry = self.tool_registry.lock().await;
+                registry.permission_info(&call.name)
+            };
+            let request = crate::ToolRequest::new(&call.name, &call.input)
+                .with_info(permission_info)
+                .with_workspace_root(self.workspace_root.as_deref());
+
+            match self.permission_policy.check_tool(&request) {
                 PolicyDecision::Allow => {
                     // fall through to execution below
                 }
