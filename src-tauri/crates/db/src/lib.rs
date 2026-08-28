@@ -11,11 +11,18 @@ pub type DbPool = SqlitePool;
 /// overrides them. Shared by the desktop app and the standalone MCP binary.
 pub mod paths;
 
+/// Startup reconciliation of runs and approvals a previous session left
+/// mid-flight, plus the per-process id that makes it safe.
+pub mod recovery;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 #[cfg(test)]
 mod paths_tests;
+
+#[cfg(test)]
+mod recovery_tests;
 
 pub struct WorkspaceRecord {
     pub id: String,
