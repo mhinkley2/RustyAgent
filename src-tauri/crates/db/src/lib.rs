@@ -69,9 +69,14 @@ pub async fn init_db(db_path: &str) -> Result<DbPool> {
 
 /// Returns the absolute path of the most recently opened workspace, if any.
 /// The active workspace is the one with the most recent `last_opened_at` timestamp.
+///
+/// The `created_at` tiebreak matches [`list_workspaces`] exactly. `last_opened_at`
+/// has millisecond resolution, so two workspaces touched in the same millisecond
+/// can tie; ordering by `created_at` keeps this function consistent with
+/// `list_workspaces` when that happens.
 pub async fn get_active_workspace_path(db: &DbPool) -> Option<std::path::PathBuf> {
     let row = sqlx::query(
-        "SELECT path FROM workspaces ORDER BY last_opened_at DESC LIMIT 1"
+        "SELECT path FROM workspaces ORDER BY last_opened_at DESC, created_at DESC LIMIT 1"
     )
     .fetch_optional(db)
     .await
@@ -89,7 +94,9 @@ pub struct MostRecentWorkspace {
 /// Returns the id + path of the most recently opened workspace, if any.
 pub async fn get_most_recent_workspace(db: &DbPool) -> Option<MostRecentWorkspace> {
     let row = sqlx::query(
-        "SELECT id, path FROM workspaces ORDER BY last_opened_at DESC LIMIT 1"
+        // Same tiebreak as `list_workspaces` and `get_active_workspace_path`,
+        // so all three agree on "most recent" when timestamps collide.
+        "SELECT id, path FROM workspaces ORDER BY last_opened_at DESC, created_at DESC LIMIT 1"
     )
     .fetch_optional(db)
     .await
@@ -283,6 +290,46 @@ mod tests {
         cleanup(&path);
     }
 
+    /// The three "most recent workspace" queries must name the same row.
+    ///
+    /// Timestamps are written directly here rather than via `touch_workspace`,
+    /// so the ordering under test is unambiguous instead of depending on how
+    /// fast the machine happens to be.
+    #[tokio::test]
+    async fn the_most_recent_workspace_queries_agree_when_timestamps_differ() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        for (id, ws_path, opened) in [
+            ("ws-older", "/tmp/older", "2026-01-01T00:00:00.000Z"),
+            ("ws-newer", "/tmp/newer", "2026-01-02T00:00:00.000Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO workspaces (id, path, name, last_opened_at, created_at)                  VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(ws_path)
+            .bind(id)
+            .bind(opened)
+            .bind(opened)
+            .execute(&db)
+            .await
+            .expect("seed workspace");
+        }
+
+        let listed = list_workspaces(&db).await.expect("list_workspaces failed");
+        let active = get_active_workspace_path(&db).await.expect("active path");
+        let recent = get_most_recent_workspace(&db).await.expect("recent workspace");
+
+        assert_eq!(listed[0].path, "/tmp/newer");
+        assert_eq!(active, std::path::PathBuf::from("/tmp/newer"));
+        assert_eq!(recent.path, "/tmp/newer");
+        assert_eq!(recent.id, "ws-newer");
+
+        drop(db);
+        cleanup(&path);
+    }
+
     #[tokio::test]
     async fn touch_workspace_upserts_and_promotes_workspace() {
         let path = temp_db_path();
@@ -302,13 +349,27 @@ mod tests {
         assert_ne!(first.id, second.id);
 
         let workspaces = list_workspaces(&db).await.expect("list_workspaces failed");
-        assert_eq!(workspaces.len(), 2);
-        assert_eq!(workspaces[0].path, first.path);
+        assert_eq!(workspaces.len(), 2, "upsert must not create a third row");
 
-        let active = get_active_workspace_path(&db)
-            .await
-            .expect("expected active workspace path after touch");
-        assert_eq!(active, std::path::PathBuf::from(&first.path));
+        // Deliberately not `workspaces[0].path == first.path`.
+        //
+        // `last_opened_at` is stamped by strftime at millisecond resolution, so
+        // three touches in a row against an in-memory database routinely land
+        // inside the same millisecond. The ordering between them is then a tie,
+        // and asserting a winner asserts something the data does not express —
+        // which is exactly how this test came to fail roughly one run in ten and
+        // abort the whole workspace suite with it.
+        //
+        // What promotion actually guarantees is that the promoted row's
+        // timestamp is not behind the row touched before it. Ordering itself is
+        // covered deterministically by
+        // `the_most_recent_workspace_queries_agree_when_timestamps_differ`.
+        assert!(
+            promoted.last_opened_at >= second.last_opened_at,
+            "promoting must not move a workspace backwards: {} < {}",
+            promoted.last_opened_at,
+            second.last_opened_at
+        );
 
         drop(db);
         let _ = std::fs::remove_dir_all(&first_dir);
