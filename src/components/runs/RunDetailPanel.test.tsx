@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
 
 import { tauriMock } from "../../test/tauriMock";
 import { RunDetailPanel } from "./RunDetailPanel";
@@ -23,6 +24,11 @@ function makeRun(overrides: Partial<StoryRun> = {}): StoryRun {
     finishedAt: new Date("2026-04-13T00:01:00Z"),
     durationSecs: 60,
     beforeSha: null,
+    worktreePath: null,
+    branchName: null,
+    afterSha: null,
+    isolationStatus: null,
+    isolationNote: null,
     ...overrides,
   };
 }
@@ -179,5 +185,188 @@ describe("RunDetailPanel context compaction", () => {
     ]);
 
     expect(await screen.findByText("not json")).toBeInTheDocument();
+  });
+});
+
+describe("RunDetailPanel run isolation", () => {
+  function renderIsolated(overrides: Partial<StoryRun>, diffOutput: string | null = null) {
+    const run = makeRun({
+      beforeSha: "abc123def456789",
+      worktreePath: "/data/worktrees/run-1",
+      branchName: "rustyagent/run-1",
+      isolationStatus: "isolated",
+      ...overrides,
+    });
+    tauriMock.handleAll({
+      get_run_events: () => [],
+      get_run_diff: () => ({
+        run_id: run.id,
+        before_sha: run.beforeSha,
+        diff_output: diffOutput,
+      }),
+      accept_run: () => "Accepted into /repo from branch 'rustyagent/run-1'.",
+      revert_run: () => "Reverted: worktree and branch were deleted.",
+    });
+    return { run, ...render(<RunDetailPanel run={run} onClose={() => {}} />) };
+  }
+
+  /** Move to the File Changes tab, where the isolation banner lives. */
+  async function openChanges() {
+    await userEvent.click(screen.getByRole("tab", { name: "File Changes" }));
+  }
+
+  it("offers accept and revert once an isolated run has finished", async () => {
+    renderIsolated({});
+
+    expect(await screen.findByRole("button", { name: /Accept/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Revert/ })).toBeEnabled();
+  });
+
+  it("offers neither while the run is still going", async () => {
+    // Its changes are not committed yet, so there is nothing coherent to
+    // accept or throw away.
+    renderIsolated({ status: "running", finishedAt: null, durationSecs: null });
+
+    await screen.findByRole("button", { name: /Export/ });
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Revert/ })).not.toBeInTheDocument();
+  });
+
+  it("offers neither for a run that was never isolated", async () => {
+    renderIsolated({
+      isolationStatus: "not_a_git_repo",
+      worktreePath: null,
+      branchName: null,
+      isolationNote: "'/tmp/plain' is not a git repository, so this run could not be isolated.",
+    });
+
+    await screen.findByRole("button", { name: /Export/ });
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Revert/ })).not.toBeInTheDocument();
+  });
+
+  it("warns, in the run's own words, when a run wrote into the user's tree", async () => {
+    renderIsolated({
+      isolationStatus: "not_a_git_repo",
+      isolationNote: "'/tmp/plain' is not a git repository, so this run could not be isolated.",
+    });
+    await openChanges();
+
+    expect(await screen.findByText("This run was not isolated.")).toBeInTheDocument();
+    expect(screen.getByText(/not a git repository/)).toBeInTheDocument();
+  });
+
+  it("names the branch an isolated run's changes are parked on", async () => {
+    renderIsolated({});
+    await openChanges();
+
+    const banner = await screen.findByText(/isolated worktree on branch/);
+    expect(banner.textContent).toContain("rustyagent/run-1");
+    expect(banner.textContent).toContain("Nothing here has reached your working tree yet");
+  });
+
+  it("shows the isolation banner above the diff, not only when there is none", async () => {
+    renderIsolated({}, "diff --git a/new.txt b/new.txt\n+created\n");
+    await openChanges();
+
+    expect(await screen.findByText(/isolated worktree on branch/)).toBeInTheDocument();
+    expect(screen.getByText("diff --git a/new.txt b/new.txt")).toBeInTheDocument();
+  });
+
+  it("accepting asks the backend to merge this run and reports what happened", async () => {
+    const onDecided = vi.fn();
+    const run = makeRun({
+      beforeSha: "abc123",
+      worktreePath: "/data/worktrees/run-1",
+      branchName: "rustyagent/run-1",
+      isolationStatus: "isolated",
+    });
+    tauriMock.handleAll({
+      get_run_events: () => [],
+      get_run_diff: () => ({ run_id: run.id, before_sha: "abc123", diff_output: null }),
+      accept_run: () => "Accepted into /repo from branch 'rustyagent/run-1'.",
+    });
+    render(<RunDetailPanel run={run} onClose={() => {}} onDecided={onDecided} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Accept/ }));
+
+    await waitFor(() => {
+      expect(tauriMock.calls("accept_run")).toEqual([{ runId: "run-1" }]);
+    });
+    expect(onDecided).toHaveBeenCalled();
+  });
+
+  it("reverting confirms first, and says the user's tree is not touched", async () => {
+    renderIsolated({});
+
+    await userEvent.click(await screen.findByRole("button", { name: /Revert/ }));
+
+    expect(await screen.findByText("Throw away this run's changes?")).toBeInTheDocument();
+    expect(screen.getByText(/never wrote there/)).toBeInTheDocument();
+    // Nothing has happened yet — the confirmation is a real gate.
+    expect(tauriMock.called("revert_run")).toBe(false);
+  });
+
+  it("reverting only calls the backend once the user confirms", async () => {
+    const onDecided = vi.fn();
+    const run = makeRun({
+      beforeSha: "abc123",
+      worktreePath: "/data/worktrees/run-1",
+      branchName: "rustyagent/run-1",
+      isolationStatus: "isolated",
+    });
+    tauriMock.handleAll({
+      get_run_events: () => [],
+      get_run_diff: () => ({ run_id: run.id, before_sha: "abc123", diff_output: null }),
+      revert_run: () => "Reverted: worktree and branch were deleted.",
+    });
+    render(<RunDetailPanel run={run} onClose={() => {}} onDecided={onDecided} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Revert/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Revert Run" }));
+
+    await waitFor(() => {
+      expect(tauriMock.calls("revert_run")).toEqual([{ runId: "run-1" }]);
+    });
+    expect(onDecided).toHaveBeenCalled();
+  });
+
+  it("keeps the run when accepting fails, so it can be retried or reverted", async () => {
+    // git refusing to merge over uncommitted local work is the safe outcome,
+    // and the panel must not pretend the decision was made.
+    const onDecided = vi.fn();
+    const run = makeRun({
+      beforeSha: "abc123",
+      worktreePath: "/data/worktrees/run-1",
+      branchName: "rustyagent/run-1",
+      isolationStatus: "isolated",
+    });
+    tauriMock.handleAll({
+      get_run_events: () => [],
+      get_run_diff: () => ({ run_id: run.id, before_sha: "abc123", diff_output: null }),
+      accept_run: () => {
+        throw new Error("local changes would be overwritten");
+      },
+    });
+    render(<RunDetailPanel run={run} onClose={() => {}} onDecided={onDecided} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /Accept/ }));
+
+    await waitFor(() => {
+      expect(tauriMock.called("accept_run")).toBe(true);
+    });
+    expect(onDecided).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /Accept/ })).toBeEnabled();
+  });
+
+  it("says so plainly once a run has been accepted or reverted", async () => {
+    renderIsolated({
+      isolationStatus: "reverted",
+      isolationNote: "Reverted: worktree and branch were deleted.",
+    });
+    await openChanges();
+
+    expect(await screen.findByText(/worktree and branch were deleted/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Accept/ })).not.toBeInTheDocument();
   });
 });

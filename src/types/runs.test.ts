@@ -31,6 +31,11 @@ function run(overrides: Partial<StoryRun> = {}): StoryRun {
     finishedAt: new Date("2026-04-13T00:01:00Z"),
     durationSecs: 60,
     beforeSha: null,
+    worktreePath: null,
+    branchName: null,
+    afterSha: null,
+    isolationStatus: null,
+    isolationNote: null,
     ...overrides,
   };
 }
