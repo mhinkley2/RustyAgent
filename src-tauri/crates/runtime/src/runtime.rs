@@ -25,6 +25,15 @@ use crate::{PermissionPolicy, PolicyDecision};
 /// over budget, so a long one defeats the compaction that produced it.
 const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 700;
 
+/// Space held back from the budget when `context_strategy = "summary"`, so the
+/// reinserted summary fits without pushing the request over.
+///
+/// The summarisation call is capped at [`SUMMARY_MAX_OUTPUT_TOKENS`], so the
+/// message can carry at most that much text; the remainder covers the
+/// `[compacted context]` marker and the per-message envelope. Erring high
+/// costs one extra evicted turn — erring low costs the invariant.
+const SUMMARY_RESERVE_TOKENS: u64 = SUMMARY_MAX_OUTPUT_TOKENS as u64 + 64;
+
 /// Bounds on how far a reconciled estimate may be scaled by the provider's
 /// real figures.
 ///
@@ -828,14 +837,26 @@ impl ConversationRuntime {
             api::tokens::estimate_overhead(self.config.system_prompt.as_deref(), tool_defs);
         let budget = self.context_policy.budget_tokens(&self.config);
 
+        let strategy = self.context_policy.strategy;
+
+        // When we intend to summarise, plan against a reduced budget so the
+        // reinserted summary has somewhere to go. Planning against the full
+        // budget and inserting afterwards would put the request back over the
+        // limit this function exists to enforce — nothing re-checks the size
+        // once the summary is in.
+        let reserve = if strategy == ContextStrategy::Summary {
+            context::calibrate(SUMMARY_RESERVE_TOKENS, self.estimate_scale)
+        } else {
+            0
+        };
+        let plan_budget = budget.saturating_sub(reserve);
+
         let plan =
-            context::plan_compaction(&self.messages, overhead, budget, self.estimate_scale);
+            context::plan_compaction(&self.messages, overhead, plan_budget, self.estimate_scale);
 
         if plan.before_tokens <= budget {
             return Ok(());
         }
-
-        let strategy = self.context_policy.strategy;
         if strategy == ContextStrategy::Full {
             return Err(format!(
                 "Context budget exceeded: the request is an estimated {} input tokens \
@@ -887,9 +908,20 @@ impl ConversationRuntime {
         let mut after_tokens = plan.after_tokens;
         let summarized = summary.is_some();
         if let Some(message) = summary {
-            after_tokens += api::tokens::estimate_message(&message);
+            // Calibrated, like every other figure here — `plan.after_tokens`
+            // is scaled, so adding a raw estimate would mix units and report a
+            // number in neither.
+            after_tokens += context::calibrate(
+                api::tokens::estimate_message(&message),
+                self.estimate_scale,
+            );
             self.messages.insert(plan.protected, message);
         }
+
+        debug_assert!(
+            after_tokens <= budget || !plan.fits,
+            "compaction left {after_tokens} tokens against a budget of {budget}"
+        );
 
         let payload = serde_json::json!({
             "strategy": strategy.as_str(),

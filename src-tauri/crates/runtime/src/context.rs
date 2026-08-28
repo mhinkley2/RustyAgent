@@ -213,6 +213,21 @@ pub fn protected_prefix(messages: &[ChatMessage]) -> usize {
     protected
 }
 
+/// Apply the estimator's calibration scale to a raw token count.
+///
+/// Public because every figure compared against a budget — or reported in a
+/// run event — has to be in the same units. A caller that adds a raw
+/// `api::tokens::estimate_*` result to a [`CompactionPlan`] figure is mixing
+/// calibrated and uncalibrated tokens; put the raw value through here first.
+pub fn calibrate(tokens: u64, scale: f64) -> u64 {
+    if scale <= 0.0 || !scale.is_finite() {
+        return tokens;
+    }
+    // Saturating: `as u64` clamps rather than wrapping, and a token count
+    // large enough to overflow is over budget under any reading.
+    ((tokens as f64) * scale).ceil() as u64
+}
+
 /// Decide what to evict so that `overhead + messages` fits inside `budget`.
 ///
 /// `overhead` is the part of the request that is not a message and cannot be
@@ -229,20 +244,11 @@ pub fn plan_compaction(
     budget: u64,
     scale: f64,
 ) -> CompactionPlan {
-    let calibrate = |tokens: u64| {
-        if scale <= 0.0 || !scale.is_finite() {
-            return tokens;
-        }
-        // Saturating: `as u64` clamps rather than wrapping, and a token count
-        // large enough to overflow is over budget under any reading.
-        ((tokens as f64) * scale).ceil() as u64
-    };
-
     let per_message: Vec<u64> = messages
         .iter()
-        .map(|m| calibrate(api::tokens::estimate_message(m)))
+        .map(|m| calibrate(api::tokens::estimate_message(m), scale))
         .collect();
-    let before_tokens = calibrate(overhead) + per_message.iter().sum::<u64>();
+    let before_tokens = calibrate(overhead, scale) + per_message.iter().sum::<u64>();
 
     let protected = protected_prefix(messages);
     let mut evict_end = protected;
