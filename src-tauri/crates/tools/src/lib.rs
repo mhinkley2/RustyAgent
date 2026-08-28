@@ -3,6 +3,7 @@
 
 pub mod builtin;
 pub mod paths;
+pub mod read_cap;
 pub mod shell;
 
 use std::sync::Arc;
