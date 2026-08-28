@@ -399,12 +399,18 @@ impl LlmProvider for AnthropicClient {
     }
 
     async fn list_models(&self) -> Result<Vec<String>, ApiError> {
-        // Anthropic doesn't have a public list-models endpoint; return known models.
+        // Hardcoded rather than fetched. Anthropic does expose `GET /v1/models`,
+        // which would also carry each model's real context window — worth moving
+        // to, but it is a network call on a trait method callers treat as cheap.
+        //
+        // Keep this in step with the frontend catalogue in `src/types/agent.ts`
+        // and with the PRICES / CONTEXT_WINDOWS tables in `pricing.rs`.
         Ok(vec![
-            "claude-opus-4-5".to_string(),
-            "claude-sonnet-4-5".to_string(),
-            "claude-haiku-3-5".to_string(),
-            "claude-3-opus-20240229".to_string(),
+            "claude-opus-5".to_string(),
+            "claude-sonnet-5".to_string(),
+            "claude-haiku-4-5".to_string(),
+            "claude-opus-4-8".to_string(),
+            "claude-fable-5".to_string(),
         ])
     }
 }
