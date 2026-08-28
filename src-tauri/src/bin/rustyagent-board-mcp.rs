@@ -51,7 +51,16 @@ impl Paths {
         self.data_dir
             .as_ref()
             .map(|dir| dir.path.clone())
-            .or_else(|| self.db_path.parent().map(PathBuf::from))
+            .or_else(|| {
+                // `Path::parent` yields `Some("")` for a bare filename, so a
+                // RUSTYAGENT_DB_PATH of "rustyagent.db" would otherwise report
+                // an empty data directory. Reporting nothing beats reporting a
+                // path that does not exist.
+                self.db_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(PathBuf::from)
+            })
     }
 }
 
@@ -83,7 +92,10 @@ fn resolve_paths() -> Result<Paths, String> {
         Some(dir) => db::paths::resolve_db_path(db_override.as_deref(), &dir.path),
         // No data directory anywhere, but an explicit database path still
         // fully determines where to open the database.
-        None => match &db_override {
+        None => match db_override.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            // Trimmed, like every other path this module reads. An env var
+            // exported from a shell or a .env routinely carries trailing
+            // whitespace, and `db::paths::present` strips it everywhere else.
             Some(path) => PathBuf::from(path),
             None => {
                 return Err(format!(
@@ -103,6 +115,31 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// A bare `RUSTYAGENT_DB_PATH` must not report an empty data directory.
+    ///
+    /// `Path::parent` yields `Some("")` for a filename with no directory
+    /// component, so the fallback used to hand the MCP context an empty path
+    /// and print an empty "Data directory:" line.
+    #[test]
+    fn a_bare_database_filename_reports_no_data_directory_rather_than_an_empty_one() {
+        let paths = Paths {
+            data_dir: None,
+            db_path: PathBuf::from("rustyagent.db"),
+        };
+
+        assert_eq!(paths.app_data_dir(), None);
+    }
+
+    #[test]
+    fn a_database_path_with_a_directory_still_reports_its_parent() {
+        let paths = Paths {
+            data_dir: None,
+            db_path: Path::new("sub").join("rustyagent.db"),
+        };
+
+        assert_eq!(paths.app_data_dir(), Some(PathBuf::from("sub")));
+    }
 
     #[test]
     fn the_bundle_identifier_is_read_from_the_apps_own_config() {

@@ -19,9 +19,16 @@ npm run tauri dev
 
 Everything RustyAgent writes lives under one directory: `rustyagent.db`, `logs/`,
 `settings.json`, the MCP auth token, and the per-run git worktrees. By default it
-is the Tauri app-data directory named after the bundle identifier —
-`%APPDATA%/com.rustyagent.app` on Windows, `~/.local/share/com.rustyagent.app`
-elsewhere.
+is the Tauri app-data directory named after the bundle identifier — on Windows
+that is `%APPDATA%/com.rustyagent.app`; on macOS and Linux the exact location is
+whatever Tauri resolves for the platform (typically
+`~/Library/Application Support/com.rustyagent.app` and
+`~/.local/share/com.rustyagent.app` respectively, though `XDG_DATA_HOME` and
+similar can move it).
+
+The `rustyagent-board-mcp` binary has no Tauri handle and so approximates that
+default rather than reproducing it. If the two ever disagree on your machine,
+set `RUSTYAGENT_DATA_DIR` to make both explicit.
 
 Two environment variables move it. Most specific wins:
 

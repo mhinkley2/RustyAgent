@@ -122,11 +122,21 @@ pub fn resolve_db_path(override_value: Option<&str>, data_dir: &Path) -> PathBuf
     }
 }
 
-/// The platform's default data directory for a bundle identifier.
+/// A best-effort default data directory for a bundle identifier.
 ///
-/// Mirrors what Tauri's `app_data_dir()` produces, for the standalone binary
-/// that has no `AppHandle` to ask. `appdata` is `%APPDATA%` on Windows;
-/// `home` is the POSIX fallback. `None` when neither is available.
+/// For the standalone binary, which has no `AppHandle` to ask. **This is not
+/// full parity with Tauri's `app_data_dir()`** and must not be treated as
+/// such: it honours `%APPDATA%` on Windows and falls back to
+/// `$HOME/.local/share`, but ignores `XDG_DATA_HOME` and does not implement
+/// macOS's `~/Library/Application Support`. Anyone who sets `XDG_DATA_HOME`,
+/// or runs on macOS, can therefore see this binary and the desktop app
+/// disagree about the default location.
+///
+/// Bringing the two into line would move the default path for existing
+/// installs, so it is deliberately left alone; set `RUSTYAGENT_DATA_DIR` to
+/// make both agree explicitly.
+///
+/// `None` when neither `appdata` nor `home` is available.
 pub fn platform_data_dir(
     appdata: Option<&str>,
     home: Option<&str>,

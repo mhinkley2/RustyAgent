@@ -879,8 +879,11 @@ pub fn run() {
             if !db_path.exists() {
                 // An empty override is indistinguishable from data loss unless
                 // the first run against it says so out loud.
+                // Says "this location", not "this data directory": the database
+                // can be moved on its own by RUSTYAGENT_DB_PATH while the data
+                // directory stays exactly where it was.
                 tracing::info!(
-                    "No database at {} yet - creating one (first run for this data directory)",
+                    "No database at {} yet - creating one (first run against this location)",
                     db_path.display()
                 );
             }
