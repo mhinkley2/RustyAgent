@@ -113,7 +113,7 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
 };
 
 export const CONTEXT_STRATEGY_OPTIONS: { value: ContextStrategy; label: string; description: string }[] = [
-  { value: "recent",  label: "Recent",  description: "Keep the most recent messages" },
-  { value: "summary", label: "Summary", description: "Periodically summarise older context" },
-  { value: "full",    label: "Full",    description: "Send all messages every time (expensive)" },
+  { value: "recent",  label: "Recent",  description: "Drop the oldest turns once the input budget is reached" },
+  { value: "summary", label: "Summary", description: "Replace the dropped turns with a generated summary (costs an extra call)" },
+  { value: "full",    label: "Full",    description: "Never compact — the run fails if it outgrows the budget" },
 ];

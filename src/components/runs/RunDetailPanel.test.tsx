@@ -96,3 +96,88 @@ describe("RunDetailPanel token accounting", () => {
     });
   });
 });
+
+describe("RunDetailPanel context compaction", () => {
+  function compactionEvent(payload: Record<string, unknown>) {
+    return {
+      id: "e1",
+      run_id: "run-1",
+      event_type: "context_compacted",
+      role: null,
+      content: JSON.stringify(payload),
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      sequence_num: 0,
+      created_at: "2026-04-13T00:00:30Z",
+    };
+  }
+
+  function renderWithEvents(events: unknown[]) {
+    tauriMock.handleAll({
+      get_run_events: () => events,
+      get_run_diff: () => ({ run_id: "run-1", before_sha: null, diff_output: null }),
+    });
+    return render(<RunDetailPanel run={makeRun()} onClose={() => {}} />);
+  }
+
+  it("tells the operator that history was dropped and how much", async () => {
+    // Without this the timeline shows nothing, and an agent that forgot an
+    // earlier decision looks like a model failure rather than a budget one.
+    renderWithEvents([
+      compactionEvent({
+        strategy: "recent",
+        before_tokens: 6100,
+        after_tokens: 4100,
+        budget_tokens: 6000,
+        evicted_messages: 2,
+        summarized: false,
+      }),
+    ]);
+
+    expect(await screen.findByText("✂ context compacted")).toBeInTheDocument();
+    const line = await screen.findByText(/6\.1k/);
+    expect(line.textContent).toContain("recent");
+    expect(line.textContent).toContain("4.1k");
+    expect(line.textContent).toContain("6.0k budget");
+    expect(line.textContent).toContain("2 messages dropped");
+    expect(line.textContent).not.toContain("summary");
+  });
+
+  it("says when the dropped prefix was replaced by a summary", async () => {
+    renderWithEvents([
+      compactionEvent({
+        strategy: "summary",
+        before_tokens: 6100,
+        after_tokens: 4300,
+        budget_tokens: 6000,
+        evicted_messages: 1,
+        summarized: true,
+      }),
+    ]);
+
+    const line = await screen.findByText(/replaced by a summary/);
+    expect(line.textContent).toContain("1 message dropped");
+  });
+
+  it("falls back to the raw payload rather than blanking on a malformed event", async () => {
+    renderWithEvents([
+      {
+        id: "e1",
+        run_id: "run-1",
+        event_type: "context_compacted",
+        role: null,
+        content: "not json",
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        sequence_num: 0,
+        created_at: "2026-04-13T00:00:30Z",
+      },
+    ]);
+
+    expect(await screen.findByText("not json")).toBeInTheDocument();
+  });
+});

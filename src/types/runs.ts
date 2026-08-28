@@ -9,7 +9,9 @@ export type RunEventType =
   | "thought"
   | "error"
   | "approval_request"
-  | "approval_response";
+  | "approval_response"
+  /** History was dropped to keep the request inside the model's input budget. */
+  | "context_compacted";
 
 export interface StoryRun {
   id: string;

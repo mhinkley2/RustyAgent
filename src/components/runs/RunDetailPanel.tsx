@@ -120,6 +120,46 @@ function ErrorEvent({ event }: { event: RunEvent }) {
   );
 }
 
+interface CompactionDetail {
+  strategy: string;
+  before_tokens: number;
+  after_tokens: number;
+  budget_tokens: number;
+  evicted_messages: number;
+  summarized: boolean;
+}
+
+/**
+ * A compaction is the one event that explains an agent forgetting something,
+ * so the timeline shows what it cost rather than the raw payload: how much
+ * context went away, against which budget, and whether a summary replaced it.
+ */
+function ContextCompactedEvent({ event }: { event: RunEvent }) {
+  let detail: CompactionDetail | null = null;
+  try {
+    detail = JSON.parse(event.content ?? "") as CompactionDetail;
+  } catch {
+    detail = null;
+  }
+  if (!detail) return <GenericEvent event={event} />;
+
+  return (
+    <div className="run-event run-event--compaction">
+      <span className="run-event__label run-event__label--compaction">
+        ✂ context compacted
+      </span>
+      <p className="run-event__content">
+        {detail.strategy} · {formatTokens(detail.before_tokens)} →{" "}
+        {formatTokens(detail.after_tokens)} tokens against a{" "}
+        {formatTokens(detail.budget_tokens)} budget ·{" "}
+        {detail.evicted_messages} message
+        {detail.evicted_messages === 1 ? "" : "s"} dropped
+        {detail.summarized ? " · replaced by a summary" : ""}
+      </p>
+    </div>
+  );
+}
+
 function GenericEvent({ event }: { event: RunEvent }) {
   return (
     <div className="run-event run-event--generic">
@@ -135,6 +175,7 @@ function EventRow({ event }: { event: RunEvent }) {
     case "tool_call":       return <ToolCallEvent event={event} />;
     case "tool_result":     return <ToolResultEvent event={event} />;
     case "error":           return <ErrorEvent event={event} />;
+    case "context_compacted": return <ContextCompactedEvent event={event} />;
     default:                return <GenericEvent event={event} />;
   }
 }

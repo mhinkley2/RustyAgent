@@ -551,6 +551,15 @@
   word-break: break-word;
 }
 
+/* ── Context compaction ── */
+.run-event--compaction {
+  background: var(--bg-elevated);
+}
+
+.run-event__label--compaction {
+  color: var(--warning);
+}
+
 /* ── Generic events ── */
 .run-event--generic {
   background: var(--bg-elevated);
