@@ -5,8 +5,16 @@ pub enum PolicyDecision {
     RequiresApproval,
 }
 
+// Tools that mutate the filesystem, and so are subject to
+// `allow_file_write_paths` and `require_approval_on_write`.
+//
+// NOTE: only `file_write` and `file_edit` are actually registered by
+// `tools::builtin::register_builtins`; the remaining names are stale and are
+// left for the permission-enforcement clean-up story to reconcile. They are
+// harmless here — an unregistered name simply never matches.
 const WRITE_TOOLS: &[&str] = &[
     "file_write",
+    "file_edit",
     "write_file_text",
     "create_empty_file",
     "create_dir_fs",
@@ -177,6 +185,47 @@ mod tests {
                 &serde_json::json!({"path": "/workspace/src/main.rs"})
             ),
             PolicyDecision::RequiresApproval
+        );
+    }
+
+    /// `file_edit` mutates the filesystem just as `file_write` does, so it has
+    /// to clear the same two gates. Without this it would be a hole straight
+    /// through both of them.
+    #[test]
+    fn file_edit_requires_approval_when_writes_need_approval() {
+        let mut policy = PermissionPolicy::allow_all();
+        policy.require_approval_on_write = true;
+        assert_eq!(
+            policy.check_tool("file_edit", &serde_json::json!({"path": "src/main.rs"})),
+            PolicyDecision::RequiresApproval
+        );
+    }
+
+    #[test]
+    fn file_edit_is_bound_by_allow_file_write_paths() {
+        let mut policy = PermissionPolicy::allow_all();
+        policy.allow_file_write_paths = vec!["src/".into()];
+
+        assert!(matches!(
+            policy.check_tool("file_edit", &serde_json::json!({"path": "docs/secret.md"})),
+            PolicyDecision::Deny(_)
+        ));
+        assert_eq!(
+            policy.check_tool("file_edit", &serde_json::json!({"path": "src/main.rs"})),
+            PolicyDecision::Allow
+        );
+    }
+
+    /// `file_read` must not be swept up by the write gates — a run that needs
+    /// approval before writing still has to be able to read.
+    #[test]
+    fn file_read_is_not_treated_as_a_write_tool() {
+        let mut policy = PermissionPolicy::allow_all();
+        policy.require_approval_on_write = true;
+        policy.allow_file_write_paths = vec!["src/".into()];
+        assert_eq!(
+            policy.check_tool("file_read", &serde_json::json!({"path": "docs/secret.md"})),
+            PolicyDecision::Allow
         );
     }
 
