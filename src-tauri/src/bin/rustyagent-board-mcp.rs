@@ -116,6 +116,38 @@ mod tests {
 
     use super::*;
 
+    /// This binary's own source, for the sweep guard below.
+    const OWN_SOURCE: &str = include_str!("rustyagent-board-mcp.rs");
+
+    /// This process must never reconcile runs.
+    ///
+    /// It opens the same database as the desktop app and is routinely launched
+    /// *while* the app is running — an MCP client starting it is not a signal
+    /// that nothing is executing. `db::recovery::reconcile_orphaned_runs`
+    /// marks every run it considers orphaned as failed, so calling it from
+    /// here would kill live runs in the app on the client's behalf.
+    ///
+    /// The rule is "this code path does not exist", which is a property of the
+    /// source rather than of any value a test can compute, so the source is
+    /// what is checked. `run()` is the only thing here that touches the
+    /// database, and it is a dozen lines long: if a future change reaches for
+    /// the sweep, this fails and says why.
+    #[test]
+    fn the_stdio_binary_never_sweeps_runs_out_from_under_the_running_app() {
+        // Split so the constant does not match itself.
+        let sweep = concat!("reconcile_", "orphaned_runs");
+        let call_sites: Vec<&str> = OWN_SOURCE
+            .lines()
+            .filter(|line| line.contains(sweep) && !line.trim_start().starts_with("///"))
+            .collect();
+
+        assert!(
+            call_sites.is_empty(),
+            "the stdio MCP binary must not run the startup sweep — it would mark runs \
+             the desktop app is executing as failed. Offending lines: {call_sites:?}"
+        );
+    }
+
     /// A bare `RUSTYAGENT_DB_PATH` must not report an empty data directory.
     ///
     /// `Path::parent` yields `Some("")` for a filename with no directory

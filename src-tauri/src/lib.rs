@@ -922,22 +922,58 @@ pub fn run() {
                 app.state::<commands::ActiveWorkspace>().set(Some(ws.id));
             }
 
-            // Drop worktrees no run claims any more. A run that finished but
-            // has not been accepted or reverted still claims its own, and is
-            // left alone — the user has not decided about it yet. Nothing
-            // outside `<app data>/worktrees` is ever considered.
-            let pool_sweep = pool_clone.clone();
+            // ---------------------------------------------------------------
+            // Startup recovery, then restore.
+            //
+            // One task, in order, rather than three racing ones. Both sweeps
+            // read `story_runs`, and the scheduler restores continuous and
+            // scheduled profiles that act on it — a profile brought back
+            // before the reconciliation could see a run that has been dead
+            // since the last session and treat it as work in progress. The
+            // ordering is the whole point, so it is expressed by sequence
+            // rather than left to whichever task the executor picks first.
+            //
+            // This is the only place the run reconciliation is invoked. The
+            // `rustyagent-board-mcp` stdio binary opens the same database
+            // while the app may be running and must never sweep; see
+            // `db::recovery`.
             let worktrees_dir = app_data_dir.join("worktrees");
             tauri::async_runtime::spawn(async move {
-                match commands::runs::sweep_orphaned_worktrees(&worktrees_dir, &pool_sweep).await {
+                // 1. Runs and approvals a previous session left mid-flight.
+                //    Nothing is deleted: an interrupted run keeps its events,
+                //    its token usage and its worktree, and gains a timeline
+                //    entry saying a restart ended it.
+                match db::recovery::reconcile_orphaned_runs(
+                    &pool_clone,
+                    db::recovery::instance_id(),
+                )
+                .await
+                {
+                    Ok(report) if report.is_empty() => {}
+                    Ok(report) => tracing::info!(
+                        "Startup reconciliation: {} run(s) interrupted by a restart, \
+                         {} pipeline step(s) and {} pending approval(s) closed out",
+                        report.runs.len(),
+                        report.pipeline_steps,
+                        report.approvals,
+                    ),
+                    Err(e) => tracing::warn!("Run reconciliation failed: {e}"),
+                }
+
+                // 2. Drop worktrees no run claims any more. A run that
+                //    finished but has not been accepted or reverted still
+                //    claims its own, and is left alone — the user has not
+                //    decided about it yet, and step 1 deliberately does not
+                //    touch `isolation_status`, so an interrupted run's
+                //    partial work survives for them to decide about. Nothing
+                //    outside `<app data>/worktrees` is ever considered.
+                match commands::runs::sweep_orphaned_worktrees(&worktrees_dir, &pool_clone).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("Swept {n} orphaned run worktree(s) at startup"),
                     Err(e) => tracing::warn!("Worktree sweep failed: {e}"),
                 }
-            });
 
-            // Restore continuous/scheduled profiles in the background
-            tauri::async_runtime::spawn(async move {
+                // 3. Only now bring continuous and scheduled profiles back.
                 scheduler::restore_schedulers(sched_clone, pool_clone, app_handle).await;
             });
 
