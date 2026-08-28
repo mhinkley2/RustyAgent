@@ -142,7 +142,25 @@ fn list_directory_at(
     Ok(entries)
 }
 
-/// Read a file as UTF-8 text.
+/// Read a file as UTF-8 text, in full.
+///
+/// **Deliberately uncapped**, and it must stay that way: this backs the Tauri
+/// command behind the editor UI, where a human who opens a file wants the file.
+/// Truncating here would silently shorten an editor buffer, and the next save
+/// would write the truncation to disk.
+///
+/// The board-mcp `read_file` tool also calls this, and applies the 32 KB
+/// context cap from `tools::read_cap` to the *result*. That is the right place
+/// for it: only that caller is answering into a model's context window.
+///
+/// The 10 MB refusal below is a different limit from that cap and is not
+/// redundant with it. This one is a **memory** guard — it stops the process
+/// allocating half a gigabyte for one editor tab. The context cap is a
+/// **context** guard — it stops a 9 MB file, which passes this check
+/// untouched, from flooding an external agent's window. Remove either and a
+/// real hole opens: without the memory guard a 500 MB file is read whole
+/// before anything truncates it; without the context cap every file under
+/// 10 MB is handed to the model intact.
 pub async fn read_file_text(
     path: String,
     db: &DbPool,
@@ -157,7 +175,8 @@ pub async fn read_file_text(
         return Err("Path is a directory, not a file".into());
     }
 
-    // Refuse files larger than 10 MB to avoid memory issues
+    // The memory guard. Not the context cap — see this function's doc comment
+    // for why both exist and why neither is redundant.
     let size = file_path.metadata().map(|m| m.len()).unwrap_or(0);
     if size > 10 * 1024 * 1024 {
         return Err(format!(
@@ -640,5 +659,67 @@ mod tests {
         let entries = list_directory_at(&root, ".").expect("should list");
 
         assert!(entries.is_empty());
+    }
+
+    // -- read_file_text: the editor path -------------------------------------
+    //
+    // This function serves both the Tauri command behind the editor UI and the
+    // board-mcp `read_file` tool. Only the MCP side applies the 32 KB context
+    // cap: a human who opens a file in the editor wants the file, and a
+    // truncated editor buffer would be a data-loss bug the moment they saved.
+    // These tests hold that line from the other side, so a future change that
+    // moves the cap down into this function fails here.
+
+    /// A pool whose single workspace row points at `root`, which
+    /// `get_active_workspace_path` resolves as the active workspace.
+    async fn workspace_pool(root: &Path) -> db::DbPool {
+        let pool = db::testing::make_test_pool().await;
+        db::testing::seed_workspace(&pool, "ws-1", &s(root)).await;
+        pool
+    }
+
+    #[tokio::test]
+    async fn read_file_text_returns_a_file_far_larger_than_the_context_cap_in_full() {
+        let (_dir, root) = workspace();
+        let pool = workspace_pool(&root).await;
+        // 4x the 32 KB cap the MCP read path applies, with no line long enough
+        // to be mistaken for the cap doing something else.
+        let content: String = (0..2048).map(|i| format!("line {i:04} {}\n", "-".repeat(53))).collect();
+        assert_eq!(content.len(), 2048 * 64);
+        let file = root.join("big.txt");
+        std::fs::write(&file, &content).expect("write");
+
+        let read = read_file_text(s(&file), &pool).await.expect("should read");
+
+        assert_eq!(read, content, "the editor must receive the whole file");
+        assert!(!read.contains("TRUNCATED"), "the editor path must carry no marker");
+    }
+
+    #[tokio::test]
+    async fn read_file_text_still_refuses_a_directory() {
+        let (_dir, root) = workspace();
+        let pool = workspace_pool(&root).await;
+        std::fs::create_dir(root.join("src")).expect("mkdir");
+
+        let err = read_file_text(s(&root.join("src")), &pool)
+            .await
+            .expect_err("should be rejected");
+
+        assert!(err.contains("is a directory"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn read_file_text_refuses_a_path_outside_the_workspace() {
+        let (_dir, root) = workspace();
+        let pool = workspace_pool(&root).await;
+        let outside = TempDir::new().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "x").expect("write");
+
+        let err = read_file_text(s(&secret), &pool)
+            .await
+            .expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
     }
 }
