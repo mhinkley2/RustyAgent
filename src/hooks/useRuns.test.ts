@@ -25,6 +25,8 @@ function rawRun(overrides: Record<string, unknown> & { id: string }) {
     status: "done",
     input_tokens: 100,
     output_tokens: 50,
+    cache_read_input_tokens: 900,
+    cache_creation_input_tokens: 40,
     estimated_cost_usd: 0.0123,
     iteration_count: 2,
     started_at: "2026-04-13T00:00:00Z",
@@ -63,6 +65,8 @@ describe("useRuns", () => {
     expect(run.agentName).toBe("Agent One");
     expect(run.status).toBe("done");
     expect(run.inputTokens).toBe(100);
+    expect(run.cacheReadTokens).toBe(900);
+    expect(run.cacheCreationTokens).toBe(40);
     expect(run.estimatedCostUsd).toBeCloseTo(0.0123);
     expect(run.startedAt).toBeInstanceOf(Date);
     expect(run.finishedAt).toBeInstanceOf(Date);
