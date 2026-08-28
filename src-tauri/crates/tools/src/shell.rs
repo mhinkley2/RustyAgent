@@ -34,15 +34,62 @@ pub struct ShellCommandTool {
     pub timeout_secs: u64,
 }
 
+/// Split a command string into tokens, honouring single and double quotes.
+///
+/// Quotes group whitespace into a single argument and are removed from the
+/// result, so `sh -c "exit 3"` yields `["sh", "-c", "exit 3"]` rather than
+/// splitting the script across two arguments.
+///
+/// Backslash is **not** an escape character. This is deliberate: `working_dir`
+/// and `command` routinely carry Windows paths like `C:\tools\build.exe`, and
+/// treating `\` as an escape would silently eat the separators. Quoting is the
+/// only grouping mechanism.
+///
+/// An unterminated quote contributes the text accumulated so far rather than
+/// raising a parse error — the resulting exec failure names the real program
+/// and is more useful than a parse error with no context.
+fn split_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+
+    for ch in command.chars() {
+        match quote {
+            // Closing quote.
+            Some(q) if ch == q => quote = None,
+            // Inside a quote every character is literal, whitespace included.
+            Some(_) => current.push(ch),
+            // Opening quote. Marks a token even if the quoted text is empty,
+            // so `""` survives as a deliberate empty argument.
+            None if ch == '\'' || ch == '"' => {
+                quote = Some(ch);
+                in_token = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_token {
+                    out.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                in_token = true;
+            }
+        }
+    }
+
+    if in_token {
+        out.push(current);
+    }
+    out
+}
+
 impl ShellCommandTool {
     /// Split the command string into (program, args) without invoking a shell.
-    /// Uses simple whitespace splitting — sufficient for pre-defined commands.
+    /// Quote-aware; see [`split_command`].
     fn argv(&self) -> Option<(String, Vec<String>)> {
-        let mut parts: Vec<String> = self
-            .command
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let mut parts = split_command(&self.command);
         if parts.is_empty() {
             return None;
         }
@@ -325,6 +372,54 @@ mod tests {
     fn argv_on_an_empty_or_blank_command_is_none() {
         assert!(tool("").argv().is_none());
         assert!(tool("   \t  ").argv().is_none());
+    }
+
+    #[test]
+    fn argv_keeps_a_double_quoted_argument_whole() {
+        let (program, args) = tool("sh -c \"exit 3\"").argv().expect("argv");
+        assert_eq!(program, "sh");
+        assert_eq!(args, vec!["-c", "exit 3"]);
+    }
+
+    #[test]
+    fn argv_keeps_a_single_quoted_argument_whole() {
+        let (program, args) = tool("git commit -m 'a message'").argv().expect("argv");
+        assert_eq!(program, "git");
+        assert_eq!(args, vec!["commit", "-m", "a message"]);
+    }
+
+    #[test]
+    fn argv_treats_the_other_quote_as_a_literal_inside_a_quote() {
+        let (_, args) = tool("echo \"it's fine\"").argv().expect("argv");
+        assert_eq!(args, vec!["it's fine"]);
+    }
+
+    /// Backslash is a path separator, not an escape — a Windows path must
+    /// survive splitting byte for byte.
+    #[test]
+    fn argv_preserves_backslashes_in_windows_paths() {
+        let (program, args) = tool("C:\\tools\\build.exe --out C:\\a b\\out.txt")
+            .argv()
+            .expect("argv");
+        assert_eq!(program, "C:\\tools\\build.exe");
+        assert_eq!(args, vec!["--out", "C:\\a", "b\\out.txt"]);
+
+        let (_, quoted) = tool("build.exe \"C:\\a b\\out.txt\"").argv().expect("argv");
+        assert_eq!(quoted, vec!["C:\\a b\\out.txt"]);
+    }
+
+    #[test]
+    fn argv_keeps_an_explicitly_empty_argument() {
+        let (program, args) = tool("prog \"\" next").argv().expect("argv");
+        assert_eq!(program, "prog");
+        assert_eq!(args, vec!["", "next"]);
+    }
+
+    #[test]
+    fn argv_on_an_unterminated_quote_keeps_what_it_has() {
+        let (program, args) = tool("sh -c \"exit 3").argv().expect("argv");
+        assert_eq!(program, "sh");
+        assert_eq!(args, vec!["-c", "exit 3"]);
     }
 
     #[tokio::test]

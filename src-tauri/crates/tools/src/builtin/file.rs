@@ -22,15 +22,20 @@ use crate::{Tool, ToolContext, ToolOutput};
 fn resolve_path(requested: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     if let Some(root) = &ctx.workspace_root {
         // Reject absolute paths when a workspace root is configured.
-        if Path::new(requested).is_absolute() {
+        //
+        // A leading separator is rejected too, and deliberately so: `is_absolute`
+        // is platform-dependent — "/docs/x.md" is absolute on Unix but not on
+        // Windows, which wants a drive prefix. Rejecting the leading separator
+        // outright gives one rule on every platform, and an explicit error beats
+        // silently reinterpreting "/etc/passwd" as "<root>/etc/passwd".
+        if Path::new(requested).is_absolute() || requested.starts_with(['/', '\\']) {
             return Err(
                 "Absolute paths are not allowed when a workspace root is configured. \
-                 Use a path relative to the workspace root (e.g. \"docs/output.md\").".into()
+                 Use a path relative to the workspace root, with no leading separator \
+                 (e.g. \"docs/output.md\").".into()
             );
         }
-        // Strip any leading separators so join works correctly.
-        let stripped = requested.trim_start_matches('/').trim_start_matches('\\');
-        let candidate = root.join(stripped);
+        let candidate = root.join(requested);
         let canonical_root = std::fs::canonicalize(root)
             .map(|p| strip_unc(&p))
             .unwrap_or_else(|_| normalize_path(root));
@@ -314,15 +319,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_leading_slash_is_stripped_rather_than_treated_as_absolute() {
-        let (_dir, ctx) = rooted_ctx().await;
-
-        let resolved = resolve_path("/docs/x.md", &ctx).expect("should resolve");
-
-        assert_eq!(resolved, root_of(&ctx).join("docs").join("x.md"));
-    }
-
-    #[tokio::test]
     async fn a_dot_path_resolves_to_the_workspace_root() {
         let (_dir, ctx) = rooted_ctx().await;
 
@@ -354,6 +350,21 @@ mod tests {
         let err = resolve_path(absolute, &ctx).expect_err("should be rejected");
 
         assert!(err.contains("Absolute paths are not allowed"), "got {err}");
+    }
+
+    /// A leading separator is rejected on every platform rather than stripped.
+    /// `is_absolute` alone would not do this: "/docs/x.md" is absolute on Unix
+    /// but not on Windows, so relying on it made the same input behave
+    /// differently per platform.
+    #[tokio::test]
+    async fn a_leading_separator_is_rejected_on_every_platform() {
+        let (_dir, ctx) = rooted_ctx().await;
+
+        for attempt in ["/docs/x.md", "\\docs\\x.md"] {
+            let err = resolve_path(attempt, &ctx)
+                .expect_err("a leading separator should be rejected");
+            assert!(err.contains("Absolute paths are not allowed"), "got {err}");
+        }
     }
 
     #[tokio::test]
