@@ -801,6 +801,12 @@ async fn fire_run(
     rt.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
+    // Scheduled and continuous runs fire without anyone watching, which is
+    // exactly when writing into the user's checkout is least acceptable.
+    if let Some(dir) = runtime::worktree::dir_for(&app) {
+        rt.isolate(&dir).await;
+    }
+
     let run_id = rt.run_id.clone();
 
     {

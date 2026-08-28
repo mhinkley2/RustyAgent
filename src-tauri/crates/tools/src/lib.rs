@@ -15,9 +15,16 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// A boxed async callback used by `SpawnSubtaskTool`.
-/// Signature: `(story_id, agent_id, pipeline_run_id, depth) -> run_id`
+///
+/// Signature: `(story_id, agent_id, pipeline_run_id, depth, workspace_root) -> run_id`
+///
+/// `workspace_root` is the *caller's* root, which for an isolated run is its
+/// private git worktree. A subtask inherits it rather than resolving the active
+/// workspace afresh: the parent spawned it to do work the parent will then
+/// look at, and a subtask that wrote somewhere else would both be invisible to
+/// the parent and land in the user's checkout.
 pub type SpawnSubtaskFn = Arc<
-    dyn Fn(String, String, String, u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
+    dyn Fn(String, String, String, u32, Option<std::path::PathBuf>) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
     + Send
     + Sync,
 >;

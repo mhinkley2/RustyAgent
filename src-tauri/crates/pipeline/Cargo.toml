@@ -19,3 +19,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
+
+[dev-dependencies]
+db = { path = "../db", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
