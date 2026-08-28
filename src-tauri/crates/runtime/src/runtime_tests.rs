@@ -119,6 +119,7 @@ struct Harness {
     track_history: bool,
     event_retention_runs: u32,
     context_policy: ContextPolicy,
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl Harness {
@@ -146,6 +147,7 @@ impl Harness {
             track_history: true,
             event_retention_runs: 0,
             context_policy: ContextPolicy::default(),
+            workspace_root: None,
         }
     }
 
@@ -170,7 +172,7 @@ impl Harness {
             self.sink.handle(),
             self.cancel.clone(),
             None, // memory
-            None, // workspace_root
+            self.workspace_root.clone(),
             self.track_history,
             self.event_retention_runs,
         )

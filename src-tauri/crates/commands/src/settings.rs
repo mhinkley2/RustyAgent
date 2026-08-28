@@ -24,6 +24,14 @@ pub struct AppSettings {
     /// Number of most-recent runs per story whose events are retained.
     /// Older run_events are pruned after each run completes. Default: 10.
     pub event_retention_runs: Option<u32>,
+    /// How many steps of a parallel pipeline may execute at once.
+    ///
+    /// Each in-flight step is a full checkout on disk and its own stream of
+    /// provider calls, so this is a spend and disk ceiling as much as a
+    /// concurrency one. A per-workspace override in `workspace_settings` takes
+    /// precedence; `pipeline::DEFAULT_MAX_PARALLEL_STEPS` applies when neither
+    /// is set.
+    pub max_parallel_steps: Option<u32>,
 }
 
 impl AppSettings {

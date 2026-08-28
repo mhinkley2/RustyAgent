@@ -184,6 +184,13 @@ pub struct ConversationRuntime {
     pub sequence_counter: Arc<AtomicU32>,
     /// Git HEAD SHA captured at run start (None if workspace is not a git repo).
     pub before_sha: Option<String>,
+    /// The isolated worktree this run executes in.
+    ///
+    /// `None` means the run is writing into the user's own directory, which
+    /// only happens when [`Self::isolate`] was never called or could not
+    /// isolate — and in the latter case `story_runs.isolation_status` and a
+    /// persisted `isolation` event both say so.
+    pub worktree: Option<crate::worktree::RunWorktree>,
 
     /// Token usage summed over every provider call this run has made.
     ///
@@ -314,12 +321,114 @@ impl ConversationRuntime {
             event_retention_runs,
             sequence_counter: Arc::new(AtomicU32::new(0)),
             before_sha,
+            worktree: None,
             usage_total: Usage::default(),
             last_usage: None,
             context_policy: ContextPolicy::default(),
             last_raw_estimate: None,
             estimate_scale: 1.0,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Isolation
+    // -----------------------------------------------------------------------
+
+    /// Give this run a private git worktree and point it at that instead of the
+    /// user's checkout.
+    ///
+    /// Called after construction rather than from the constructor, which
+    /// already carries nineteen arguments, and for the same reason as
+    /// `context_policy`: every caller that has an app data directory to offer
+    /// sets it straight after building, and a caller that forgets gets the old
+    /// un-isolated behaviour rather than a broken run.
+    ///
+    /// **Must be called before [`Self::run`].** Once the loop starts, the
+    /// workspace root has already been handed to tool contexts.
+    ///
+    /// This never fails the run. A workspace that cannot be isolated — no git,
+    /// no commits, no disk — records why in `story_runs.isolation_status` and
+    /// `isolation_note`, persists an `isolation` event so the reason appears in
+    /// the run timeline, and proceeds un-isolated. Silence is the one outcome
+    /// that is not allowed.
+    pub async fn isolate(&mut self, worktrees_dir: &std::path::Path) -> crate::worktree::Isolation {
+        self.isolate_from(worktrees_dir, None).await
+    }
+
+    /// As [`Self::isolate`], but branching the worktree from `base` rather than
+    /// the workspace's `HEAD`.
+    ///
+    /// The steps of a sequential pipeline pass the previous step's commit, so
+    /// each one starts from what the last one produced instead of from an
+    /// empty slate. Without it, isolation would quietly break the handoff that
+    /// makes a sequential pipeline worth running.
+    pub async fn isolate_from(
+        &mut self,
+        worktrees_dir: &std::path::Path,
+        base: Option<&str>,
+    ) -> crate::worktree::Isolation {
+        let Some(root) = self.workspace_root.clone() else {
+            let note = "This run has no workspace directory, so nothing was isolated. \
+                        File tools are unrestricted."
+                .to_string();
+            self.record_isolation(crate::worktree::STATUS_NO_WORKSPACE, Some(&note), None)
+                .await;
+            self.persist_event("isolation", &serde_json::json!({ "message": note }))
+                .await;
+            return crate::worktree::Isolation::Unavailable(note);
+        };
+
+        let outcome = crate::worktree::create_from(&root, worktrees_dir, &self.run_id, base);
+
+        if let Some(wt) = outcome.worktree() {
+            info!(
+                run_id = %self.run_id,
+                branch = %wt.branch,
+                path = %wt.path.display(),
+                "Run isolated in a git worktree"
+            );
+            // Everything downstream keys off `workspace_root`: the run's
+            // `ToolContext`, `resolve_path` in the file tools, and
+            // `resolve_working_dir` in the shell tool.
+            self.workspace_root = Some(wt.path.clone());
+            self.before_sha = Some(wt.base_sha.clone());
+            self.worktree = Some(wt.clone());
+        } else {
+            warn!(run_id = %self.run_id, "Run is NOT isolated: {}", outcome.note().unwrap_or_default());
+        }
+
+        let note = outcome.note();
+        self.record_isolation(outcome.status(), note.as_deref(), outcome.worktree())
+            .await;
+        if let Some(note) = note {
+            self.persist_event("isolation", &serde_json::json!({ "message": note }))
+                .await;
+        }
+
+        outcome
+    }
+
+    /// Write the isolation columns on the `story_runs` row.
+    async fn record_isolation(
+        &self,
+        status: &str,
+        note: Option<&str>,
+        worktree: Option<&crate::worktree::RunWorktree>,
+    ) {
+        let _ = sqlx::query(
+            "UPDATE story_runs \
+             SET worktree_path = ?, branch_name = ?, before_sha = ?, \
+                 isolation_status = ?, isolation_note = ? \
+             WHERE id = ?",
+        )
+        .bind(worktree.map(|w| w.path.to_string_lossy().to_string()))
+        .bind(worktree.map(|w| w.branch.clone()))
+        .bind(self.before_sha.clone())
+        .bind(status)
+        .bind(note)
+        .bind(&self.run_id)
+        .execute(&self.db)
+        .await;
     }
 
     // -----------------------------------------------------------------------
@@ -1016,6 +1125,9 @@ impl ConversationRuntime {
             event_type,
             "error" | "approval_request" | "approval_response"
                 | "complete" | "cancelled" | "failed" | "context_compacted"
+                // Whether a run was isolated decides whether its changes can be
+                // reverted at all. That must survive `track_history = false`.
+                | "isolation"
         );
         if !critical && !self.track_history {
             return;
@@ -1043,6 +1155,12 @@ impl ConversationRuntime {
             "error" => {
                 let m = payload["message"].as_str().map(|s| s.to_string());
                 (None, m.or_else(|| Some(payload.to_string())), None, None, None, 1)
+            }
+            // Same shape as `error` but not a failure: the run continues, the
+            // operator just has to know it was not isolated.
+            "isolation" => {
+                let m = payload["message"].as_str().map(|s| s.to_string());
+                (None, m.or_else(|| Some(payload.to_string())), None, None, None, 0)
             }
             "tool_result" => {
                 let t  = payload["tool_name"].as_str().map(|s| s.to_string());
@@ -1125,7 +1243,37 @@ impl ConversationRuntime {
         .execute(&self.db)
         .await;
 
-        // Capture git diff against the before-SHA (best-effort).
+        // Commit whatever the run wrote onto its own branch. This is what makes
+        // accept and revert cheap later: the changes become one object the user
+        // can squash-merge or throw away, instead of a pile of loose edits.
+        //
+        // The commit lands in the run's private worktree, so it cannot touch
+        // the user's branch, index, or working tree.
+        if let Some(wt) = &self.worktree {
+            let message = format!(
+                "RustyAgent run {} on story {} ({status})",
+                &self.run_id, &self.story_id
+            );
+            match crate::worktree::commit_all(&wt.path, &message) {
+                Ok(Some(sha)) => {
+                    info!(run_id = %self.run_id, branch = %wt.branch, "Committed run output");
+                    let _ = sqlx::query("UPDATE story_runs SET after_sha = ? WHERE id = ?")
+                        .bind(&sha)
+                        .bind(&self.run_id)
+                        .execute(&self.db)
+                        .await;
+                }
+                Ok(None) => {
+                    debug!(run_id = %self.run_id, "Run changed no files; nothing to commit");
+                }
+                Err(e) => {
+                    warn!(run_id = %self.run_id, "Could not commit the run's worktree: {e}");
+                }
+            }
+        }
+
+        // Capture git diff against the before-SHA (best-effort). Runs against
+        // the run's own workspace root, which is the worktree when isolated.
         if let (Some(sha), Some(root)) = (self.before_sha.as_deref(), self.workspace_root.as_deref()) {
             if let Some(diff) = crate::git::get_diff_since(root, sha) {
                 let _ = sqlx::query(

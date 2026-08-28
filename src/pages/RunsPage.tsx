@@ -65,7 +65,7 @@ export default function RunsPage() {
   const [selectedRun, setSelectedRun] = useState<StoryRun | null>(null);
   const [storySearch, setStorySearch] = useState("");
 
-  const { runs, loading, error, deleteRun } = useRuns(filters);
+  const { runs, loading, error, deleteRun, refresh } = useRuns(filters);
   const { profiles } = useAgents();
 
   // Apply client-side story title search (server filter only has storyId)
@@ -253,6 +253,7 @@ export default function RunsPage() {
         run={selectedRun}
         onClose={() => setSelectedRun(null)}
         onDelete={handleDelete}
+        onDecided={() => refresh(filters)}
       />
     </div>
   );

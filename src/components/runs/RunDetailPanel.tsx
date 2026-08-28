@@ -1,16 +1,34 @@
 import { useState } from "react";
-import { ChevronDown, ChevronRight, Copy, Download, Trash2 } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Download,
+  Trash2,
+  Undo2,
+} from "lucide-react";
 import { SlidePanel } from "../forms";
 import { ConfirmDialog } from "../forms";
+import { notifyError, notifyToast } from "../ui/Toast";
 import type { StoryRun, RunEvent, RunDiff } from "../../types/runs";
 import {
   formatEstimatedCost,
   formatTokens,
   formatDuration,
+  isDecidable,
+  ranUnisolated,
   totalInputTokens,
   RUN_STATUS_LABELS,
 } from "../../types/runs";
-import { useRunEvents, useRunDiff, exportRun } from "../../hooks/useRuns";
+import {
+  useRunEvents,
+  useRunDiff,
+  exportRun,
+  acceptRun,
+  revertRun,
+} from "../../hooks/useRuns";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -211,6 +229,61 @@ function parseDiff(raw: string): DiffLine[] {
   return lines;
 }
 
+/**
+ * Where this run's changes actually live.
+ *
+ * The single most important thing to know before reading a diff: whether these
+ * edits are sitting safely on a branch of their own, or were written straight
+ * into the checkout the user is looking at.
+ */
+function IsolationBanner({ run }: { run: StoryRun }) {
+  if (ranUnisolated(run)) {
+    return (
+      <div className="run-isolation run-isolation--warning" role="status">
+        <AlertTriangle size={13} aria-hidden="true" />
+        <div>
+          <strong>This run was not isolated.</strong>
+          <p>
+            {run.isolationNote ??
+              "It wrote directly into your working directory, and RustyAgent cannot undo it for you."}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (run.isolationStatus === "accepted") {
+    return (
+      <p className="run-isolation run-isolation--done" role="status">
+        Accepted into your working tree. {run.isolationNote ?? ""}
+      </p>
+    );
+  }
+
+  if (run.isolationStatus === "reverted") {
+    return (
+      <p className="run-isolation run-isolation--done" role="status">
+        Reverted — this run's worktree and branch were deleted, and your working
+        tree was never touched.
+      </p>
+    );
+  }
+
+  if (run.isolationStatus !== "isolated") return null;
+
+  return (
+    <div className="run-isolation" role="status">
+      <div>
+        <p>
+          Ran in an isolated worktree on branch <code>{run.branchName}</code>.
+          Nothing here has reached your working tree yet.
+        </p>
+        {run.isolationNote && <p className="run-isolation__note">{run.isolationNote}</p>}
+      </div>
+    </div>
+  );
+}
+
 function ChangesTab({ run, diff, loading, error }: {
   run: StoryRun;
   diff: RunDiff | null;
@@ -219,9 +292,12 @@ function ChangesTab({ run, diff, loading, error }: {
 }) {
   if (!run.beforeSha) {
     return (
-      <p className="run-detail__muted">
-        Git not detected — file diffs are unavailable for this run.
-      </p>
+      <>
+        <IsolationBanner run={run} />
+        <p className="run-detail__muted">
+          Git not detected — file diffs are unavailable for this run.
+        </p>
+      </>
     );
   }
   if (loading) {
@@ -232,9 +308,12 @@ function ChangesTab({ run, diff, loading, error }: {
   }
   if (!diff?.diffOutput) {
     return (
-      <p className="run-detail__muted">
-        No file changes recorded for this run.
-      </p>
+      <>
+        <IsolationBanner run={run} />
+        <p className="run-detail__muted">
+          No file changes recorded for this run.
+        </p>
+      </>
     );
   }
 
@@ -242,6 +321,7 @@ function ChangesTab({ run, diff, loading, error }: {
 
   return (
     <div className="run-diff">
+      <IsolationBanner run={run} />
       <div className="run-diff__sha-row">
         <span className="run-diff__sha-label">Base commit</span>
         <code className="run-diff__sha">{run.beforeSha.slice(0, 12)}</code>
@@ -265,12 +345,19 @@ interface RunDetailPanelProps {
   run: StoryRun | null;
   onClose: () => void;
   onDelete?: (run: StoryRun) => void;
+  /**
+   * Called after a run is accepted or reverted, so the list showing it can
+   * pick up the new isolation status.
+   */
+  onDecided?: () => void;
 }
 
-export function RunDetailPanel({ run, onClose, onDelete }: RunDetailPanelProps) {
+export function RunDetailPanel({ run, onClose, onDelete, onDecided }: RunDetailPanelProps) {
   const { events, loading: eventsLoading } = useRunEvents(run?.id ?? null);
   const { diff, loading: diffLoading, error: diffError } = useRunDiff(run?.id ?? null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmRevert, setConfirmRevert] = useState(false);
+  const [deciding, setDeciding] = useState(false);
   const [activeTab, setActiveTab] = useState<"events" | "changes">("events");
 
   async function handleExport() {
@@ -278,6 +365,41 @@ export function RunDetailPanel({ run, onClose, onDelete }: RunDetailPanelProps) 
     const storySlug = (run.storyTitle ?? run.storyId).slice(0, 30).replace(/\s+/g, "-").toLowerCase();
     await exportRun(run.id, `run-${storySlug}-${run.id.slice(0, 8)}.jsonl`);
   }
+
+  async function handleAccept() {
+    if (!run) return;
+    setDeciding(true);
+    try {
+      const message = await acceptRun(run.id);
+      notifyToast({ variant: "success", title: "Run accepted", body: message });
+      onDecided?.();
+      onClose();
+    } catch (e) {
+      // Most often git refusing to merge over uncommitted local work. That is
+      // the safe outcome, and the message says which files are in the way.
+      notifyError("Could not accept this run", String(e), { duration: 12000 });
+    } finally {
+      setDeciding(false);
+    }
+  }
+
+  async function handleRevert() {
+    if (!run) return;
+    setDeciding(true);
+    try {
+      const message = await revertRun(run.id);
+      notifyToast({ variant: "success", title: "Run reverted", body: message });
+      onDecided?.();
+      onClose();
+    } catch (e) {
+      notifyError("Could not revert this run", String(e), { duration: 12000 });
+    } finally {
+      setDeciding(false);
+      setConfirmRevert(false);
+    }
+  }
+
+  const decidable = run !== null && isDecidable(run);
 
   const footer = run ? (
     <div className="run-detail__footer">
@@ -289,6 +411,26 @@ export function RunDetailPanel({ run, onClose, onDelete }: RunDetailPanelProps) 
         <Download size={13} />
         Export .jsonl
       </button>
+      {decidable && (
+        <>
+          <button
+            className="btn btn--ghost btn--sm"
+            onClick={() => setConfirmRevert(true)}
+            disabled={deciding}
+          >
+            <Undo2 size={13} />
+            Revert
+          </button>
+          <button
+            className="btn btn--primary btn--sm"
+            onClick={handleAccept}
+            disabled={deciding}
+          >
+            <Check size={13} />
+            Accept
+          </button>
+        </>
+      )}
     </div>
   ) : undefined;
 
@@ -395,6 +537,20 @@ export function RunDetailPanel({ run, onClose, onDelete }: RunDetailPanelProps) 
           </div>
         )}
       </SlidePanel>
+
+      <ConfirmDialog
+        open={confirmRevert}
+        title="Throw away this run's changes?"
+        body={
+          run
+            ? `This deletes the run's worktree and its branch ${run.branchName ?? ""}. Your own working tree is not touched — the run never wrote there. This cannot be undone.`
+            : ""
+        }
+        confirmLabel="Revert Run"
+        loading={deciding}
+        onClose={() => setConfirmRevert(false)}
+        onConfirm={handleRevert}
+      />
 
       <ConfirmDialog
         open={confirmDelete}

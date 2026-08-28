@@ -387,7 +387,58 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
   width: 100%;
+}
+
+/* Delete stays on the left however many actions join it on the right. */
+.run-detail__footer > .btn:first-child {
+  margin-right: auto;
+}
+
+/* ─── Isolation banner ───────────────────────────────────────────────────── */
+
+.run-isolation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.run-isolation p {
+  margin: 0;
+}
+
+.run-isolation code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.run-isolation__note {
+  margin-top: 4px;
+  color: var(--text-secondary);
+}
+
+.run-isolation--warning {
+  background: var(--warning-subtle);
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.run-isolation--warning strong {
+  display: block;
+  margin-bottom: 2px;
+}
+
+.run-isolation--done {
+  display: block;
 }
 
 /* ─── 6. Event log rows ──────────────────────────────────────────────────── */

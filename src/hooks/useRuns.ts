@@ -24,6 +24,11 @@ interface RawRun {
   finished_at: string | null;
   duration_secs: number | null;
   before_sha: string | null;
+  worktree_path: string | null;
+  branch_name: string | null;
+  after_sha: string | null;
+  isolation_status: string | null;
+  isolation_note: string | null;
 }
 
 interface RawEvent {
@@ -62,6 +67,11 @@ function mapRun(r: RawRun): StoryRun {
     finishedAt:       r.finished_at ? new Date(r.finished_at) : null,
     durationSecs:     r.duration_secs,
     beforeSha:        r.before_sha,
+    worktreePath:     r.worktree_path,
+    branchName:       r.branch_name,
+    afterSha:         r.after_sha,
+    isolationStatus:  r.isolation_status as StoryRun["isolationStatus"],
+    isolationNote:    r.isolation_note,
   };
 }
 
@@ -211,4 +221,30 @@ export function useRunDiff(runId: string | null): UseRunDiffReturn {
   }, [runId]);
 
   return { diff, loading, error };
+}
+
+// ---------------------------------------------------------------------------
+// Accepting and reverting an isolated run
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge a finished run's branch into the user's working tree.
+ *
+ * The backend uses `git merge --squash`, so the changes land staged and
+ * uncommitted, and git refuses rather than overwriting uncommitted local work.
+ * Resolves with the backend's description of what happened.
+ */
+export async function acceptRun(runId: string): Promise<string> {
+  return invoke<string>("accept_run", { runId });
+}
+
+/**
+ * Throw a finished run's changes away.
+ *
+ * Deletes only the run's own worktree and branch. The user's working tree is
+ * never written to, which is why this is an exact undo rather than a
+ * best-effort one.
+ */
+export async function revertRun(runId: string): Promise<string> {
+  return invoke<string>("revert_run", { runId });
 }

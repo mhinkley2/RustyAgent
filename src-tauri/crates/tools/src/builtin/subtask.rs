@@ -70,7 +70,15 @@ impl Tool for SpawnSubtaskTool {
             None => return ToolOutput::err("spawn_subtask is not available in this context"),
         };
 
-        match spawn_fn(story_id.clone(), agent_id.clone(), pipeline_run_id, ctx.pipeline_depth + 1).await {
+        match spawn_fn(
+            story_id.clone(),
+            agent_id.clone(),
+            pipeline_run_id,
+            ctx.pipeline_depth + 1,
+            ctx.workspace_root.clone(),
+        )
+        .await
+        {
             Ok(run_id) => ToolOutput::ok(serde_json::to_string(&json!({
                 "run_id": run_id,
                 "story_id": story_id,

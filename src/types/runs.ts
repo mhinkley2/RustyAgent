@@ -4,6 +4,8 @@ export type RunStatus = "running" | "done" | "failed" | "cancelled";
 
 export type RunEventType =
   | "message"
+  /** Whether — and how — the run was isolated from the user's checkout. */
+  | "isolation"
   | "tool_call"
   | "tool_result"
   | "thought"
@@ -35,6 +37,51 @@ export interface StoryRun {
   durationSecs: number | null;
   /** Git HEAD SHA at run start; null if workspace is not a git repo. */
   beforeSha: string | null;
+  /** Absolute path of the isolated worktree the run executed in. */
+  worktreePath: string | null;
+  /** Branch the run's worktree had checked out. */
+  branchName: string | null;
+  /** Commit made on that branch when the run finished; null if it changed nothing. */
+  afterSha: string | null;
+  /** How the run was isolated, and what has since been decided about it. */
+  isolationStatus: IsolationStatus | null;
+  /** Why a run was not isolated, or what was surprising about the one that was. */
+  isolationNote: string | null;
+}
+
+/**
+ * `story_runs.isolation_status`.
+ *
+ * `null` means the run predates worktree isolation. Only an `isolated` run can
+ * be accepted or reverted — there is nothing of RustyAgent's own to apply or
+ * throw away for any of the others.
+ */
+export type IsolationStatus =
+  /** Ran in its own git worktree; awaiting a decision. */
+  | "isolated"
+  /** The workspace is not a git repository. Ran in the user's directory. */
+  | "not_a_git_repo"
+  /** A git repository, but a worktree could not be made. Ran un-isolated. */
+  | "unavailable"
+  /** The run had no workspace directory at all. */
+  | "no_workspace"
+  /** Its changes were merged into the user's working tree. */
+  | "accepted"
+  /** Its worktree and branch were thrown away. */
+  | "reverted";
+
+/** Whether this run still has a worktree and branch to accept or revert. */
+export function isDecidable(run: StoryRun): boolean {
+  return run.isolationStatus === "isolated" && run.status !== "running";
+}
+
+/** Whether the run wrote into the user's own checkout rather than a worktree. */
+export function ranUnisolated(run: StoryRun): boolean {
+  return (
+    run.isolationStatus === "not_a_git_repo" ||
+    run.isolationStatus === "unavailable" ||
+    run.isolationStatus === "no_workspace"
+  );
 }
 
 /** Git diff payload — fetched separately due to potentially large size. */
