@@ -22,9 +22,6 @@ function mapPerms(raw: Record<string, unknown>): AgentPermissions {
     allowShellCommands:       Array.isArray(raw.allow_shell_commands ?? raw.allowShellCommands)
                                 ? (raw.allow_shell_commands ?? raw.allowShellCommands) as string[]
                                 : [],
-    allowNetworkHosts:        Array.isArray(raw.allow_network_hosts ?? raw.allowNetworkHosts)
-                                ? (raw.allow_network_hosts ?? raw.allowNetworkHosts) as string[]
-                                : [],
     requireApprovalOnWrite:   Boolean(raw.require_approval_on_write ?? raw.requireApprovalOnWrite ?? false),
   };
 }
