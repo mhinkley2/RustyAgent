@@ -188,9 +188,16 @@ where
         let task = make(index);
         let semaphore = semaphore.clone();
         handles.push(tokio::spawn(async move {
-            // The semaphore is never closed, so this cannot fail; holding the
-            // permit until the task returns is what enforces the ceiling.
-            let _permit = semaphore.acquire_owned().await;
+            // Holding the permit until the task returns is what enforces the
+            // ceiling. `acquire_owned` only fails on a closed semaphore, and
+            // this one is created in `run_bounded` and never closed — but bind
+            // the permit rather than the `Result`, so that if someone later
+            // does close it this fails loudly instead of quietly running the
+            // whole fan-out unbounded.
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("run_bounded's semaphore is never closed");
             task.await
         }));
     }

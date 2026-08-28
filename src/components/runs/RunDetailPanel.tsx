@@ -255,7 +255,10 @@ function IsolationBanner({ run }: { run: StoryRun }) {
   if (run.isolationStatus === "accepted") {
     return (
       <p className="run-isolation run-isolation--done" role="status">
-        Accepted into your working tree. {run.isolationNote ?? ""}
+        {/* The backend note already opens with "Accepted into <path> from
+            branch …", so prefixing it here repeated the phrase. Fall back to a
+            short sentence only when there is no note. */}
+        {run.isolationNote ?? "Accepted into your working tree."}
       </p>
     );
   }
