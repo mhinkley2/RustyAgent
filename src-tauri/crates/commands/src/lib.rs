@@ -273,6 +273,12 @@ pub async fn start_run(
     runtime.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
+    // Let the run reach the user: notifications for a parked approval or a
+    // finished run, and the approval wait the user configured (indefinite by
+    // default, so an unattended run parks rather than fail-closing).
+    runtime.notifier = Some(runtime::AppNotifier::arc(app.clone()));
+    runtime.approval_timeout = runtime::notifier::unattended_settings(&app).approval_timeout();
+
     // Move the run into its own git worktree before the loop starts, so the
     // agent's file tools are pointed at an isolated checkout rather than the
     // user's. A workspace that cannot be isolated records why on the run row
@@ -525,6 +531,12 @@ pub async fn start_chat_run(
     // still gets `recent` compaction at a per-model budget.
     runtime.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
+
+    // Let the run reach the user: notifications for a parked approval or a
+    // finished run, and the approval wait the user configured (indefinite by
+    // default, so an unattended run parks rather than fail-closing).
+    runtime.notifier = Some(runtime::AppNotifier::arc(app.clone()));
+    runtime.approval_timeout = runtime::notifier::unattended_settings(&app).approval_timeout();
 
     let run_id = runtime.run_id.clone();
 

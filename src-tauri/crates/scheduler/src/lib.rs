@@ -798,6 +798,11 @@ async fn fire_run(
     rt.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
+    // A scheduled run is the unattended case by definition, so this is the
+    // path where reaching the user matters most.
+    rt.notifier = Some(runtime::AppNotifier::arc(app.clone()));
+    rt.approval_timeout = runtime::notifier::unattended_settings(&app).approval_timeout();
+
     // Scheduled and continuous runs fire without anyone watching, which is
     // exactly when writing into the user's checkout is least acceptable.
     if let Some(dir) = runtime::worktree::dir_for(&app) {

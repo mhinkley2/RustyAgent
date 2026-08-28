@@ -84,6 +84,10 @@ impl McpCtx {
             pipeline_depth: 0,
             spawn_subtask: None,
             workspace_root: self.workspace_root.clone(),
+            // No desktop to notify through from this process. `send_notification`
+            // is not among the adapted tools, and if it ever were it would now
+            // report the failure rather than claim delivery.
+            notifier: None,
         }
     }
 }

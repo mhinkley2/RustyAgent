@@ -841,6 +841,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Without this the notification builder has no implementation behind
+        // it and every delivery fails — which `send_notification` would then
+        // honestly report, but nobody would ever be notified.
+        .plugin(tauri_plugin_notification::init())
         .manage(RunRegistry::new())
         .manage(Arc::new(ApprovalGate::new()))
         .manage(commands::ActiveWorkspace::new())

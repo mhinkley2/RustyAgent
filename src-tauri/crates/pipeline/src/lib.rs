@@ -702,6 +702,12 @@ async fn fire_step_run(
     rt.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
+    // Let the run reach the user: notifications for a parked approval or a
+    // finished run, and the approval wait the user configured (indefinite by
+    // default, so an unattended run parks rather than fail-closing).
+    rt.notifier = Some(runtime::AppNotifier::arc(app_for_isolation.clone()));
+    rt.approval_timeout = runtime::notifier::unattended_settings(&app_for_isolation).approval_timeout();
+
     // Give the step its own checkout before the loop starts. Parallel steps
     // otherwise edit the same files in the same tree and the last writer wins.
     if let Some(dir) = runtime::worktree::dir_for(&app_for_isolation) {
@@ -897,6 +903,8 @@ async fn run_subtask_impl(
 
     let cancel = runtime::CancelFlag::new();
 
+    // Kept because the constructor takes the handle by value.
+    let app_for_notifications = app.clone();
     let mut rt = runtime::ConversationRuntime::new_with_pipeline(
         story_id,
         agent_id,
@@ -934,6 +942,13 @@ async fn run_subtask_impl(
     // still gets `recent` compaction at a per-model budget.
     rt.context_policy =
         runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
+
+    // Let the run reach the user: notifications for a parked approval or a
+    // finished run, and the approval wait the user configured (indefinite by
+    // default, so an unattended run parks rather than fail-closing).
+    rt.notifier = Some(runtime::AppNotifier::arc(app_for_notifications.clone()));
+    rt.approval_timeout =
+        runtime::notifier::unattended_settings(&app_for_notifications).approval_timeout();
 
     let run_id = rt.run_id.clone();
     let cancel_tok = rt.cancel.clone();
