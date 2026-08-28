@@ -1,7 +1,8 @@
 import { useState, useEffect } from "react";
 import { PageHeader } from "../components/board/PageHeader";
 import { useSettings } from "../hooks/useSettings";
-import type { AppSettings } from "../types/settings";
+import type { AppSettings, NotificationSettings } from "../types/settings";
+import { DEFAULT_NOTIFICATIONS } from "../types/settings";
 import { Eye, EyeOff, Check } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,39 @@ function ApiKeyField({
   );
 }
 
+function ToggleField({
+  id,
+  label,
+  hint,
+  checked,
+  disabled,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  hint: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className={`settings-toggle${disabled ? " settings-toggle--disabled" : ""}`}>
+      <input
+        id={id}
+        className="settings-toggle__input"
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <label className="settings-toggle__label" htmlFor={id}>
+        <span className="settings-toggle__title">{label}</span>
+        <span className="settings-toggle__hint">{hint}</span>
+      </label>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // SettingsPage
 // ---------------------------------------------------------------------------
@@ -67,7 +101,10 @@ export default function SettingsPage() {
     openrouter_api_key: "",
     deepseek_api_key: "",
     ollama_base_url: "",
+    approval_timeout_secs: "",
   });
+  const [notifications, setNotifications] =
+    useState<NotificationSettings>(DEFAULT_NOTIFICATIONS);
   const [saved, setSaved] = useState(false);
 
   // Populate draft once settings load.
@@ -78,7 +115,12 @@ export default function SettingsPage() {
         openrouter_api_key: settings.openrouter_api_key ?? "",
         deepseek_api_key: settings.deepseek_api_key ?? "",
         ollama_base_url: settings.ollama_base_url ?? "",
+        approval_timeout_secs:
+          settings.approval_timeout_secs == null
+            ? ""
+            : String(settings.approval_timeout_secs),
       });
+      setNotifications(settings.notifications ?? DEFAULT_NOTIFICATIONS);
     }
   }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -87,12 +129,25 @@ export default function SettingsPage() {
     setDraft((prev) => ({ ...prev, [key]: value }));
   };
 
+  const setNotification = (key: keyof NotificationSettings, value: boolean) => {
+    setSaved(false);
+    setNotifications((prev) => ({ ...prev, [key]: value }));
+  };
+
   const handleSave = async () => {
+    const timeout = Number.parseInt(draft.approval_timeout_secs, 10);
     const toSave: AppSettings = {
+      // Spread what was loaded so knobs with no control here — event
+      // retention, pipeline parallelism — survive a save from this page
+      // instead of being erased back to their defaults.
+      ...settings,
       anthropic_api_key: draft.anthropic_api_key || null,
       openrouter_api_key: draft.openrouter_api_key || null,
       deepseek_api_key: draft.deepseek_api_key || null,
       ollama_base_url: draft.ollama_base_url || null,
+      notifications,
+      approval_timeout_secs:
+        Number.isFinite(timeout) && timeout > 0 ? timeout : null,
     };
     await saveSettings(toSave);
     setSaved(true);
@@ -187,6 +242,81 @@ export default function SettingsPage() {
             <p className="settings-field__hint">
               Leave blank to use the default (http://localhost:11434). Change
               this if you run Ollama on a different host or port.
+            </p>
+          </div>
+        </section>
+
+        {/* ── Notifications ──────────────────────────────────────── */}
+        <section className="settings-section">
+          <h2 className="settings-section__title">Notifications</h2>
+          <p className="settings-section__desc">
+            How RustyAgent reaches you while a run is working and you are not
+            watching. Notifications are raised once per event — never per token
+            or per tool call.
+          </p>
+
+          <ToggleField
+            id="notify-enabled"
+            label="Desktop notifications"
+            hint="Master switch. With this off, nothing below is delivered."
+            checked={notifications.enabled}
+            onChange={(v) => setNotification("enabled", v)}
+          />
+
+          <ToggleField
+            id="notify-approval"
+            label="A run needs your approval"
+            hint="A gated tool call parks the run until you decide, so this is the one that has to reach you."
+            checked={notifications.onApproval}
+            disabled={!notifications.enabled}
+            onChange={(v) => setNotification("onApproval", v)}
+          />
+
+          <ToggleField
+            id="notify-failed"
+            label="A run fails"
+            hint="Raised once, when the run reaches a failed state."
+            checked={notifications.onRunFailed}
+            disabled={!notifications.enabled}
+            onChange={(v) => setNotification("onRunFailed", v)}
+          />
+
+          <ToggleField
+            id="notify-completed"
+            label="A run finishes"
+            hint="Raised once, when the run completes. Cancelling a run yourself never notifies."
+            checked={notifications.onRunCompleted}
+            disabled={!notifications.enabled}
+            onChange={(v) => setNotification("onRunCompleted", v)}
+          />
+
+          <ToggleField
+            id="notify-agent"
+            label="An agent asks to notify you"
+            hint="The send_notification tool. With this off the tool reports the failure to the agent rather than pretending you were told."
+            checked={notifications.onAgentRequest}
+            disabled={!notifications.enabled}
+            onChange={(v) => setNotification("onAgentRequest", v)}
+          />
+
+          <div className="settings-field">
+            <label className="settings-field__label" htmlFor="approval-timeout">
+              Approval timeout (seconds)
+            </label>
+            <input
+              id="approval-timeout"
+              className="settings-field__input"
+              type="number"
+              min={0}
+              value={draft.approval_timeout_secs}
+              onChange={(e) => set("approval_timeout_secs", e.target.value)}
+              placeholder="Wait indefinitely"
+              autoComplete="off"
+            />
+            <p className="settings-field__hint">
+              Leave blank to wait indefinitely, so a run parks until you come
+              back. A value here ends the wait instead — recorded as expired,
+              never as a decision you made.
             </p>
           </div>
         </section>

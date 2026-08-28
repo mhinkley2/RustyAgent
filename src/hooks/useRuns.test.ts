@@ -209,6 +209,171 @@ describe("useRunEvents", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.error).toContain("run not found");
   });
+
+  // The point of the feature: an autonomous run could previously only be
+  // watched by closing the detail panel and opening it again.
+  it("appends tool calls and results as the run emits them", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "file_write",
+      input: { path: "a.txt" },
+    });
+    await tauriMock.emit("run-event", {
+      type: "tool_result",
+      run_id: "run-1",
+      tool_name: "file_write",
+      output: "written",
+      is_error: false,
+    });
+
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+    expect(result.current.events[0].eventType).toBe("tool_call");
+    expect(result.current.events[0].toolInput).toBe(JSON.stringify({ path: "a.txt" }));
+    expect(result.current.events[1].eventType).toBe("tool_result");
+    expect(result.current.events[1].toolOutput).toBe("written");
+    expect(result.current.events.map((e) => e.sequenceNum)).toEqual([0, 1]);
+  });
+
+  // Every run in the app emits on one `run-event` channel, so an unfiltered
+  // listener would interleave three agents' work into one timeline.
+  it("ignores events belonging to another run", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-2",
+      tool_name: "file_write",
+      input: {},
+    });
+
+    expect(result.current.events).toEqual([]);
+  });
+
+  // A parked run looks identical to a slow one otherwise.
+  it("shows a run parking on an approval and then moving again", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await tauriMock.emit("run-event", {
+      type: "awaiting_approval",
+      run_id: "run-1",
+      approval_request_id: "ap-1",
+      tool_name: "file_write",
+    });
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    expect(result.current.events[0].eventType).toBe("approval_request");
+    expect(result.current.events[0].content).toContain("file_write");
+
+    await tauriMock.emit("run-event", {
+      type: "approval_resolved",
+      run_id: "run-1",
+      approval_request_id: "ap-1",
+      tool_name: "file_write",
+      approved: true,
+      outcome: "approved",
+    });
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+    expect(result.current.events[1].eventType).toBe("approval_response");
+  });
+
+  // `complete` and `cancelled` are persisted with detail this payload does not
+  // carry, so appending them live would double them on the next refresh.
+  it("does not append events the database will return with more detail", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await tauriMock.emit("run-event", {
+      type: "complete",
+      run_id: "run-1",
+      stop_reason: "end_turn",
+    });
+    await tauriMock.emit("run-event", { type: "cancelled", run_id: "run-1" });
+
+    expect(result.current.events).toEqual([]);
+  });
+
+  // The fetch and the subscription start together. If live events were
+  // appended to the fetched array, the response landing second would wipe
+  // whatever arrived while it was in flight.
+  it("keeps a live event that arrives before the initial fetch resolves", async () => {
+    let release: (rows: unknown[]) => void = () => {};
+    tauriMock.handle(
+      "get_run_events",
+      () => new Promise((resolve) => { release = resolve; }),
+    );
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "file_write",
+      input: {},
+    });
+
+    release([
+      rawEvent({ id: "e1", event_type: "message", content: "from the database" }),
+    ]);
+
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+    expect(result.current.events[0].content).toBe("from the database");
+    expect(result.current.events[1].toolName).toBe("file_write");
+    expect(result.current.events.map((e) => e.sequenceNum)).toEqual([0, 1]);
+  });
+
+  it("stops listening when the panel closes", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { unmount } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
+
+    unmount();
+
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(0));
+  });
+
+  it("follows the new run when the panel switches between runs", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result, rerender } = renderHook(({ id }) => useRunEvents(id), {
+      initialProps: { id: "run-1" as string | null },
+    });
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
+
+    rerender({ id: "run-2" });
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "stale",
+      input: {},
+    });
+    expect(result.current.events).toEqual([]);
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-2",
+      tool_name: "current",
+      input: {},
+    });
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    expect(result.current.events[0].toolName).toBe("current");
+  });
 });
 
 describe("useRunDiff", () => {
