@@ -73,6 +73,10 @@ pub async fn seed_story(db: &DbPool, id: &str, title: &str, status: &str) {
 }
 
 /// Insert a run row in the `running` state, ready for a runtime to finish.
+///
+/// `owner_instance_id` is left NULL, which is what a run started by a previous
+/// launch of the app looks like to the startup sweep. Use [`seed_run_owned`]
+/// for a run that is meant to look live.
 pub async fn seed_run(db: &DbPool, id: &str, story_id: &str, agent_profile_id: &str) {
     sqlx::query(
         "INSERT INTO story_runs (id, story_id, agent_profile_id, status)
@@ -84,6 +88,41 @@ pub async fn seed_run(db: &DbPool, id: &str, story_id: &str, agent_profile_id: &
     .execute(db)
     .await
     .expect("seed story_runs");
+}
+
+/// As [`seed_run`], but claimed by a named application instance.
+///
+/// A run whose `owner_instance_id` matches the id the sweep is given is one
+/// the sweeping process started itself, and must survive the sweep.
+pub async fn seed_run_owned(
+    db: &DbPool,
+    id: &str,
+    story_id: &str,
+    agent_profile_id: &str,
+    owner_instance_id: &str,
+) {
+    sqlx::query(
+        "INSERT INTO story_runs (id, story_id, agent_profile_id, status, owner_instance_id)
+         VALUES (?, ?, ?, 'running', ?)",
+    )
+    .bind(id)
+    .bind(story_id)
+    .bind(agent_profile_id)
+    .bind(owner_instance_id)
+    .execute(db)
+    .await
+    .expect("seed story_runs");
+}
+
+/// Read one run's `iteration_count` column.
+pub async fn run_iteration_count(db: &DbPool, run_id: &str) -> i64 {
+    use sqlx::Row;
+    sqlx::query("SELECT iteration_count FROM story_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_one(db)
+        .await
+        .expect("fetch run iteration_count")
+        .get::<i64, _>("iteration_count")
 }
 
 /// Read one run's `status` column.

@@ -13,7 +13,16 @@ export type RunEventType =
   | "approval_request"
   | "approval_response"
   /** History was dropped to keep the request inside the model's input budget. */
-  | "context_compacted";
+  | "context_compacted"
+  /**
+   * The app exited while the run was still executing, and the startup sweep
+   * closed the run out. Written only by `db::recovery::reconcile_orphaned_runs`
+   * — the run itself was never there to write it.
+   *
+   * The run's `status` is plain `failed`: the reason for the failure lives
+   * here rather than in a fifth `RunStatus` no filter or badge would know.
+   */
+  | "interrupted";
 
 export interface StoryRun {
   id: string;

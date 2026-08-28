@@ -1,0 +1,14 @@
+-- Which process is running a run, so a crash is distinguishable from a run
+-- that is simply still going.
+--
+-- `finish_run` is the only writer of a terminal run status and it runs
+-- in-process: kill the app mid-run and the row reads 'running' forever. The
+-- startup sweep in `db::recovery` fixes that, but it needs a way to tell
+-- "orphaned by a crash" from "running under the process doing the sweeping".
+--
+-- owner_instance_id  The id of the application launch that started the run
+--                    (`db::recovery::instance_id`), freshly generated every
+--                    process start. NULL for runs that predate this migration
+--                    and for rows seeded by tests; either way, no live process
+--                    claims them, so the sweep may reconcile them.
+ALTER TABLE story_runs ADD COLUMN owner_instance_id TEXT;

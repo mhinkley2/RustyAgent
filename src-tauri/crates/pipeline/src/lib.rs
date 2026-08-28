@@ -232,12 +232,17 @@ pub async fn start_pipeline(
     // Create the root story_run row that represents the whole pipeline.
     let pipeline_run_id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO story_runs (id, story_id, agent_profile_id, status, started_at) \
-         VALUES (?, ?, ?, 'running', CURRENT_TIMESTAMP)",
+        // `owner_instance_id` marks the row as belonging to this launch of the
+        // app, so the startup sweep in `db::recovery` leaves a live pipeline
+        // alone and only reconciles one a previous process died holding.
+        "INSERT INTO story_runs \
+             (id, story_id, agent_profile_id, status, started_at, owner_instance_id) \
+         VALUES (?, ?, ?, 'running', CURRENT_TIMESTAMP, ?)",
     )
     .bind(&pipeline_run_id)
     .bind(&story_id)
     .bind(&agent_profile_id)
+    .bind(db::recovery::instance_id())
     .execute(&db)
     .await
     .map_err(|e| format!("DB error inserting pipeline run: {e}"))?;

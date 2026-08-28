@@ -14,7 +14,8 @@ use tokio::sync::Mutex;
 use api::mock::{MockResponse, RecordedCall, DEFAULT_MOCK_USAGE};
 use api::{ChatMessage, CompletionConfig, MessageRole, MockLlmProvider, ToolCall, Usage};
 use db::testing::{
-    make_test_pool, run_events, run_status, run_usage, seed_profile, seed_story, RunUsage,
+    make_test_pool, run_events, run_iteration_count, run_status, run_usage, seed_profile,
+    seed_story, RunUsage,
 };
 use db::DbPool;
 use tools::{Tool, ToolContext, ToolOutput, ToolPermissionInfo, ToolRegistry};
@@ -200,6 +201,10 @@ impl Harness {
 
     async fn usage(&self, run_id: &str) -> RunUsage {
         run_usage(&self.db, run_id).await
+    }
+
+    async fn iterations(&self, run_id: &str) -> i64 {
+        run_iteration_count(&self.db, run_id).await
     }
 
     fn calls(&self) -> Vec<RecordedCall> {
@@ -1740,4 +1745,243 @@ async fn a_reinserted_summary_still_fits_inside_the_budget() {
         }
         other => panic!("expected ContextCompacted, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Iteration accounting
+//
+// `story_runs.iteration_count` was read, selected for display and rendered in
+// `RunDetailPanel`, but no code path wrote it: every run reported zero
+// iterations regardless of how much work it did. These pin what it now says on
+// each of the loop's exit paths, and — the case that matters for crash
+// recovery — that it is already correct on the row *before* the run ends, so a
+// run the app never finished still reports what it got through.
+// ---------------------------------------------------------------------------
+
+/// A tool that reads its own run's persisted `iteration_count` while the loop
+/// is still going, and reports it back through a shared slot.
+struct IterationPeekTool {
+    seen: Arc<std::sync::Mutex<Vec<i64>>>,
+}
+
+#[async_trait]
+impl Tool for IterationPeekTool {
+    fn name(&self) -> &str {
+        "peek"
+    }
+    fn description(&self) -> &str {
+        "reads the run's persisted iteration count"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+    async fn execute(&self, _input: Value, ctx: &ToolContext) -> ToolOutput {
+        let count = run_iteration_count(&ctx.db, &ctx.run_id).await;
+        self.seen.lock().expect("seen poisoned").push(count);
+        ToolOutput::ok("peeked")
+    }
+}
+
+#[tokio::test]
+async fn a_single_turn_run_reports_the_one_iteration_it_performed() {
+    // The bug this closes: the column read zero for every run ever made.
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.iterations(&run_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_multi_iteration_run_reports_a_count_matching_its_provider_calls() {
+    let h = Harness::new(vec![
+        MockResponse::tool_call("c1", "get_story", json!({})),
+        MockResponse::tool_call("c2", "get_story", json!({})),
+        MockResponse::text("finally"),
+    ])
+    .await
+    .with_tool(Box::new(StubTool::new("get_story", "a story")))
+    .await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert_eq!(h.provider.call_count(), 3);
+    assert_eq!(h.iterations(&run_id).await, 3);
+}
+
+#[tokio::test]
+async fn a_failed_run_reports_its_iterations_rather_than_zero() {
+    // Usage is persisted on the failure path; the iteration count has to be
+    // too, or the run reads as having spent tokens over no iterations.
+    let h = Harness::new(vec![
+        MockResponse::tool_call("c1", "get_story", json!({})),
+        MockResponse::ProviderError("upstream down".into()),
+    ])
+    .await
+    .with_tool(Box::new(StubTool::new("get_story", "a story")))
+    .await;
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let _ = rt.run().await;
+
+    assert_eq!(h.status(&run_id).await, "failed");
+    assert_eq!(
+        h.iterations(&run_id).await,
+        2,
+        "the failing call was an iteration too"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_run_reports_its_iterations_rather_than_zero() {
+    let h = Harness::new(vec![
+        MockResponse::tool_call("c1", "cancel_me", json!({})),
+        MockResponse::text("never reached"),
+    ])
+    .await;
+    let cancelling = CancellingTool { cancel: h.cancel.clone() };
+    let h = h.with_tool(Box::new(cancelling)).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "cancelled");
+    assert_eq!(h.iterations(&run_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_run_cancelled_before_its_first_call_reports_no_iterations() {
+    // Honest in the other direction: it really did nothing.
+    let h = Harness::new(vec![MockResponse::text("never reached")]).await;
+    h.cancel.cancel();
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "cancelled");
+    assert_eq!(h.iterations(&run_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_run_that_hits_the_iteration_cap_reports_the_cap() {
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "spin", json!({})),
+        MockResponse::tool_call("c2", "spin", json!({})),
+        MockResponse::tool_call("c3", "spin", json!({})),
+    ])
+    .await
+    .with_tool(Box::new(StubTool::new("spin", "again")))
+    .await;
+    h.max_iterations = 3;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "failed");
+    assert_eq!(h.iterations(&run_id).await, 3);
+}
+
+#[tokio::test]
+async fn the_iteration_count_is_on_the_row_before_the_run_ends() {
+    // The crash case, made deterministic. A run killed by closing the app
+    // never reaches `finish_run`; all the startup sweep can do is leave the
+    // column saying whatever the run itself last wrote. If the count were only
+    // written at the end, every interrupted run would report zero — exactly
+    // the bug this story is closing, moved somewhere harder to see.
+    //
+    // The tool reads the row from inside the loop, so what it sees is what a
+    // crash at that instant would have left behind.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let h = Harness::new(vec![
+        MockResponse::tool_call("c1", "peek", json!({})),
+        MockResponse::tool_call("c2", "peek", json!({})),
+        MockResponse::text("done"),
+    ])
+    .await
+    .with_tool(Box::new(IterationPeekTool { seen: seen.clone() }))
+    .await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(
+        *seen.lock().expect("seen poisoned"),
+        vec![1, 2],
+        "the row must already carry the iterations performed so far"
+    );
+    assert_eq!(h.iterations(&run_id).await, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Crash recovery, end to end
+//
+// The db crate covers the sweep's SQL against seeded rows. These drive a real
+// `ConversationRuntime` instead, so a drift between what the runtime writes
+// and what the sweep reads cannot hide between the two crates.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_run_records_the_process_that_started_it() {
+    // What lets the startup sweep tell a run this process is executing from
+    // one a dead process left behind.
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    let run_id = h.run().await;
+
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_instance_id FROM story_runs WHERE id = ?")
+            .bind(&run_id)
+            .fetch_one(&h.db)
+            .await
+            .expect("fetch owner_instance_id");
+
+    assert_eq!(owner.as_deref(), Some(db::recovery::instance_id()));
+}
+
+#[tokio::test]
+async fn the_startup_sweep_leaves_a_run_this_process_is_executing_alone() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+
+    let report = db::recovery::reconcile_orphaned_runs(&h.db, db::recovery::instance_id())
+        .await
+        .expect("sweep");
+
+    assert!(report.is_empty(), "a live run must survive the sweep: {report:?}");
+    assert_eq!(h.status(&run_id).await, "running");
+
+    // ...and it still finishes normally afterwards.
+    rt.run().await.expect("run");
+    assert_eq!(h.status(&run_id).await, "done");
+}
+
+#[tokio::test]
+async fn the_startup_sweep_interrupts_a_run_a_previous_process_left_behind() {
+    // A crash, as far as the database can tell: the row exists and says
+    // running, and nothing in this process claims it.
+    let h = Harness::new(vec![MockResponse::text("unused")]).await;
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    sqlx::query(
+        "UPDATE story_runs SET owner_instance_id = 'a-previous-launch', iteration_count = 4 \
+         WHERE id = ?",
+    )
+    .bind(&run_id)
+    .execute(&h.db)
+    .await
+    .expect("re-owner the run");
+
+    let report = db::recovery::reconcile_orphaned_runs(&h.db, db::recovery::instance_id())
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.runs, vec![run_id.clone()]);
+    assert_eq!(h.status(&run_id).await, "failed");
+    assert_eq!(
+        h.iterations(&run_id).await,
+        4,
+        "the work it got through is kept"
+    );
+    let kinds: Vec<String> = h.events(&run_id).await.into_iter().map(|(k, _)| k).collect();
+    assert!(kinds.contains(&"interrupted".to_string()), "got {kinds:?}");
+    drop(rt);
 }
