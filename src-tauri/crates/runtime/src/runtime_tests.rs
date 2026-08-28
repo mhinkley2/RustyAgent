@@ -1501,3 +1501,55 @@ async fn a_provider_reporting_more_input_than_estimated_tightens_the_budget() {
     assert_eq!(compaction_events(&h.sink).len(), 1);
     assert_eq!(h.status(&run_id).await, "done");
 }
+
+/// A summary must land *inside* the budget, not just replace what was evicted.
+///
+/// The plan is computed for the post-eviction list, which does not yet contain
+/// the summary. Planning against the full budget and inserting afterwards put
+/// the request back over the ceiling this function exists to enforce, and
+/// nothing downstream re-checked it.
+///
+/// Sizes are tuned so eviction stops *just* under budget: two small units are
+/// dropped to get below, leaving little headroom, and the summary then has to
+/// fit in what remains. A fixture that evicts one huge unit lands far below
+/// budget and cannot show the bug.
+#[tokio::test]
+async fn a_reinserted_summary_still_fits_inside_the_budget() {
+    let mut h = Harness::with_provider(
+        MockLlmProvider::script(vec![
+            MockResponse::tool_call("c1", "read_small", json!({})),
+            MockResponse::tool_call("c2", "read_small", json!({})),
+            MockResponse::tool_call("c3", "read_huge", json!({})),
+            // Consumed by the summarisation call, which fires here.
+            MockResponse::text("summary text ".repeat(200)),
+            MockResponse::text("all done"),
+        ])
+        .without_usage(),
+    )
+    .await
+    .with_tool(Box::new(StubTool::new("read_small", &"x".repeat(3_000))))
+    .await
+    .with_tool(Box::new(StubTool::new("read_huge", &"x".repeat(16_000))))
+    .await;
+    h.context_policy = ContextPolicy::from_profile("summary", Some(TIGHT_BUDGET));
+
+    let run_id = h.run().await;
+    assert_eq!(h.status(&run_id).await, "done");
+
+    let event = compaction_events(&h.sink).pop().expect("a compaction event");
+    match event {
+        RunEvent::ContextCompacted {
+            after_tokens,
+            budget_tokens,
+            summarized,
+            ..
+        } => {
+            assert!(summarized, "this fixture summarises");
+            assert!(
+                after_tokens <= budget_tokens,
+                "summary pushed the request back over budget:                  {after_tokens} > {budget_tokens}"
+            );
+        }
+        other => panic!("expected ContextCompacted, got {other:?}"),
+    }
+}
