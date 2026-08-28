@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use db::testing::{make_test_pool, seed_profile, seed_run, seed_story};
+use db::testing::{make_test_pool, seed_profile, seed_run, seed_story, seed_workspace};
 use db::DbPool;
 use sqlx::Row;
 use tempfile::TempDir;
@@ -376,4 +376,48 @@ async fn sweeping_before_any_run_has_been_isolated_is_a_no_op() {
         0
     );
     assert!(runtime::worktree::sweep_orphans(&fx.worktrees, &HashSet::new()).is_empty());
+}
+
+/// Accept must refuse rather than guess when the owning repository is unknown.
+///
+/// `main_repo_for` derives the repo from the run's worktree, then from the
+/// story's workspace. It used to fall back to whatever workspace was *active*,
+/// which is simply wherever the user happens to be pointed — not necessarily
+/// the repository the run was created from. Since accept runs
+/// `git merge --squash` in whatever path comes back, guessing pointed a git
+/// write at a repository nobody named.
+#[tokio::test]
+async fn accept_refuses_when_the_owning_repository_cannot_be_determined() {
+    let fx = Fixture::new().await;
+    let branch = fx
+        .finished_isolated_run("run-1", &[("created.txt", "by the agent\n")])
+        .await;
+
+    // A different repository, registered and most-recently-opened — this is
+    // what `get_active_workspace_path` would have handed back.
+    let elsewhere = fx._tmp.path().join("unrelated-repo");
+    std::fs::create_dir_all(&elsewhere).expect("mkdir");
+    git(&elsewhere, &["-c", "init.defaultBranch=main", "init", "-q"]);
+    seed_workspace(
+        &fx.db,
+        "ws-unrelated",
+        &elsewhere.to_string_lossy(),
+    )
+    .await;
+
+    // Remove the worktree directory so the first resolution path fails and the
+    // fallback is the only thing left.
+    let worktree = PathBuf::from(fx.worktree_path("run-1").await.expect("path"));
+    std::fs::remove_dir_all(&worktree).expect("remove worktree");
+
+    let err = accept_run("run-1".into(), &fx.db).await.expect_err("must refuse");
+
+    assert!(
+        err.contains("which repository this run belongs to"),
+        "unhelpful error: {err}"
+    );
+    // The unrelated repository was not touched, and the run stays decidable.
+    assert!(!elsewhere.join("created.txt").exists());
+    assert_eq!(fx.isolation_status("run-1").await.as_deref(), Some("isolated"));
+    assert!(fx.branch_exists(&branch), "the branch must survive a refusal");
 }

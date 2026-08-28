@@ -361,15 +361,18 @@ async fn main_repo_for(iso: &RunIsolation, db: &DbPool) -> Result<std::path::Pat
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
+    // Deliberately no fall back to the *active* workspace. The caller merges
+    // or deletes a branch in whatever path this returns, and the active
+    // workspace is simply wherever the user happens to be pointed now — which
+    // need not be the repository this run was created from. Refusing leaves the
+    // run decidable once the right workspace is re-registered; guessing runs
+    // git against a repository nobody named.
     let from_story: Option<String> = row.and_then(|r| r.try_get("path").ok());
-    from_story
-        .map(std::path::PathBuf::from)
-        .or(db::get_active_workspace_path(db).await)
-        .ok_or_else(|| {
-            "Could not work out which repository this run belongs to — its worktree is gone and \
-             its workspace is no longer registered."
-                .to_string()
-        })
+    from_story.map(std::path::PathBuf::from).ok_or_else(|| {
+        "Could not work out which repository this run belongs to — its worktree is gone and \
+         its workspace is no longer registered. Re-register that workspace and try again."
+            .to_string()
+    })
 }
 
 async fn set_isolation_status(run_id: &str, status: &str, note: &str, db: &DbPool) {
