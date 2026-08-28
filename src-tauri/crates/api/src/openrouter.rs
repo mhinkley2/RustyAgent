@@ -79,6 +79,9 @@ impl OpenRouterClient {
             "max_tokens": config.max_tokens,
             "stream": true,
             "messages": api_messages,
+            // OpenAI-compatible streams report token usage only when asked;
+            // without this the final chunk carries no counts at all.
+            "stream_options": { "include_usage": true },
         });
 
         if let Some(temp) = config.temperature {
@@ -145,6 +148,12 @@ impl LlmProvider for OpenRouterClient {
                         return;
                     }
                 }
+            }
+
+            // The connection can close without a `[DONE]` sentinel, leaving the
+            // terminal event held pending a usage chunk that will never come.
+            for event in decoder.finish() {
+                yield event;
             }
         };
 

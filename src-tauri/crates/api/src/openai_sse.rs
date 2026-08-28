@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     error::ApiError,
-    types::{StreamEvent, ToolCall},
+    types::{StreamEvent, ToolCall, Usage},
 };
 
 /// Partial state for one streamed tool call, keyed by its `index`.
@@ -46,6 +46,20 @@ pub(crate) fn split_lines(buf: &mut String) -> Vec<String> {
 pub(crate) struct OpenAiSseDecoder {
     /// BTreeMap so flushing is deterministic in `index` order.
     tools: BTreeMap<u32, ToolAccum>,
+    /// Usage from the trailing `include_usage` chunk; None until one arrives.
+    usage: Option<Usage>,
+    /// A `finish_reason` we have seen but not yet turned into a `Done`.
+    ///
+    /// With `stream_options.include_usage`, the usage chunk arrives *after*
+    /// the chunk carrying `finish_reason`. Emitting `Done` immediately would
+    /// end the turn one chunk before the token counts show up, so the terminal
+    /// event is held until the usage chunk, the `[DONE]` sentinel, or the end
+    /// of the stream — whichever comes first.
+    pending_done: Option<String>,
+    /// Whether the terminal event has already gone out. The turn ends exactly
+    /// once, so a `[DONE]` sentinel trailing an already-released `Done` must
+    /// not produce a second one.
+    done_emitted: bool,
 }
 
 impl OpenAiSseDecoder {
@@ -72,9 +86,8 @@ impl OpenAiSseDecoder {
             // Some providers close without ever sending a finish_reason; flush
             // whatever tool calls are still in flight before terminating.
             self.flush_tools(&mut out);
-            out.push(StreamEvent::Done {
-                stop_reason: "stop".to_string(),
-            });
+            let reason = self.pending_done.take().unwrap_or_else(|| "stop".to_string());
+            self.emit_done(&mut out, reason);
             return Ok(Decoded {
                 events: out,
                 terminal: true,
@@ -86,6 +99,12 @@ impl OpenAiSseDecoder {
         }
 
         let parsed: Value = serde_json::from_str(data)?;
+
+        // Read usage before the choices, so a provider that packs both into one
+        // chunk still gets its counts onto that chunk's `Done`.
+        if let Some(raw) = parsed.get("usage") {
+            self.absorb_usage(raw);
+        }
 
         if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
@@ -108,11 +127,16 @@ impl OpenAiSseDecoder {
                 if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                     if !reason.is_empty() {
                         self.flush_tools(&mut out);
-                        out.push(StreamEvent::Done {
-                            stop_reason: reason.to_string(),
-                        });
+                        self.pending_done = Some(reason.to_string());
                     }
                 }
+            }
+        }
+
+        // Release the held terminal event as soon as usage is in hand.
+        if self.usage.is_some() {
+            if let Some(reason) = self.pending_done.take() {
+                self.emit_done(&mut out, reason);
             }
         }
 
@@ -120,6 +144,60 @@ impl OpenAiSseDecoder {
             events: out,
             terminal: false,
         })
+    }
+
+    /// Push the turn's single terminal event, if it has not gone out already.
+    fn emit_done(&mut self, out: &mut Vec<StreamEvent>, stop_reason: String) {
+        if self.done_emitted {
+            return;
+        }
+        self.done_emitted = true;
+        out.push(StreamEvent::Done {
+            stop_reason,
+            usage: self.usage,
+        });
+    }
+
+    /// Flush anything still held when the byte stream ends.
+    ///
+    /// A provider that closes the connection without a `[DONE]` sentinel would
+    /// otherwise strand the deferred `Done` — and any tool call that never got
+    /// a `finish_reason` — inside the decoder.
+    pub fn finish(&mut self) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        self.flush_tools(&mut out);
+        if let Some(reason) = self.pending_done.take() {
+            self.emit_done(&mut out, reason);
+        }
+        out
+    }
+
+    /// Normalise one OpenAI-shaped `usage` object.
+    ///
+    /// OpenAI counts cached tokens *inside* `prompt_tokens`, whereas [`Usage`]
+    /// follows Anthropic and keeps them apart, so the cached portion is
+    /// subtracted out rather than counted twice. These providers report no
+    /// cache-write count at all, which stays zero.
+    fn absorb_usage(&mut self, raw: &Value) {
+        let field = |name: &str| raw.get(name).and_then(Value::as_u64);
+        let (prompt, completion) = (field("prompt_tokens"), field("completion_tokens"));
+        if prompt.is_none() && completion.is_none() {
+            return;
+        }
+
+        let cached = raw
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let prompt = prompt.unwrap_or(0);
+
+        self.usage = Some(Usage {
+            input_tokens: prompt.saturating_sub(cached),
+            output_tokens: completion.unwrap_or(0),
+            cache_read_input_tokens: cached.min(prompt),
+            cache_creation_input_tokens: 0,
+        });
     }
 
     fn accumulate(&mut self, tc: &Value) {
@@ -175,6 +253,8 @@ impl OpenAiSseDecoder {
 mod tests {
     use super::*;
 
+    /// Feed chunks through the same loop the clients use, including the
+    /// end-of-stream flush.
     fn drive(chunks: &[&str]) -> Vec<StreamEvent> {
         let mut decoder = OpenAiSseDecoder::new();
         let mut leftover = String::new();
@@ -189,6 +269,7 @@ mod tests {
                 }
             }
         }
+        out.extend(decoder.finish());
         out
     }
 
@@ -208,7 +289,14 @@ mod tests {
 
     fn as_done(e: &StreamEvent) -> &str {
         match e {
-            StreamEvent::Done { stop_reason } => stop_reason,
+            StreamEvent::Done { stop_reason, .. } => stop_reason,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    fn done_usage(e: &StreamEvent) -> Option<Usage> {
+        match e {
+            StreamEvent::Done { usage, .. } => *usage,
             other => panic!("expected Done, got {other:?}"),
         }
     }
@@ -336,6 +424,92 @@ mod tests {
 
         assert!(decoded.terminal);
         assert_eq!(as_done(&decoded.events[0]), "stop");
+    }
+
+    // -- usage ---------------------------------------------------------------
+
+    #[test]
+    fn the_trailing_usage_chunk_is_attached_to_the_done_event() {
+        // With stream_options.include_usage the counts arrive one chunk *after*
+        // finish_reason, so Done has to wait for them.
+        let events = drive(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":300,\"completion_tokens\":25}}\n",
+            "data: [DONE]\n",
+        ]);
+
+        assert_eq!(events.len(), 2, "got {events:?}");
+        assert_eq!(as_done(&events[1]), "stop", "the real reason, not the sentinel default");
+        let usage = done_usage(&events[1]).expect("usage reported");
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 25);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_split_out_of_the_prompt_total() {
+        // OpenAI counts cached tokens inside prompt_tokens; Usage keeps them
+        // apart, so counting both would double-bill the cached prefix.
+        let events = drive(&[
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n",
+        ]);
+
+        let usage = done_usage(&events[0]).expect("usage reported");
+        assert_eq!(usage.input_tokens, 200, "uncached remainder");
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        assert_eq!(usage.total_input_tokens(), 1000, "and they still sum back");
+    }
+
+    #[test]
+    fn usage_arriving_with_the_finish_reason_does_not_delay_the_done_event() {
+        let events = drive(&[
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n",
+        ]);
+
+        assert_eq!(events.len(), 1);
+        assert!(done_usage(&events[0]).is_some());
+    }
+
+    #[test]
+    fn a_stream_that_reports_no_usage_still_terminates_with_none() {
+        let events = drive(&["data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n"]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(as_done(&events[0]), "stop");
+        assert_eq!(done_usage(&events[0]), None);
+    }
+
+    #[test]
+    fn a_connection_that_closes_after_finish_reason_still_yields_done() {
+        // No [DONE] sentinel and no usage chunk: the end-of-stream flush is the
+        // only thing that can release the held terminal event.
+        let mut decoder = OpenAiSseDecoder::new();
+        let decoded = decoder
+            .decode_line("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}")
+            .expect("decode");
+        assert!(decoded.events.is_empty(), "Done is held pending usage");
+
+        let flushed = decoder.finish();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(as_done(&flushed[0]), "length");
+        assert_eq!(done_usage(&flushed[0]), None);
+    }
+
+    #[test]
+    fn an_empty_usage_object_is_ignored_rather_than_reported_as_zero() {
+        let events = drive(&[
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n",
+        ]);
+
+        assert_eq!(done_usage(&events[0]), None);
+    }
+
+    #[test]
+    fn finish_is_idempotent_once_the_terminal_event_has_been_emitted() {
+        let mut decoder = OpenAiSseDecoder::new();
+        decoder.decode_line("data: [DONE]").expect("decode");
+
+        assert!(decoder.finish().is_empty(), "Done must not be emitted twice");
     }
 
     #[test]

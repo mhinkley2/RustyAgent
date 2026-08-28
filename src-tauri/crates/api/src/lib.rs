@@ -4,6 +4,7 @@
 pub mod error;
 pub mod keychain;
 pub mod types;
+pub mod pricing;
 pub mod provider;
 pub mod anthropic;
 pub(crate) mod openai_sse;
@@ -19,8 +20,9 @@ pub use error::ApiError;
 pub use keychain::ApiKeyStore;
 pub use types::{
     ChatMessage, MessageRole, ToolDefinition, ToolCall, ToolResult,
-    CompletionConfig, StreamEvent, ContentBlock,
+    CompletionConfig, StreamEvent, ContentBlock, Usage,
 };
+pub use pricing::{estimate_cost_usd, ModelPrice};
 pub use provider::LlmProvider;
 pub use mock::MockLlmProvider;
 pub use anthropic::AnthropicClient;
