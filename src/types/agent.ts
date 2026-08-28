@@ -83,11 +83,16 @@ export interface AgentRuntimeStatus {
 // ---------------------------------------------------------------------------
 
 export const PROVIDER_MODELS: Record<Provider, { value: string; label: string }[]> = {
+  // Every id here must also appear in the api crate's PRICES and
+  // CONTEXT_WINDOWS tables (crates/api/src/pricing.rs). A model missing from
+  // those still runs, but records no cost and budgets its context at the
+  // conservative default rather than its real window.
   anthropic: [
-    { value: "claude-opus-4-5",              label: "Claude Opus 4.5" },
-    { value: "claude-3-5-sonnet-20241022",   label: "Claude 3.5 Sonnet" },
-    { value: "claude-3-5-haiku-20241022",    label: "Claude 3.5 Haiku" },
-    { value: "claude-3-opus-20240229",       label: "Claude 3 Opus" },
+    { value: "claude-opus-5",    label: "Claude Opus 5" },
+    { value: "claude-sonnet-5",  label: "Claude Sonnet 5" },
+    { value: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+    { value: "claude-opus-4-8",  label: "Claude Opus 4.8" },
+    { value: "claude-fable-5",   label: "Claude Fable 5" },
   ],
   deepseek: [
     { value: "deepseek-chat",     label: "DeepSeek Chat" },
@@ -113,7 +118,7 @@ export const PROVIDER_LABELS: Record<Provider, string> = {
 };
 
 export const CONTEXT_STRATEGY_OPTIONS: { value: ContextStrategy; label: string; description: string }[] = [
-  { value: "recent",  label: "Recent",  description: "Keep the most recent messages" },
-  { value: "summary", label: "Summary", description: "Periodically summarise older context" },
-  { value: "full",    label: "Full",    description: "Send all messages every time (expensive)" },
+  { value: "recent",  label: "Recent",  description: "Drop the oldest turns once the input budget is reached" },
+  { value: "summary", label: "Summary", description: "Replace the dropped turns with a generated summary (costs an extra call)" },
+  { value: "full",    label: "Full",    description: "Never compact — the run fails if it outgrows the budget" },
 ];

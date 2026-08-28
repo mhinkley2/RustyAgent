@@ -11,12 +11,28 @@ use tauri::Emitter;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use api::{ChatMessage, CompletionConfig, LlmProvider, StreamEvent, ToolCall, Usage};
+use api::{ChatMessage, CompletionConfig, LlmProvider, StreamEvent, ToolCall, ToolDefinition, Usage};
 use tools::{ToolContext, ToolRegistry};
 use memory::MemoryStore;
 
 use crate::approval_gate::ApprovalGate;
+use crate::context::{self, ContextPolicy, ContextStrategy};
 use crate::{PermissionPolicy, PolicyDecision};
+
+/// Output cap for the summarisation call `context_strategy = "summary"` makes.
+///
+/// Small on purpose: the summary is reinserted into the very context that was
+/// over budget, so a long one defeats the compaction that produced it.
+const SUMMARY_MAX_OUTPUT_TOKENS: u32 = 700;
+
+/// Bounds on how far a reconciled estimate may be scaled by the provider's
+/// real figures.
+///
+/// The ratio is one observation, and a provider that reports something odd —
+/// or a call whose usage covers a different request than the one measured —
+/// must not be able to move the budget arbitrarily far in either direction.
+const MIN_ESTIMATE_SCALE: f64 = 0.5;
+const MAX_ESTIMATE_SCALE: f64 = 4.0;
 
 // ---------------------------------------------------------------------------
 // Tauri event payloads
@@ -37,6 +53,28 @@ pub enum RunEvent {
     Cancelled { run_id: String },
     /// The run failed with an error.
     Failed { run_id: String, message: String },
+    /// The conversation was compacted to fit the input budget.
+    ///
+    /// Emitted once per compaction, before the provider call it made room
+    /// for, so an operator watching a long run can see history being dropped
+    /// rather than inferring it from an agent that forgot something.
+    ContextCompacted {
+        run_id: String,
+        /// The `context_strategy` that did it: `"recent"` or `"summary"`.
+        strategy: String,
+        /// Estimated input tokens before compaction.
+        before_tokens: u64,
+        /// Estimated input tokens after it.
+        after_tokens: u64,
+        /// The budget both are measured against.
+        budget_tokens: u64,
+        /// How many messages were dropped.
+        evicted_messages: usize,
+        /// Whether the dropped prefix was replaced by a generated summary.
+        /// `false` under `recent`, and also under `summary` when the
+        /// summarisation call failed and it degraded to plain eviction.
+        summarized: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +190,25 @@ pub struct ConversationRuntime {
     /// `total_input_tokens()` is the size of the context that was last sent,
     /// which is the figure a context budget has to be measured against.
     pub last_usage: Option<Usage>,
+
+    /// How this profile wants an over-budget conversation handled.
+    ///
+    /// Defaulted rather than taken as a constructor argument: the two
+    /// constructors already carry sixteen and nineteen parameters, and every
+    /// caller that has a profile row to read sets this straight after
+    /// building. The default — `recent`, with a per-model budget — is the
+    /// safe one, so a caller that forgets still gets compaction.
+    pub context_policy: ContextPolicy,
+
+    /// Our own estimate of the input size of the last request sent, before
+    /// any calibration scaling.
+    ///
+    /// Kept so the next `Usage` can be divided by it to learn how far off the
+    /// estimator is for this model.
+    last_raw_estimate: Option<u64>,
+    /// Multiplier applied to raw estimates, learned from the provider's real
+    /// figures. 1.0 until the first call reports usage.
+    estimate_scale: f64,
 }
 
 impl ConversationRuntime {
@@ -250,6 +307,9 @@ impl ConversationRuntime {
             before_sha,
             usage_total: Usage::default(),
             last_usage: None,
+            context_policy: ContextPolicy::default(),
+            last_raw_estimate: None,
+            estimate_scale: 1.0,
         })
     }
 
@@ -324,6 +384,21 @@ impl ConversationRuntime {
                     .filter(|def| self.permission_policy.check(&def.name))
                     .collect::<Vec<_>>()
             };
+
+            // ---------------------------------------------------------------
+            // Keep the conversation inside the model's input budget.
+            //
+            // Immediately before the call, because the tool list is part of
+            // what is measured and the message list has just grown by a whole
+            // tool round trip.
+            // ---------------------------------------------------------------
+            if let Err(msg) = self.enforce_context_budget(&tool_defs).await {
+                error!(run_id = %self.run_id, "{msg}");
+                self.persist_event("error", &serde_json::json!({ "message": msg })).await;
+                self.emit(RunEvent::Failed { run_id: self.run_id.clone(), message: msg.clone() });
+                self.finish_run("failed").await;
+                return Err(anyhow::anyhow!(msg));
+            }
 
             // ---------------------------------------------------------------
             // Call the LLM and stream events.
@@ -610,6 +685,195 @@ impl ConversationRuntime {
     }
 
     // -----------------------------------------------------------------------
+    // Context budget
+    // -----------------------------------------------------------------------
+
+    /// Bring `self.messages` inside the profile's input budget, or refuse to
+    /// make the call.
+    ///
+    /// Returns `Err` with an operator-readable message when the request cannot
+    /// be made to fit — under `full`, which never compacts, and under the
+    /// compacting strategies when even the protected prefix is too large. That
+    /// is deliberately a run failure: the alternative is handing the provider a
+    /// request we already know it will reject, and failing with its error
+    /// instead of ours.
+    async fn enforce_context_budget(&mut self, tool_defs: &[ToolDefinition]) -> Result<(), String> {
+        let outcome = self.compact_to_budget(tool_defs).await;
+
+        // Whatever happened above, record the uncalibrated size of what is
+        // about to be sent. The provider's reply divides its real input count
+        // by this to learn how far off the estimator is.
+        self.last_raw_estimate = Some(api::tokens::estimate_request(
+            self.config.system_prompt.as_deref(),
+            &self.messages,
+            tool_defs,
+        ));
+
+        outcome
+    }
+
+    /// The decision itself. See [`Self::enforce_context_budget`], which wraps
+    /// this so the estimate is recorded on every path out.
+    async fn compact_to_budget(&mut self, tool_defs: &[ToolDefinition]) -> Result<(), String> {
+        let overhead =
+            api::tokens::estimate_overhead(self.config.system_prompt.as_deref(), tool_defs);
+        let budget = self.context_policy.budget_tokens(&self.config);
+
+        let plan =
+            context::plan_compaction(&self.messages, overhead, budget, self.estimate_scale);
+
+        if plan.before_tokens <= budget {
+            return Ok(());
+        }
+
+        let strategy = self.context_policy.strategy;
+        if strategy == ContextStrategy::Full {
+            return Err(format!(
+                "Context budget exceeded: the request is an estimated {} input tokens \
+                 against a budget of {budget}. context_strategy is \"full\", which never \
+                 compacts. Raise max_input_tokens for this profile, or switch it to \
+                 \"recent\" or \"summary\".",
+                plan.before_tokens
+            ));
+        }
+
+        if !plan.fits {
+            return Err(format!(
+                "Context budget exceeded: the request is an estimated {} input tokens \
+                 against a budget of {budget}, and compaction cannot get below {} — the \
+                 system prompt, tool definitions and originating task alone do not fit. \
+                 Raise max_input_tokens, shorten the system prompt, or grant fewer tools.",
+                plan.before_tokens, plan.after_tokens
+            ));
+        }
+
+        info!(
+            run_id = %self.run_id,
+            strategy = strategy.as_str(),
+            before = plan.before_tokens,
+            budget,
+            evicting = plan.evicted_count(),
+            "Compacting conversation to fit the input budget"
+        );
+
+        // Summarise before draining — the summariser needs the messages, and a
+        // failed call must leave the run exactly where plain `recent` would.
+        let mut summary = None;
+        if strategy == ContextStrategy::Summary {
+            let evicted: Vec<ChatMessage> =
+                self.messages[plan.protected..plan.evict_end].to_vec();
+            match self.summarize_evicted(&evicted).await {
+                Some(text) => summary = Some(ChatMessage::user(
+                    format!("{}{}", context::SUMMARY_PREFIX, text),
+                )),
+                None => warn!(
+                    run_id = %self.run_id,
+                    "Summarisation failed; degrading to 'recent' for this compaction"
+                ),
+            }
+        }
+
+        self.messages.drain(plan.protected..plan.evict_end);
+
+        let mut after_tokens = plan.after_tokens;
+        let summarized = summary.is_some();
+        if let Some(message) = summary {
+            after_tokens += api::tokens::estimate_message(&message);
+            self.messages.insert(plan.protected, message);
+        }
+
+        let payload = serde_json::json!({
+            "strategy": strategy.as_str(),
+            "before_tokens": plan.before_tokens,
+            "after_tokens": after_tokens,
+            "budget_tokens": budget,
+            "evicted_messages": plan.evicted_count(),
+            "summarized": summarized,
+        });
+        self.persist_event("context_compacted", &payload).await;
+        self.emit(RunEvent::ContextCompacted {
+            run_id: self.run_id.clone(),
+            strategy: strategy.as_str().to_string(),
+            before_tokens: plan.before_tokens,
+            after_tokens,
+            budget_tokens: budget,
+            evicted_messages: plan.evicted_count(),
+            summarized,
+        });
+
+        Ok(())
+    }
+
+    /// Summarise the messages about to be dropped, with a cheap capped call.
+    ///
+    /// `None` on any failure — a summary is a nicety, and losing one is not
+    /// worth losing the run. The caller degrades to plain eviction.
+    async fn summarize_evicted(&mut self, evicted: &[ChatMessage]) -> Option<String> {
+        if evicted.is_empty() {
+            return None;
+        }
+
+        let mut config = self.config.clone();
+        // Never spend more on a summary than the run itself is allowed to
+        // write, and never more than the cap either way.
+        config.max_tokens = SUMMARY_MAX_OUTPUT_TOKENS.min(self.config.max_tokens);
+        config.temperature = None;
+        config.system_prompt = Some(context::SUMMARY_SYSTEM_PROMPT.to_string());
+
+        let prompt = ChatMessage::user(context::summary_prompt(evicted));
+
+        // No tools: the summariser reads a transcript, it does not act.
+        let mut stream = match self
+            .provider
+            .stream_completion(vec![prompt], Vec::new(), config)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!(run_id = %self.run_id, "Summarisation call failed: {e}");
+                return None;
+            }
+        };
+
+        let mut text = String::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(token)) => text.push_str(&token),
+                Ok(StreamEvent::Done { usage: u, .. }) => {
+                    usage = u;
+                    break;
+                }
+                Ok(StreamEvent::Error(msg)) => {
+                    warn!(run_id = %self.run_id, "Summarisation stream error: {msg}");
+                }
+                Ok(StreamEvent::ToolCallDelta(_)) => {}
+                Err(e) => {
+                    warn!(run_id = %self.run_id, "Summarisation stream failed: {e}");
+                    return None;
+                }
+            }
+        }
+        drop(stream);
+
+        // The summarisation call is real spend and belongs in the run's total.
+        // It deliberately does *not* touch `last_usage`: that figure is the
+        // size of the agent conversation last sent, and this call sent
+        // something else entirely. Folding it in would corrupt the calibration
+        // the budget depends on.
+        if let Some(u) = usage {
+            self.usage_total += u;
+        }
+
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            warn!(run_id = %self.run_id, "Summarisation returned nothing");
+            return None;
+        }
+        Some(text)
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -652,6 +916,7 @@ impl ConversationRuntime {
     fn record_usage(&mut self, usage: Usage) {
         self.usage_total += usage;
         self.last_usage = Some(usage);
+        self.calibrate_estimate(usage);
         debug!(
             run_id = %self.run_id,
             input = usage.input_tokens,
@@ -659,6 +924,42 @@ impl ConversationRuntime {
             cache_read = usage.cache_read_input_tokens,
             "Provider reported usage"
         );
+    }
+
+    /// Correct the token estimator against what the provider actually counted.
+    ///
+    /// `Usage::total_input_tokens()` is the real size of the context that was
+    /// just sent — the same content `last_raw_estimate` guessed at — so their
+    /// ratio is how wrong the estimator is for this model and this kind of
+    /// content. Applying it keeps a character-based guess from either
+    /// compacting a conversation that would have fit or, worse, letting one
+    /// through that will not.
+    ///
+    /// One observation, clamped, rather than a running average: an agent's
+    /// content changes shape through a run, and the most recent call is the
+    /// best evidence about the next one.
+    fn calibrate_estimate(&mut self, usage: Usage) {
+        let real = usage.total_input_tokens();
+        let Some(estimated) = self.last_raw_estimate.filter(|e| *e > 0) else {
+            return;
+        };
+        if real == 0 {
+            // A provider that reports no input tokens is not evidence that the
+            // request was empty.
+            return;
+        }
+
+        let scale = (real as f64 / estimated as f64).clamp(MIN_ESTIMATE_SCALE, MAX_ESTIMATE_SCALE);
+        if (scale - self.estimate_scale).abs() > f64::EPSILON {
+            debug!(
+                run_id = %self.run_id,
+                estimated,
+                real,
+                scale,
+                "Recalibrated the token estimator against reported usage"
+            );
+        }
+        self.estimate_scale = scale;
     }
 
     fn emit(&self, event: RunEvent) {
@@ -672,13 +973,17 @@ impl ConversationRuntime {
     ///
     /// Non-critical event types (`message`, `tool_call`, `tool_result`, `thought`) are
     /// skipped when `track_history` is `false`. Critical events (`error`,
-    /// `approval_request`, `approval_response`, `complete`, `cancelled`, `failed`) are
-    /// always written regardless of the flag.
+    /// `approval_request`, `approval_response`, `complete`, `cancelled`, `failed`,
+    /// `context_compacted`) are always written regardless of the flag.
     async fn persist_event(&self, event_type: &str, payload: &serde_json::Value) {
+        // `context_compacted` is critical: it records that history was
+        // discarded. An operator debugging an agent that "forgot" something
+        // needs to see it even on a story with history tracking off, which is
+        // exactly the configuration where the messages themselves are gone.
         let critical = matches!(
             event_type,
             "error" | "approval_request" | "approval_response"
-                | "complete" | "cancelled" | "failed"
+                | "complete" | "cancelled" | "failed" | "context_compacted"
         );
         if !critical && !self.track_history {
             return;
@@ -700,6 +1005,12 @@ impl ConversationRuntime {
                 let t = payload["tool_name"].as_str().map(|s| s.to_string());
                 let i = payload.get("input").map(|v| v.to_string());
                 (None, None, t, i, None, 0)
+            }
+            // The timeline renders `content` verbatim, so lift the message out
+            // of the payload rather than showing the operator raw JSON.
+            "error" => {
+                let m = payload["message"].as_str().map(|s| s.to_string());
+                (None, m.or_else(|| Some(payload.to_string())), None, None, None, 1)
             }
             "tool_result" => {
                 let t  = payload["tool_name"].as_str().map(|s| s.to_string());

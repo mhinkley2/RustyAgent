@@ -101,7 +101,8 @@ pub async fn start_run(
     // Load the agent profile from the database.
     // ------------------------------------------------------------------
     let row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory \
+        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+                context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
     .bind(&profile_id)
@@ -117,6 +118,8 @@ pub async fn start_run(
     let max_iterations: i64 = row.try_get("max_iterations").unwrap_or(20);
     let max_tokens_per_run: i64 = row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
+    let context_strategy: String = row.try_get("context_strategy").unwrap_or_default();
+    let max_input_tokens: Option<i64> = row.try_get("max_input_tokens").ok().flatten();
 
     // ------------------------------------------------------------------
     // Load the agent_permissions row (if any).
@@ -237,7 +240,7 @@ pub async fn start_run(
         None
     };
 
-    let runtime = ConversationRuntime::new(
+    let mut runtime = ConversationRuntime::new(
         &story_id,
         &profile_id,
         provider,
@@ -257,6 +260,13 @@ pub async fn start_run(
     )
     .await
     .map_err(|e| format!("Failed to create runtime: {e}"))?;
+
+    // Give the loop the profile's context settings. Set here rather than
+    // passed to the constructor, which already carries far too many
+    // arguments; the default is the safe one, so a caller that forgets
+    // still gets `recent` compaction at a per-model budget.
+    runtime.context_policy =
+        runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
     let run_id = runtime.run_id.clone();
 
@@ -328,7 +338,8 @@ pub async fn start_chat_run(
 
     // Load the agent profile.
     let row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory \
+        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+                context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
     .bind(&profile_id)
@@ -344,6 +355,8 @@ pub async fn start_chat_run(
     let max_iterations: i64   = row.try_get("max_iterations").unwrap_or(20);
     let max_tokens: i64       = row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
+    let context_strategy: String = row.try_get("context_strategy").unwrap_or_default();
+    let max_input_tokens: Option<i64> = row.try_get("max_input_tokens").ok().flatten();
 
     // Load permissions for this profile.
     let perm_row = sqlx::query(
@@ -473,7 +486,7 @@ pub async fn start_chat_run(
     let cancel       = CancelFlag::new();
     let cancel_clone = cancel.clone();
 
-    let runtime = ConversationRuntime::new(
+    let mut runtime = ConversationRuntime::new(
         &session_id,
         &profile_id,
         provider,
@@ -493,6 +506,13 @@ pub async fn start_chat_run(
     )
     .await
     .map_err(|e| format!("Failed to create chat runtime: {e}"))?;
+
+    // Give the loop the profile's context settings. Set here rather than
+    // passed to the constructor, which already carries far too many
+    // arguments; the default is the safe one, so a caller that forgets
+    // still gets `recent` compaction at a per-model budget.
+    runtime.context_policy =
+        runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
     let run_id = runtime.run_id.clone();
 

@@ -412,7 +412,10 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
           <h3 className="agent-form__section-title">Limits</h3>
 
           <div className="agent-form__row">
-            <FormField label="Max input tokens" helperText="Leave blank for provider default.">
+            <FormField
+              label="Max input tokens"
+              helperText="The context budget for each call. Leave blank to derive one from the model, with room reserved for the response."
+            >
               {(id) => (
                 <NumberInput
                   id={id}

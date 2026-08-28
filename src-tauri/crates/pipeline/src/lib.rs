@@ -385,7 +385,8 @@ async fn fire_step_run(
 
     // Load agent profile
     let profile_row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory \
+        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+                context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
     .bind(agent_id)
@@ -400,6 +401,8 @@ async fn fire_step_run(
     let max_iterations: i64 = profile_row.try_get("max_iterations").unwrap_or(20);
     let max_tokens: i64 = profile_row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = profile_row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
+    let context_strategy: String = profile_row.try_get("context_strategy").unwrap_or_default();
+    let max_input_tokens: Option<i64> = profile_row.try_get("max_input_tokens").ok().flatten();
 
     // Load story
     let story_row = sqlx::query("SELECT title, description, track_history FROM stories WHERE id = ?")
@@ -523,7 +526,7 @@ async fn fire_step_run(
     let pipeline_run_id_str = pipeline_run_id.to_string();
     let registry_arc = Arc::new(tokio::sync::Mutex::new(registry));
 
-    let rt = runtime::ConversationRuntime::new_with_pipeline(
+    let mut rt = runtime::ConversationRuntime::new_with_pipeline(
         story_id,
         agent_id,
         provider,
@@ -546,6 +549,13 @@ async fn fire_step_run(
     )
     .await
     .context("Failed to create ConversationRuntime for pipeline step")?;
+
+    // Give the loop the profile's context settings. Set here rather than
+    // passed to the constructor, which already carries far too many
+    // arguments; the default is the safe one, so a caller that forgets
+    // still gets `recent` compaction at a per-model budget.
+    rt.context_policy =
+        runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
     let run_id = rt.run_id.clone();
     let cancel_tok = rt.cancel.clone();
@@ -624,7 +634,8 @@ async fn run_subtask_impl(
 
     // Load profile
     let profile_row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory \
+        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+                context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
     .bind(&agent_id)
@@ -639,6 +650,8 @@ async fn run_subtask_impl(
     let max_iterations: i64 = profile_row.try_get("max_iterations").unwrap_or(20);
     let max_tokens: i64 = profile_row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = profile_row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
+    let context_strategy: String = profile_row.try_get("context_strategy").unwrap_or_default();
+    let max_input_tokens: Option<i64> = profile_row.try_get("max_input_tokens").ok().flatten();
 
     // Load story
     let story_row = sqlx::query("SELECT title, description, track_history FROM stories WHERE id = ?")
@@ -731,7 +744,7 @@ async fn run_subtask_impl(
 
     let cancel = runtime::CancelFlag::new();
 
-    let rt = runtime::ConversationRuntime::new_with_pipeline(
+    let mut rt = runtime::ConversationRuntime::new_with_pipeline(
         story_id,
         agent_id,
         provider,
@@ -754,6 +767,13 @@ async fn run_subtask_impl(
     )
     .await
     .context("Failed to create ConversationRuntime for subtask")?;
+
+    // Give the loop the profile's context settings. Set here rather than
+    // passed to the constructor, which already carries far too many
+    // arguments; the default is the safe one, so a caller that forgets
+    // still gets `recent` compaction at a per-model budget.
+    rt.context_policy =
+        runtime::ContextPolicy::from_profile(&context_strategy, max_input_tokens);
 
     let run_id = rt.run_id.clone();
     let cancel_tok = rt.cancel.clone();

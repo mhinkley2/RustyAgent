@@ -20,6 +20,7 @@ use db::DbPool;
 use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 
 use crate::approval_gate::ApprovalGate;
+use crate::context::{ContextPolicy, SUMMARY_PREFIX};
 use crate::runtime::{CancelFlag, ConversationRuntime, RunEvent};
 use crate::testing::RecordingSink;
 use crate::PermissionPolicy;
@@ -117,6 +118,7 @@ struct Harness {
     max_iterations: u32,
     track_history: bool,
     event_retention_runs: u32,
+    context_policy: ContextPolicy,
 }
 
 impl Harness {
@@ -143,6 +145,7 @@ impl Harness {
             max_iterations: 20,
             track_history: true,
             event_retention_runs: 0,
+            context_policy: ContextPolicy::default(),
         }
     }
 
@@ -153,7 +156,7 @@ impl Harness {
 
     /// Build the runtime, returning it plus its run id.
     async fn build(&self) -> ConversationRuntime {
-        ConversationRuntime::new(
+        let mut rt = ConversationRuntime::new(
             STORY_ID,
             PROFILE_ID,
             Box::new(ProviderHandle(self.provider.clone())),
@@ -172,7 +175,9 @@ impl Harness {
             self.event_retention_runs,
         )
         .await
-        .expect("build runtime")
+        .expect("build runtime");
+        rt.context_policy = self.context_policy;
+        rt
     }
 
     /// Build and run to completion, returning the run id.
@@ -1042,4 +1047,457 @@ async fn a_saturated_token_total_persists_clamped_rather_than_negative() {
 
     assert_eq!(usage.input_tokens, i64::MAX, "clamped, not wrapped to -1");
     assert_eq!(usage.output_tokens, i64::MAX);
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction
+//
+// The message list only ever grew, so a long run eventually sent the provider
+// more input than the model could take and died with its work lost. These
+// drive a conversation past a deliberately small budget and pin what the loop
+// does about it.
+// ---------------------------------------------------------------------------
+
+/// A tool result big enough that a couple of round trips blow the budget:
+/// 6,000 bytes estimates at ~2,000 tokens.
+const BIG_TOOL_OUTPUT_BYTES: usize = 6_000;
+
+/// Budget that three of those round trips exceed and two do not, so the run
+/// compacts exactly once on its fourth call.
+const TIGHT_BUDGET: i64 = 6_000;
+
+/// Three tool round trips then a final answer. The fourth provider call is
+/// the one that needs room made for it.
+fn overflowing_script() -> Vec<MockResponse> {
+    vec![
+        MockResponse::tool_call("c1", "read_big", json!({})),
+        MockResponse::tool_call("c2", "read_big", json!({})),
+        MockResponse::tool_call("c3", "read_big", json!({})),
+        MockResponse::text("all done"),
+    ]
+}
+
+/// A harness on `overflowing_script` with the given strategy and budget.
+///
+/// `without_usage` throughout: the mock's canned token counts describe no real
+/// request, and letting them recalibrate the estimator would make the budget
+/// these tests assert on a moving target. Reconciliation gets its own test.
+async fn overflowing_harness(strategy: &str, budget: Option<i64>) -> Harness {
+    let mut h = Harness::with_provider(
+        MockLlmProvider::script(overflowing_script()).without_usage(),
+    )
+    .await
+    .with_tool(Box::new(StubTool::new(
+        "read_big",
+        &"x".repeat(BIG_TOOL_OUTPUT_BYTES),
+    )))
+    .await;
+    h.context_policy = ContextPolicy::from_profile(strategy, budget);
+    h
+}
+
+/// The estimated input size of one recorded provider call.
+fn request_size(call: &RecordedCall) -> u64 {
+    api::tokens::estimate_request(
+        call.config.system_prompt.as_deref(),
+        &call.messages,
+        &call.tools,
+    )
+}
+
+fn compaction_events(sink: &RecordingSink) -> Vec<RunEvent> {
+    sink.run_events()
+        .into_iter()
+        .filter(|e| matches!(e, RunEvent::ContextCompacted { .. }))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_conversation_driven_past_the_budget_is_compacted_and_the_run_completes() {
+    // The regression test for the whole story: before this, the fourth call
+    // went out oversized and the provider killed the run.
+    let h = overflowing_harness("recent", Some(TIGHT_BUDGET)).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert_eq!(h.provider.call_count(), 4, "every scripted turn was reached");
+    assert_eq!(compaction_events(&h.sink).len(), 1);
+
+    for (i, call) in h.calls().iter().enumerate() {
+        let size = request_size(call);
+        assert!(
+            size <= TIGHT_BUDGET as u64,
+            "call {i} went out at {size} tokens against a {TIGHT_BUDGET} budget"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_same_conversation_under_full_fails_instead_of_overflowing() {
+    // The pairing that shows compaction is what keeps the run alive: identical
+    // script and budget, and the only difference is the strategy.
+    let h = overflowing_harness("full", Some(TIGHT_BUDGET)).await;
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let result = rt.run().await;
+
+    assert!(result.is_err(), "full must not send an oversized request");
+    assert_eq!(h.status(&run_id).await, "failed");
+    assert_eq!(
+        h.provider.call_count(),
+        3,
+        "the over-budget fourth call is never made"
+    );
+
+    let message = h
+        .sink
+        .run_events()
+        .into_iter()
+        .find_map(|e| match e {
+            RunEvent::Failed { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("a failed event");
+    assert!(
+        message.contains(&TIGHT_BUDGET.to_string()),
+        "the failure must name the budget, got: {message}"
+    );
+    assert!(message.contains("full"), "got: {message}");
+
+    // The same explanation reaches the run timeline as readable prose, not as
+    // a JSON blob the operator has to decode.
+    let persisted = h.events(&run_id).await;
+    let error = persisted
+        .iter()
+        .find(|(t, _)| t == "error")
+        .map(|(_, c)| c.clone())
+        .expect("a persisted error event");
+    assert_eq!(error, message);
+}
+
+#[tokio::test]
+async fn an_unrecognised_context_strategy_compacts_like_recent() {
+    // A typo in a settings field must not panic, and must not silently become
+    // the one strategy that lets a run die.
+    let h = overflowing_harness("agressive", Some(TIGHT_BUDGET)).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert_eq!(compaction_events(&h.sink).len(), 1);
+}
+
+#[tokio::test]
+async fn a_budget_the_conversation_never_reaches_leaves_it_untouched() {
+    // The other half of "max_input_tokens determines the budget": the same run
+    // under a generous one compacts nothing.
+    let h = overflowing_harness("recent", Some(1_000_000)).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert!(compaction_events(&h.sink).is_empty());
+    let last = h.calls().pop().expect("a call");
+    assert!(
+        request_size(&last) > TIGHT_BUDGET as u64,
+        "the run really did outgrow the tight budget"
+    );
+}
+
+#[tokio::test]
+async fn compaction_drops_the_oldest_turn_and_keeps_the_task_and_the_recent_ones() {
+    let h = overflowing_harness("recent", Some(TIGHT_BUDGET)).await;
+
+    h.run().await;
+
+    let final_call = h.calls().pop().expect("a fourth call");
+    let roles: Vec<&MessageRole> = final_call.messages.iter().map(|m| &m.role).collect();
+
+    // The task survives at the head...
+    assert_eq!(roles.first(), Some(&&MessageRole::User));
+    assert_eq!(final_call.messages[0].content, "do the thing");
+    // ...one round trip was dropped, and the two newest were kept.
+    assert_eq!(
+        final_call.messages.len(),
+        5,
+        "expected task + two surviving round trips, got {roles:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_originating_task_message_survives_every_compaction() {
+    // An agent that has forgotten what it was asked to do is worse than one
+    // that failed loudly.
+    let h = overflowing_harness("recent", Some(2_500)).await;
+
+    h.run().await;
+
+    for (i, call) in h.calls().iter().enumerate() {
+        assert!(
+            call.messages
+                .iter()
+                .any(|m| m.role == MessageRole::User && m.content == "do the thing"),
+            "call {i} lost the task message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_compacted_request_ever_carries_a_tool_result_without_its_tool_call() {
+    // Anthropic answers an orphaned `tool_result` with a hard 400, so a naive
+    // oldest-first drop turns a survivable run into a dead one.
+    let h = overflowing_harness("recent", Some(2_500)).await;
+
+    h.run().await;
+
+    for (i, call) in h.calls().iter().enumerate() {
+        let mut open: Vec<&str> = Vec::new();
+        for message in &call.messages {
+            if let Some(calls) = &message.tool_calls {
+                open = calls.iter().map(|c| c.id.as_str()).collect();
+            } else if message.role == MessageRole::Tool {
+                let id = message.tool_call_id.as_deref().unwrap_or_default();
+                assert!(
+                    open.contains(&id),
+                    "call {i} sent tool_result '{id}' with no preceding tool_use"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_compaction_emits_a_run_event_carrying_the_before_and_after_estimates() {
+    let h = overflowing_harness("recent", Some(TIGHT_BUDGET)).await;
+
+    let run_id = h.run().await;
+
+    let event = compaction_events(&h.sink).pop().expect("a compaction event");
+    match event {
+        RunEvent::ContextCompacted {
+            strategy,
+            before_tokens,
+            after_tokens,
+            budget_tokens,
+            evicted_messages,
+            summarized,
+            ..
+        } => {
+            assert_eq!(strategy, "recent");
+            assert_eq!(budget_tokens, TIGHT_BUDGET as u64);
+            assert!(before_tokens > budget_tokens, "before {before_tokens}");
+            assert!(after_tokens <= budget_tokens, "after {after_tokens}");
+            assert_eq!(evicted_messages, 2, "the tool call and its result");
+            assert!(!summarized);
+        }
+        other => panic!("expected ContextCompacted, got {other:?}"),
+    }
+
+    // And it reaches the run timeline, not just the live event stream.
+    let persisted: Vec<String> = h
+        .events(&run_id)
+        .await
+        .into_iter()
+        .filter(|(t, _)| t == "context_compacted")
+        .map(|(_, c)| c)
+        .collect();
+    assert_eq!(persisted.len(), 1);
+    let payload: Value = serde_json::from_str(&persisted[0]).expect("json payload");
+    assert!(payload["before_tokens"].as_u64().unwrap() > payload["after_tokens"].as_u64().unwrap());
+}
+
+#[tokio::test]
+async fn a_compaction_is_recorded_even_when_the_story_does_not_track_history() {
+    // History tracking off is exactly the configuration where the dropped
+    // messages leave no other trace.
+    let mut h = overflowing_harness("recent", Some(TIGHT_BUDGET)).await;
+    h.track_history = false;
+
+    let run_id = h.run().await;
+
+    let types: Vec<String> = h.events(&run_id).await.into_iter().map(|(t, _)| t).collect();
+    assert!(
+        types.contains(&"context_compacted".to_string()),
+        "got {types:?}"
+    );
+    assert!(!types.contains(&"token".to_string()), "got {types:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Summarisation
+// ---------------------------------------------------------------------------
+
+/// `overflowing_script` with an extra response spliced in where the
+/// summarisation call lands — after the third turn, before the fourth.
+fn summarising_script(summary: MockResponse) -> Vec<MockResponse> {
+    let mut script = overflowing_script();
+    let last = script.pop().expect("the final answer");
+    script.push(summary);
+    script.push(last);
+    script
+}
+
+async fn summarising_harness(summary: MockResponse) -> Harness {
+    let mut h = Harness::with_provider(
+        MockLlmProvider::script(summarising_script(summary)).without_usage(),
+    )
+    .await
+    .with_tool(Box::new(StubTool::new(
+        "read_big",
+        &"x".repeat(BIG_TOOL_OUTPUT_BYTES),
+    )))
+    .await;
+    h.context_policy = ContextPolicy::from_profile("summary", Some(TIGHT_BUDGET));
+    h
+}
+
+#[tokio::test]
+async fn the_summary_strategy_replaces_the_evicted_prefix_with_a_generated_message() {
+    let h = summarising_harness(MockResponse::text("read a big file, found nothing")).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+
+    let final_call = h.calls().pop().expect("a final call");
+    let summary = final_call
+        .messages
+        .iter()
+        .find(|m| m.content.starts_with(SUMMARY_PREFIX))
+        .expect("a reinserted summary message");
+    assert!(summary.content.contains("read a big file, found nothing"));
+    // Right after the protected task message, where the dropped turns were.
+    assert_eq!(final_call.messages[0].content, "do the thing");
+    assert!(final_call.messages[1].content.starts_with(SUMMARY_PREFIX));
+
+    let event = compaction_events(&h.sink).pop().expect("a compaction event");
+    match event {
+        RunEvent::ContextCompacted { strategy, summarized, .. } => {
+            assert_eq!(strategy, "summary");
+            assert!(summarized);
+        }
+        other => panic!("expected ContextCompacted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_summarisation_call_is_cheap_and_carries_no_tools() {
+    // It reads a transcript; it must not be able to act, and it must not
+    // inherit the run's full output budget.
+    let h = summarising_harness(MockResponse::text("a summary")).await;
+
+    h.run().await;
+
+    // Calls are [turn, turn, turn, summarise, turn].
+    let calls = h.calls();
+    let summarising = &calls[3];
+    assert!(summarising.tools.is_empty(), "the summariser gets no tools");
+    assert_eq!(summarising.messages.len(), 1);
+    assert!(summarising.messages[0].content.contains("--- transcript ---"));
+    assert!(
+        summarising.config.max_tokens < h.config.max_tokens,
+        "the summary must be capped below the run's own output budget"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_summarisation_degrades_to_recent_rather_than_failing_the_run() {
+    // Losing a summary is not worth losing the run.
+    let h = summarising_harness(MockResponse::ProviderError("summariser down".into())).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+
+    let event = compaction_events(&h.sink).pop().expect("a compaction event");
+    match event {
+        RunEvent::ContextCompacted { summarized, evicted_messages, .. } => {
+            assert!(!summarized, "no summary was produced");
+            assert_eq!(evicted_messages, 2, "but the eviction still happened");
+        }
+        other => panic!("expected ContextCompacted, got {other:?}"),
+    }
+
+    let final_call = h.calls().pop().expect("a final call");
+    assert!(
+        !final_call
+            .messages
+            .iter()
+            .any(|m| m.content.starts_with(SUMMARY_PREFIX)),
+        "a failed summary must not leave a placeholder behind"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_summary_response_degrades_to_recent_too() {
+    // A provider that returns 200 and nothing at all is a failure by another
+    // name; reinserting an empty message would cost tokens and say nothing.
+    let h = summarising_harness(MockResponse::text("   ")).await;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    let final_call = h.calls().pop().expect("a final call");
+    assert!(!final_call
+        .messages
+        .iter()
+        .any(|m| m.content.starts_with(SUMMARY_PREFIX)));
+}
+
+// ---------------------------------------------------------------------------
+// Reconciling the estimate against real usage
+// ---------------------------------------------------------------------------
+
+/// One tool round trip then an answer — comfortably inside `TIGHT_BUDGET` by
+/// the estimator's own reckoning.
+fn short_script() -> Vec<MockResponse> {
+    vec![
+        MockResponse::tool_call("c1", "read_big", json!({})),
+        MockResponse::text("done"),
+    ]
+}
+
+async fn reconciling_harness(provider: MockLlmProvider) -> Harness {
+    let mut h = Harness::with_provider(provider)
+        .await
+        .with_tool(Box::new(StubTool::new(
+            "read_big",
+            &"x".repeat(BIG_TOOL_OUTPUT_BYTES),
+        )))
+        .await;
+    h.context_policy = ContextPolicy::from_profile("recent", Some(TIGHT_BUDGET));
+    h
+}
+
+#[tokio::test]
+async fn a_conversation_the_estimator_thinks_fits_is_left_alone() {
+    let h = reconciling_harness(MockLlmProvider::script(short_script()).without_usage()).await;
+
+    h.run().await;
+
+    assert!(
+        compaction_events(&h.sink).is_empty(),
+        "the estimate is well inside the budget"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_reporting_more_input_than_estimated_tightens_the_budget() {
+    // The estimator is a character count; `Usage::total_input_tokens()` is the
+    // truth. When the truth comes back far higher, the next call has to be
+    // measured against that ratio — otherwise the budget is enforced against a
+    // number the provider does not agree with.
+    let h = reconciling_harness(
+        MockLlmProvider::script(short_script()).with_usage(Usage::new(400, 5)),
+    )
+    .await;
+
+    let run_id = h.run().await;
+
+    // Same script and budget as the test above; only the reported usage
+    // differs, and now the second call is compacted.
+    assert_eq!(compaction_events(&h.sink).len(), 1);
+    assert_eq!(h.status(&run_id).await, "done");
 }

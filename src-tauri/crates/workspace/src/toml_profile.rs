@@ -7,7 +7,7 @@
 //   name = "My Agent"
 //   description = "Does something useful"
 //   provider = "anthropic"
-//   model = "claude-opus-4-5"
+//   model = "claude-opus-5"
 //   system_prompt = """
 //   You are a helpful assistant.
 //   """
