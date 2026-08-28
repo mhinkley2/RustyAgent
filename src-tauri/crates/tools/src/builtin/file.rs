@@ -370,6 +370,16 @@ pub struct FileEditTool;
 impl Tool for FileEditTool {
     fn name(&self) -> &str { "file_edit" }
 
+    /// A targeted substring swap is still a write, so it clears the same gates
+    /// as `file_write`: `allow_file_write_paths` and `require_approval_on_write`.
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo {
+            writes_files: true,
+            path_inputs: &["path"],
+            ..Default::default()
+        }
+    }
+
     fn description(&self) -> &str {
         "Change part of an existing file by replacing an exact substring, without \
          transporting the whole file. Prefer this over file_write for every edit to \

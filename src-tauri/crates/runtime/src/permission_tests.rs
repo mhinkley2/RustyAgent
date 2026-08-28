@@ -669,20 +669,17 @@ async fn the_name_lists_agree_with_what_the_registered_builtins_declare() {
         );
     }
 
-    // The same holds for WRITE_TOOLS, with one deliberate exception:
-    // `file_edit` is registered by the patch-based edit tool, which is landing
-    // on its own branch. Keeping its entry here is what stops whichever of the
-    // two stories merges second from silently dropping the other's gate. When
-    // that tool lands, this exception disappears.
-    let unregistered: Vec<&&str> = WRITE_TOOLS
-        .iter()
-        .filter(|name| !registered.iter().any(|r| r == *name))
-        .collect();
-    assert_eq!(
-        unregistered,
-        vec![&"file_edit"],
-        "WRITE_TOOLS should contain only registered tools, plus the known file_edit exception"
-    );
+    // The same holds for WRITE_TOOLS, with no exceptions. There was one while
+    // the patch-based edit tool was on its own branch — `file_edit` was listed
+    // here before anything registered it, so that whichever story merged second
+    // could not silently drop the other's gate. Both have landed, so the list
+    // is expected to be exactly the registered write tools.
+    for name in WRITE_TOOLS {
+        assert!(
+            registered.iter().any(|r| r == name),
+            "WRITE_TOOLS names '{name}', which register_builtins does not register"
+        );
+    }
 }
 
 #[test]
