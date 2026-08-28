@@ -22,10 +22,21 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tools::read_cap::{floor_char_boundary, optional_positive, MAX_READ_BYTES};
 
-/// Bytes of serialized rows a single response may carry.
+/// Bytes of serialized JSON a single response's payload may carry.
 ///
 /// The same 32 KB the file read path uses: it is this codebase's one number
 /// for "more tool output than a turn can carry".
+///
+/// What this does and does not bound, stated exactly, because the wire form is
+/// not the payload form. An MCP result carries the payload **twice** — once as
+/// the model-visible `content` text and once as `structuredContent` for
+/// programs (`registry::tool_output_to_result`); both are part of the protocol
+/// and neither can be dropped. So a page built to this budget yields roughly
+/// `2x` this many bytes on the wire, while the *model-visible* text stays at
+/// about this figure. Context flooding is what the cap exists to prevent, and
+/// that is the model-visible half — but a caller measuring the whole frame
+/// should expect twice the number, and tool descriptions should not promise
+/// otherwise.
 pub const MAX_PAGE_BYTES: usize = MAX_READ_BYTES;
 
 /// Bytes any single free-text column may carry.
@@ -181,6 +192,11 @@ fn page_envelope_of(
     let mut envelope = Map::new();
     envelope.insert(item_key.to_string(), Value::Array(page));
     envelope.insert("offset".into(), json!(request.offset));
+    // The limit actually in force, which is not necessarily the one asked for:
+    // an over-ceiling `limit` is clamped rather than rejected. Without this the
+    // caller could not tell a clamp from a short page, because `returned` is
+    // also reduced by the byte budget and by simply running out of rows.
+    envelope.insert("limit".into(), json!(request.limit));
     envelope.insert("returned".into(), json!(returned));
     envelope.insert("total".into(), json!(total));
     envelope.insert("complete".into(), json!(complete));
@@ -304,6 +320,19 @@ mod tests {
         assert_eq!(envelope["returned"], json!(50));
         assert_eq!(envelope["offset"], json!(401));
         assert_eq!(seen.load(Ordering::SeqCst), 50);
+    }
+
+    /// The clamped limit is reported, so a caller can tell a ceiling from a
+    /// short page. `returned` alone is ambiguous: it also shrinks when the byte
+    /// budget cuts the page and when the list simply runs out.
+    #[test]
+    fn the_envelope_reports_the_limit_actually_in_force() {
+        let envelope =
+            paged_rows(rows(500), req(1, 200), "t", "items", "the list", &[]).expect("page");
+
+        assert_eq!(envelope["limit"], json!(200));
+        assert_eq!(envelope["returned"], json!(200));
+        assert_eq!(envelope["total"], json!(500));
     }
 
     #[test]

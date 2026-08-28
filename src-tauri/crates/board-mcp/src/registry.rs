@@ -83,7 +83,13 @@ pub fn json_ok(value: Value) -> ToolOutput {
 pub fn tool_output_to_result(output: ToolOutput) -> Value {
     let parsed = serde_json::from_str::<Value>(&output.content).ok();
     let text = if let Some(value) = parsed.as_ref() {
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| output.content.clone())
+        // Compact, not pretty. This text is the model-visible half of the
+        // reply and the same payload already goes out verbatim in
+        // `structuredContent` below, so indentation buys a program nothing and
+        // costs the model tokens — measured at ~11% on a full page of run
+        // events, more on numeric-heavy rows. In a surface whose whole purpose
+        // is bounding what a reply costs to read, that is not a good trade.
+        serde_json::to_string(value).unwrap_or_else(|_| output.content.clone())
     } else {
         output.content.clone()
     };
