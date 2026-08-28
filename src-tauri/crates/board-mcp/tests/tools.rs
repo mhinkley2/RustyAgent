@@ -785,17 +785,30 @@ async fn get_chat_session_messages_pages_and_caps_a_long_conversation() {
     assert_eq!(first["complete"], json!(false));
     assert_eq!(first["next_offset"], json!(51));
 
+    // The oversized message is found by its content, not by assuming a
+    // position. `chat_session_messages` orders by `created_at ASC, id ASC`,
+    // `created_at` is millisecond-resolution, and `id` is a random UUID — so
+    // messages appended inside one millisecond tie on the timestamp and then
+    // sort by a random string. Asserting the pasted file lands at offset 61
+    // made this test a coin flip that only lost under load.
     let last = call_ok(
         &ctx,
         &registry,
         "get_chat_session_messages",
-        json!({ "session_id": session_id, "offset": 61 }),
+        json!({ "session_id": session_id, "offset": 51 }),
     )
     .await;
-    let content = last["messages"][0]["content"].as_str().expect("content");
-    assert!(content.len() < 10_000, "the pasted file was not capped");
-    assert!(content.contains("[get_chat_session_messages FIELD TRUNCATED: 'content' is 50000 bytes"));
     assert_eq!(last["next_offset"], serde_json::Value::Null);
+
+    let capped = last["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .find(|c| c.contains("[get_chat_session_messages FIELD TRUNCATED: 'content' is 50000 bytes"))
+        .expect("the pasted file should appear capped somewhere in the final page");
+
+    assert!(capped.len() < 10_000, "the pasted file was not capped");
 }
 
 #[tokio::test]
