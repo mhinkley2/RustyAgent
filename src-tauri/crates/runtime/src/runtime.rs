@@ -286,14 +286,20 @@ impl ConversationRuntime {
             .and_then(|root| crate::git::get_head_sha(root));
 
         // Persist the run record.
+        //
+        // `owner_instance_id` stamps the row with this launch of the app, so
+        // the startup sweep in `db::recovery` can tell a run this process is
+        // executing from one a previous process died holding.
         sqlx::query(
-            "INSERT INTO story_runs (id, story_id, agent_profile_id, status, before_sha, started_at)
-             VALUES (?, ?, ?, 'running', ?, CURRENT_TIMESTAMP)"
+            "INSERT INTO story_runs
+                 (id, story_id, agent_profile_id, status, before_sha, started_at, owner_instance_id)
+             VALUES (?, ?, ?, 'running', ?, CURRENT_TIMESTAMP, ?)"
         )
         .bind(&run_id)
         .bind(&story_id)
         .bind(&agent_profile_id)
         .bind(&before_sha)
+        .bind(db::recovery::instance_id())
         .execute(&db)
         .await
         .context("Failed to insert story_run")?;
@@ -476,7 +482,7 @@ impl ConversationRuntime {
             if self.cancel.is_cancelled() {
                 info!(run_id = %self.run_id, "Run cancelled before iteration {iterations}");
                 self.emit(RunEvent::Cancelled { run_id: self.run_id.clone() });
-                self.finish_run("cancelled").await;
+                self.finish_run("cancelled", iterations).await;
                 return Ok(());
             }
 
@@ -486,10 +492,17 @@ impl ConversationRuntime {
                     run_id: self.run_id.clone(),
                     message: format!("Max iterations ({}) reached", self.max_iterations),
                 });
-                self.finish_run("failed").await;
+                self.finish_run("failed", iterations).await;
                 return Ok(());
             }
             iterations += 1;
+            // Written as the loop turns, not only at the end. A run the app
+            // never got to finish is reconciled by
+            // `db::recovery::reconcile_orphaned_runs`, which cannot see this
+            // counter and can only leave the column saying whatever the run
+            // itself last said — so if it were written once at the end, every
+            // interrupted run would report zero iterations.
+            self.persist_iteration_count(iterations).await;
 
             // ---------------------------------------------------------------
             // Collect tool definitions visible to this profile.
@@ -514,7 +527,7 @@ impl ConversationRuntime {
                 error!(run_id = %self.run_id, "{msg}");
                 self.persist_event("error", &serde_json::json!({ "message": msg })).await;
                 self.emit(RunEvent::Failed { run_id: self.run_id.clone(), message: msg.clone() });
-                self.finish_run("failed").await;
+                self.finish_run("failed", iterations).await;
                 return Err(anyhow::anyhow!(msg));
             }
 
@@ -531,7 +544,7 @@ impl ConversationRuntime {
                     let msg = format!("LLM call failed: {e}");
                     error!(run_id = %self.run_id, "{msg}");
                     self.emit(RunEvent::Failed { run_id: self.run_id.clone(), message: msg.clone() });
-                    self.finish_run("failed").await;
+                    self.finish_run("failed", iterations).await;
                     return Err(anyhow::anyhow!(msg));
                 }
             };
@@ -544,7 +557,7 @@ impl ConversationRuntime {
                 if self.cancel.is_cancelled() {
                     info!(run_id = %self.run_id, "Run cancelled mid-stream");
                     self.emit(RunEvent::Cancelled { run_id: self.run_id.clone() });
-                    self.finish_run("cancelled").await;
+                    self.finish_run("cancelled", iterations).await;
                     return Ok(());
                 }
 
@@ -630,7 +643,7 @@ impl ConversationRuntime {
 
         // "done" — not "completed" — is the shared vocabulary: the pipeline
         // engine writes it and the frontend's RunStatus union only knows it.
-        self.finish_run("done").await;
+        self.finish_run("done", iterations).await;
         Ok(())
     }
 
@@ -1220,12 +1233,31 @@ impl ConversationRuntime {
         i64::try_from(value).unwrap_or(i64::MAX)
     }
 
+    /// Record how far the loop has got, best-effort.
+    ///
+    /// One tiny UPDATE per LLM iteration, which is nothing beside the provider
+    /// call it accompanies, and it is the only reason an interrupted run can
+    /// report the iterations it actually performed.
+    ///
+    /// `iterations` counts iterations *entered*: the figure is bumped as an
+    /// iteration begins, so a run cut off mid-iteration is credited with the
+    /// work that iteration had already done rather than discarding it.
+    async fn persist_iteration_count(&self, iterations: u32) {
+        let _ = sqlx::query("UPDATE story_runs SET iteration_count = ? WHERE id = ?")
+            .bind(i64::from(iterations))
+            .bind(&self.run_id)
+            .execute(&self.db)
+            .await;
+    }
+
     /// Mark the run terminal and write down what it spent.
     ///
     /// Called on every exit path — completion, failure, cancellation — because
     /// a run that died halfway still consumed the tokens it consumed, and a
-    /// cost that only lands on the happy path is an undercount.
-    async fn finish_run(&self, status: &str) {
+    /// cost that only lands on the happy path is an undercount. `iterations`
+    /// rides along in the same statement rather than as a second query, so the
+    /// figure can never disagree with the status it was recorded against.
+    async fn finish_run(&self, status: &str, iterations: u32) {
         let usage = self.usage_total;
         // `None` for a model the price table does not know. COALESCE then
         // leaves the column at its default rather than asserting $0.00 — the
@@ -1242,12 +1274,14 @@ impl ConversationRuntime {
         let _ = sqlx::query(
             "UPDATE story_runs \
              SET status = ?, finished_at = CURRENT_TIMESTAMP, \
+                 iteration_count = ?, \
                  input_tokens = ?, output_tokens = ?, \
                  cache_read_input_tokens = ?, cache_creation_input_tokens = ?, \
                  estimated_cost_usd = COALESCE(?, estimated_cost_usd) \
              WHERE id = ?"
         )
         .bind(status)
+        .bind(i64::from(iterations))
         .bind(Self::clamp_to_i64(usage.input_tokens))
         .bind(Self::clamp_to_i64(usage.output_tokens))
         .bind(Self::clamp_to_i64(usage.cache_read_input_tokens))
