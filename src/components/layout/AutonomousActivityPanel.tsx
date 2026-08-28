@@ -71,6 +71,32 @@ function liveEventToLastAction(event: LiveRunEvent): RawEvent | null {
   }
 }
 
+/**
+ * Record `row` as what `runId` is doing, unless it cannot change what is shown.
+ *
+ * `summarizeAction` renders every assistant message as the same "Drafting
+ * response" label, so the second and later tokens of a reply produce an
+ * identical panel. Returning the previous map by reference lets React skip the
+ * re-render entirely, which matters because tokens arrive by the thousand.
+ *
+ * Exported for its own test: the guard is invisible from the rendered output —
+ * that is the point of it.
+ */
+export function mergeLastAction(
+  prev: Record<string, RawEvent | null>,
+  runId: string,
+  row: RawEvent,
+): Record<string, RawEvent | null> {
+  const current = prev[runId];
+  const bothAssistantText =
+    row.event_type === "message" &&
+    row.role === "assistant" &&
+    current?.event_type === "message" &&
+    current.role === "assistant";
+
+  return bothAssistantText ? prev : { ...prev, [runId]: row };
+}
+
 interface ActivityRow {
   id: string;
   agentName: string;
@@ -256,7 +282,7 @@ export default function AutonomousActivityPanel() {
     void listen<LiveRunEvent>("run-event", ({ payload }) => {
       const row = liveEventToLastAction(payload);
       if (row) {
-        setLatestEvents((prev) => ({ ...prev, [payload.run_id]: row }));
+        setLatestEvents((prev) => mergeLastAction(prev, payload.run_id, row));
       }
       // A run reaching a terminal state changes the list, not just the row:
       // its status, its position, and whether it is still counted as active.

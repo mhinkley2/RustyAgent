@@ -240,6 +240,51 @@ describe("useRunEvents", () => {
     expect(result.current.events.map((e) => e.sequenceNum)).toEqual([0, 1]);
   });
 
+  // The runtime emits one `Token` per text delta. A row per token would make a
+  // long reply grow the timeline to a thousand rows and re-render every one of
+  // them a thousand times.
+  it("grows one message row as tokens stream instead of a row per token", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    for (const content of ["Hel", "lo ", "there"]) {
+      await tauriMock.emit("run-event", { type: "token", run_id: "run-1", content });
+    }
+
+    await waitFor(() => expect(result.current.events).toHaveLength(1));
+    expect(result.current.events[0].eventType).toBe("message");
+    expect(result.current.events[0].content).toBe("Hello there");
+  });
+
+  // Coalescing must not swallow the boundary between two replies.
+  it("starts a new message row after a tool call interrupts the stream", async () => {
+    tauriMock.handle("get_run_events", () => []);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await tauriMock.emit("run-event", { type: "token", run_id: "run-1", content: "before" });
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "file_write",
+      input: {},
+    });
+    await tauriMock.emit("run-event", { type: "token", run_id: "run-1", content: "after" });
+
+    await waitFor(() => expect(result.current.events).toHaveLength(3));
+    expect(result.current.events.map((e) => e.eventType)).toEqual([
+      "message",
+      "tool_call",
+      "message",
+    ]);
+    expect(result.current.events[0].content).toBe("before");
+    expect(result.current.events[2].content).toBe("after");
+    expect(result.current.events.map((e) => e.sequenceNum)).toEqual([0, 1, 2]);
+  });
+
   // Every run in the app emits on one `run-event` channel, so an unfiltered
   // listener would interleave three agents' work into one timeline.
   it("ignores events belonging to another run", async () => {

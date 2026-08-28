@@ -121,6 +121,19 @@ type LiveRunEvent =
   | { type: "context_compacted"; run_id: string };
 
 /**
+ * Whether a row is assistant text still being streamed, and so may absorb the
+ * next token.
+ *
+ * Recognised by shape because {@link liveEventToRow} produces this shape for
+ * `token` and nothing else. Note that the *database* keeps one `token` row per
+ * delta, so a refresh does not return the coalesced row this builds — the live
+ * view is the tidier of the two, not the divergent one.
+ */
+function isStreamedText(row: Omit<RunEvent, "sequenceNum">): boolean {
+  return row.eventType === "message" && row.role === "assistant";
+}
+
+/**
  * Turn a live event into the row the timeline renders.
  *
  * Only the kinds the runtime also *persists* are mapped, and they are mapped
@@ -291,7 +304,19 @@ export function useRunEvents(runId: string | null): UseRunEventsReturn {
     void listen<LiveRunEvent>("run-event", ({ payload }) => {
       if (payload.run_id !== runId) return;
       const row = liveEventToRow(payload, runId);
-      if (row) setLive(prev => [...prev, row]);
+      if (!row) return;
+      setLive(prev => {
+        // Grow the assistant's message rather than appending a row per token.
+        // The runtime emits one `Token` per text delta, so a long reply would
+        // otherwise add a thousand rows and re-render every one of them a
+        // thousand times.
+        const last = prev[prev.length - 1];
+        if (isStreamedText(row) && last && isStreamedText(last)) {
+          const merged = { ...last, content: (last.content ?? "") + (row.content ?? "") };
+          return [...prev.slice(0, -1), merged];
+        }
+        return [...prev, row];
+      });
     }).then(fn => {
       // `listen` resolves after an await, by which point the effect may
       // already have been torn down; without this the handler outlives the
