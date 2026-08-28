@@ -1021,3 +1021,25 @@ async fn a_run_that_hits_the_iteration_cap_records_every_call_it_made() {
     assert_eq!(usage.input_tokens, 30, "three calls at 10 input each");
     assert_eq!(usage.output_tokens, 12);
 }
+
+/// A saturated token total must persist as `i64::MAX`, not wrap to a negative.
+///
+/// `Usage` sums with `saturating_add`, so a pathological provider figure pins
+/// the total at `u64::MAX` rather than overflowing. Binding that with `as i64`
+/// would have stored `-1`, turning the guard that produced it into the very
+/// "nonsense number" its doc comment forbids.
+#[tokio::test]
+async fn a_saturated_token_total_persists_clamped_rather_than_negative() {
+    let mut h = Harness::with_provider(
+        MockLlmProvider::script(vec![MockResponse::text("done")])
+            .with_usage(Usage::new(u64::MAX, u64::MAX)),
+    )
+    .await;
+    h.max_iterations = 1;
+
+    let run_id = h.run().await;
+    let usage = h.usage(&run_id).await;
+
+    assert_eq!(usage.input_tokens, i64::MAX, "clamped, not wrapped to -1");
+    assert_eq!(usage.output_tokens, i64::MAX);
+}
