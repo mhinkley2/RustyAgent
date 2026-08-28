@@ -29,6 +29,9 @@ pub mod filesystem;
 pub use filesystem::FileEntry;
 
 pub mod permissions;
+
+#[cfg(test)]
+mod permissions_tests;
 pub use permissions::AgentPermissions;
 pub use runtime::ApprovalGate;
 
@@ -129,7 +132,7 @@ pub async fn start_run(
     // ------------------------------------------------------------------
     let perm_row = sqlx::query(
         "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths, \
-                allow_shell_commands, allow_network_hosts, require_approval_on_write \
+                allow_shell_commands, require_approval_on_write \
          FROM agent_permissions WHERE profile_id = ?",
     )
     .bind(&profile_id)
@@ -209,10 +212,9 @@ pub async fn start_run(
             let reads: String  = pr.try_get("allow_file_read_paths").unwrap_or_else(|_| "[]".into());
             let writes: String = pr.try_get("allow_file_write_paths").unwrap_or_else(|_| "[]".into());
             let cmds: String   = pr.try_get("allow_shell_commands").unwrap_or_else(|_| "[]".into());
-            let hosts: String  = pr.try_get("allow_network_hosts").unwrap_or_else(|_| "[]".into());
             let req_approval: i64 = pr.try_get("require_approval_on_write").unwrap_or(0);
             PermissionPolicy::from_db_permissions(
-                &tools, &reads, &writes, &cmds, &hosts, req_approval != 0,
+                &tools, &reads, &writes, &cmds, req_approval != 0,
             )
         }
         None => PermissionPolicy::allow_all(),
@@ -372,7 +374,7 @@ pub async fn start_chat_run(
     // Load permissions for this profile.
     let perm_row = sqlx::query(
         "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths, \
-                allow_shell_commands, allow_network_hosts, require_approval_on_write \
+                allow_shell_commands, require_approval_on_write \
          FROM agent_permissions WHERE profile_id = ?",
     )
     .bind(&profile_id)
@@ -476,10 +478,9 @@ pub async fn start_chat_run(
             let reads: String  = pr.try_get("allow_file_read_paths").unwrap_or_else(|_| "[]".into());
             let writes: String = pr.try_get("allow_file_write_paths").unwrap_or_else(|_| "[]".into());
             let cmds: String   = pr.try_get("allow_shell_commands").unwrap_or_else(|_| "[]".into());
-            let hosts: String  = pr.try_get("allow_network_hosts").unwrap_or_else(|_| "[]".into());
             let req_approval: i64 = pr.try_get("require_approval_on_write").unwrap_or(0);
             PermissionPolicy::from_db_permissions(
-                &tools, &reads, &writes, &cmds, &hosts, req_approval != 0,
+                &tools, &reads, &writes, &cmds, req_approval != 0,
             )
         }
         None => PermissionPolicy::allow_all(),

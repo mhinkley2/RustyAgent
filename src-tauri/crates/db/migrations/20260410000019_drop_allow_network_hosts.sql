@@ -1,0 +1,21 @@
+-- Drop `agent_permissions.allow_network_hosts`.
+--
+-- The column was written by the settings UI, read back into `PermissionPolicy`,
+-- and consulted by nothing. RustyAgent has no network-capable agent tool, so
+-- there was no egress to gate: the control advertised containment it could not
+-- deliver, which is worse than offering no control at all.
+--
+-- Enforcing it would mean building a lock for a door that does not exist. If a
+-- network tool is ever added, the allow-list comes back with an enforcement
+-- point attached, and this migration is the record of why it is not here now.
+--
+-- Stored values are discarded rather than migrated. Nothing ever acted on them,
+-- so there is no behaviour to preserve; the other five columns, and every row,
+-- are untouched.
+--
+-- Note also that the 20260410000005 comment on `allow_shell_commands` claimed
+-- an empty array meant "shell execution not permitted". It never did, in any
+-- layer. The rule for every remaining list is the one the UI states: empty
+-- means unrestricted.
+
+ALTER TABLE agent_permissions DROP COLUMN allow_network_hosts;

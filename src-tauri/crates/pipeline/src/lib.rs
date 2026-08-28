@@ -600,7 +600,7 @@ async fn fire_step_run(
     // Load permissions
     let perm_row = sqlx::query(
         "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths, \
-                allow_shell_commands, allow_network_hosts, require_approval_on_write \
+                allow_shell_commands, require_approval_on_write \
          FROM agent_permissions WHERE profile_id = ?",
     )
     .bind(agent_id)
@@ -614,9 +614,8 @@ async fn fire_step_run(
             let r: String  = pr.try_get("allow_file_read_paths").unwrap_or_else(|_| "[]".into());
             let w: String  = pr.try_get("allow_file_write_paths").unwrap_or_else(|_| "[]".into());
             let c: String  = pr.try_get("allow_shell_commands").unwrap_or_else(|_| "[]".into());
-            let h: String  = pr.try_get("allow_network_hosts").unwrap_or_else(|_| "[]".into());
             let req: i64   = pr.try_get("require_approval_on_write").unwrap_or(0);
-            runtime::PermissionPolicy::from_db_permissions(&t, &r, &w, &c, &h, req != 0)
+            runtime::PermissionPolicy::from_db_permissions(&t, &r, &w, &c, req != 0)
         }
         None => runtime::PermissionPolicy::allow_all(),
     };
@@ -850,7 +849,7 @@ async fn run_subtask_impl(
 
     let perm_row = sqlx::query(
         "SELECT allowed_tools, allow_file_read_paths, allow_file_write_paths, \
-                allow_shell_commands, allow_network_hosts, require_approval_on_write \
+                allow_shell_commands, require_approval_on_write \
          FROM agent_permissions WHERE profile_id = ?",
     )
     .bind(&agent_id)
@@ -864,9 +863,8 @@ async fn run_subtask_impl(
             let r: String  = pr.try_get("allow_file_read_paths").unwrap_or_else(|_| "[]".into());
             let w: String  = pr.try_get("allow_file_write_paths").unwrap_or_else(|_| "[]".into());
             let c: String  = pr.try_get("allow_shell_commands").unwrap_or_else(|_| "[]".into());
-            let h: String  = pr.try_get("allow_network_hosts").unwrap_or_else(|_| "[]".into());
             let req: i64   = pr.try_get("require_approval_on_write").unwrap_or(0);
-            runtime::PermissionPolicy::from_db_permissions(&t, &r, &w, &c, &h, req != 0)
+            runtime::PermissionPolicy::from_db_permissions(&t, &r, &w, &c, req != 0)
         }
         None => runtime::PermissionPolicy::allow_all(),
     };

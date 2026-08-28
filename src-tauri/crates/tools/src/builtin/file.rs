@@ -17,7 +17,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::paths::{is_within, normalize_path, resolve_existing_prefix, strip_unc};
+use crate::{Tool, ToolContext, ToolOutput, ToolPermissionInfo};
 
 // ---------------------------------------------------------------------------
 // Path resolution helper
@@ -49,7 +50,7 @@ fn resolve_path(requested: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
         // lexical normalisation would let a link inside the workspace point out
         // of it.
         let resolved = resolve_existing_prefix(&candidate);
-        if !resolved.starts_with(&canonical_root) {
+        if !is_within(&resolved, &canonical_root) {
             return Err(format!(
                 "Path '{}' resolves outside the workspace root. \
                  Only paths inside the workspace are permitted.",
@@ -69,56 +70,6 @@ fn resolve_path(requested: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
             return Err("Path must not contain '..' components.".into());
         }
         Ok(p.to_path_buf())
-    }
-}
-
-/// Lexically normalise a path (resolves `.` and `..` without touching the FS).
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => { out.pop(); }
-            std::path::Component::CurDir => {}
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// On Windows `canonicalize` returns a `\\?\`-prefixed path; strip it so both
-/// sides of the containment check are in the same form.
-fn strip_unc(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-}
-
-/// Canonicalise the deepest existing ancestor of `path`, then re-append the
-/// components that do not exist yet.
-///
-/// `canonicalize` alone fails outright for a file being created for the first
-/// time, but skipping it entirely (a purely lexical normalisation) would let a
-/// symlink inside the workspace resolve to a target outside it.
-fn resolve_existing_prefix(path: &Path) -> PathBuf {
-    let normalised = normalize_path(path);
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut probe = normalised.as_path();
-
-    loop {
-        if let Ok(real) = std::fs::canonicalize(probe) {
-            let mut out = strip_unc(&real);
-            for part in tail.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        match (probe.parent(), probe.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_os_string());
-                probe = parent;
-            }
-            // Reached the root without finding anything that exists.
-            _ => return normalised,
-        }
     }
 }
 
@@ -196,6 +147,14 @@ pub struct FileReadTool;
 #[async_trait]
 impl Tool for FileReadTool {
     fn name(&self) -> &str { "file_read" }
+
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo {
+            reads_files: true,
+            path_inputs: &["path"],
+            ..Default::default()
+        }
+    }
 
     fn description(&self) -> &str {
         "Read the text content of a file. Provide a path relative to the workspace \
@@ -337,6 +296,14 @@ pub struct FileWriteTool;
 impl Tool for FileWriteTool {
     fn name(&self) -> &str { "file_write" }
 
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo {
+            writes_files: true,
+            path_inputs: &["path"],
+            ..Default::default()
+        }
+    }
+
     fn description(&self) -> &str {
         "Write text content to a file, creating it and any parent directories if \
          needed. Overwrites existing content. Provide a path relative to the \
@@ -402,6 +369,16 @@ pub struct FileEditTool;
 #[async_trait]
 impl Tool for FileEditTool {
     fn name(&self) -> &str { "file_edit" }
+
+    /// A targeted substring swap is still a write, so it clears the same gates
+    /// as `file_write`: `allow_file_write_paths` and `require_approval_on_write`.
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo {
+            writes_files: true,
+            path_inputs: &["path"],
+            ..Default::default()
+        }
+    }
 
     fn description(&self) -> &str {
         "Change part of an existing file by replacing an exact substring, without \
@@ -561,6 +538,14 @@ pub struct FileListTool;
 #[async_trait]
 impl Tool for FileListTool {
     fn name(&self) -> &str { "file_list" }
+
+    fn permission_info(&self) -> ToolPermissionInfo {
+        ToolPermissionInfo {
+            reads_files: true,
+            path_inputs: &["path"],
+            ..Default::default()
+        }
+    }
 
     fn description(&self) -> &str {
         "List files and subdirectories inside a directory. Provide a path relative \

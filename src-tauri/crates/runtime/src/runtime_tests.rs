@@ -17,7 +17,7 @@ use db::testing::{
     make_test_pool, run_events, run_status, run_usage, seed_profile, seed_story, RunUsage,
 };
 use db::DbPool;
-use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
+use tools::{Tool, ToolContext, ToolOutput, ToolPermissionInfo, ToolRegistry};
 
 use crate::approval_gate::ApprovalGate;
 use crate::context::{ContextPolicy, SUMMARY_PREFIX};
@@ -493,6 +493,192 @@ async fn a_denied_tool_is_not_executed_and_its_reason_goes_back_to_the_llm() {
     // The run continues — the model gets to react to the denial.
     assert_eq!(h.status(&run_id).await, "done");
     assert_eq!(h.provider.call_count(), 2);
+}
+
+/// A stub that declares a permission profile, so the runtime's registry lookup
+/// has something to hand the policy. This is the wiring the unit tests in
+/// `permission_tests` cannot reach: registry -> `ToolPermissionInfo` -> policy.
+struct DeclaredTool {
+    name: String,
+    info: ToolPermissionInfo,
+    calls: Arc<std::sync::Mutex<Vec<Value>>>,
+}
+
+impl DeclaredTool {
+    fn new(name: &str, info: ToolPermissionInfo) -> Self {
+        Self {
+            name: name.to_string(),
+            info,
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> Arc<std::sync::Mutex<Vec<Value>>> {
+        self.calls.clone()
+    }
+}
+
+#[async_trait]
+impl Tool for DeclaredTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "a stub tool with a declared permission profile"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+    fn permission_info(&self) -> ToolPermissionInfo {
+        self.info.clone()
+    }
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolOutput {
+        self.calls.lock().expect("calls poisoned").push(input);
+        ToolOutput::ok("ran")
+    }
+}
+
+fn declared_read() -> ToolPermissionInfo {
+    ToolPermissionInfo { reads_files: true, path_inputs: &["path"], ..Default::default() }
+}
+
+fn declared_shell(program: &str) -> ToolPermissionInfo {
+    ToolPermissionInfo {
+        reads_files: true,
+        writes_files: true,
+        path_inputs: &[],
+        shell_program: Some(program.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn a_read_outside_the_allowed_read_paths_is_denied_before_the_tool_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = DeclaredTool::new("file_read", declared_read());
+    let calls = tool.calls();
+
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_read", json!({ "path": "secrets/keys.json" })),
+        MockResponse::text("understood"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.workspace_root = Some(dir.path().to_path_buf());
+    h.policy.allow_file_read_paths = vec!["docs".into()];
+
+    let run_id = h.run().await;
+
+    assert!(calls.lock().unwrap().is_empty(), "the read must not happen");
+    let (output, is_error) = h
+        .sink
+        .run_events()
+        .into_iter()
+        .find_map(|e| match e {
+            RunEvent::ToolResult { output, is_error, .. } => Some((output, is_error)),
+            _ => None,
+        })
+        .expect("a tool result");
+    assert!(is_error);
+    assert!(output.contains("allowed read paths"), "got {output}");
+    assert_eq!(h.status(&run_id).await, "done");
+}
+
+#[tokio::test]
+async fn a_read_inside_the_allowed_read_paths_still_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = DeclaredTool::new("file_read", declared_read());
+    let calls = tool.calls();
+
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_read", json!({ "path": "docs/report.md" })),
+        MockResponse::text("read it"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.workspace_root = Some(dir.path().to_path_buf());
+    h.policy.allow_file_read_paths = vec!["docs".into()];
+
+    h.run().await;
+
+    assert_eq!(calls.lock().unwrap().len(), 1, "the read should have happened");
+}
+
+/// The gap this story closes end to end: a custom shell tool was never
+/// classified as a write, so it never reached the approval gate.
+#[tokio::test]
+async fn a_custom_shell_tool_is_sent_through_the_approval_gate() {
+    let tool = DeclaredTool::new("run_tests", declared_shell("cargo"));
+    let calls = tool.calls();
+
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "run_tests", json!({})),
+        MockResponse::text("done"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.policy = approval_policy();
+
+    let rt = h.build().await;
+    let runner = tokio::spawn(async move { rt.run().await });
+
+    let approval_id = await_approval_id(&h.db).await;
+    assert!(calls.lock().unwrap().is_empty(), "the command ran before approval");
+
+    assert!(h.gate.resolve(&approval_id, true));
+    runner.await.expect("join").expect("run");
+
+    assert_eq!(calls.lock().unwrap().len(), 1, "approved, so it should run once");
+}
+
+#[tokio::test]
+async fn a_shell_program_off_the_allow_list_is_denied_before_it_runs() {
+    let tool = DeclaredTool::new("wipe", declared_shell("rm"));
+    let calls = tool.calls();
+
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "wipe", json!({})),
+        MockResponse::text("understood"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.policy.allow_shell_commands = vec!["cargo".into()];
+
+    h.run().await;
+
+    assert!(calls.lock().unwrap().is_empty(), "the command must not run");
+    let output = h
+        .sink
+        .run_events()
+        .into_iter()
+        .find_map(|e| match e {
+            RunEvent::ToolResult { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("a tool result");
+    assert!(output.contains("allowed shell commands"), "got {output}");
+}
+
+#[tokio::test]
+async fn a_shell_program_on_the_allow_list_still_runs() {
+    let tool = DeclaredTool::new("build", declared_shell("cargo"));
+    let calls = tool.calls();
+
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "build", json!({})),
+        MockResponse::text("built"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.policy.allow_shell_commands = vec!["cargo".into()];
+
+    h.run().await;
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }
 
 // ---------------------------------------------------------------------------

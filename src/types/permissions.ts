@@ -8,10 +8,8 @@ export interface AgentPermissions {
   allowFileReadPaths: string[];
   /** Path prefixes for allowed file writes (empty = no restriction). */
   allowFileWritePaths: string[];
-  /** Shell command name prefixes permitted (empty = no restriction). */
+  /** Program names permitted for custom shell tools (empty = no restriction). */
   allowShellCommands: string[];
-  /** Network hostname allow-list (empty = no restriction). */
-  allowNetworkHosts: string[];
   /** When true, every file write tool call pauses for human approval. */
   requireApprovalOnWrite: boolean;
 }
@@ -23,7 +21,6 @@ export function defaultPermissions(profileId: string): AgentPermissions {
     allowFileReadPaths: [],
     allowFileWritePaths: [],
     allowShellCommands: [],
-    allowNetworkHosts: [],
     requireApprovalOnWrite: false,
   };
 }

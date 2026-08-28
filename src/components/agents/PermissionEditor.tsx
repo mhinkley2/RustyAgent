@@ -55,6 +55,7 @@ function TagList({ label, helperText, items, placeholder, onChange }: TagListPro
         <input
           type="text"
           className="perm-tag-list__draft"
+          aria-label={label}
           value={draft}
           onChange={e => setDraft(e.target.value)}
           onKeyDown={onKey}
@@ -89,8 +90,9 @@ export function PermissionEditor({ value, onChange }: PermissionEditorProps) {
   return (
     <div className="perm-editor">
       <p className="perm-editor__intro">
-        Restrict which tools and file paths this agent can access. Leave a list
-        empty to allow everything in that category.
+        Restrict which tools, file paths and shell programs this agent can
+        reach. Leave a list empty to allow everything in that category. Every
+        control here is checked by the runtime before a tool call runs.
       </p>
 
       <div className="perm-editor__section">
@@ -98,11 +100,12 @@ export function PermissionEditor({ value, onChange }: PermissionEditorProps) {
         <Toggle
           checked={value.requireApprovalOnWrite}
           onChange={v => set("requireApprovalOnWrite", v)}
-          label="Require human approval before every file write"
+          label="Require human approval before every write"
         />
         <p className="form-field__helper" style={{ marginTop: 4 }}>
-          The run will pause and wait until you approve or reject each write in
-          the Approvals queue.
+          The run pauses until you approve or reject each write in the Approvals
+          queue. Custom shell tools count as writes — a command can change
+          anything the app can.
         </p>
       </div>
 
@@ -110,9 +113,9 @@ export function PermissionEditor({ value, onChange }: PermissionEditorProps) {
         <h4 className="perm-editor__section-title">Allowed Tools</h4>
         <TagList
           label="Tool allowlist"
-          helperText="Exact built-in tool names (e.g. write_file_text). Empty = all tools allowed."
+          helperText="Exact agent tool names (e.g. file_write, file_read). Empty = all tools allowed."
           items={value.allowedTools}
-          placeholder="write_file_text"
+          placeholder="file_write"
           onChange={v => set("allowedTools", v)}
         />
       </div>
@@ -121,35 +124,33 @@ export function PermissionEditor({ value, onChange }: PermissionEditorProps) {
         <h4 className="perm-editor__section-title">File Paths</h4>
         <TagList
           label="Allowed write paths"
-          helperText="Absolute directory prefixes the agent may write to (e.g. /workspace/). Empty = no restriction."
+          helperText="Directories the agent may write to. Relative entries resolve against the workspace root. Empty = no restriction."
           items={value.allowFileWritePaths}
-          placeholder="/workspace/"
+          placeholder="src/"
           onChange={v => set("allowFileWritePaths", v)}
         />
         <TagList
           label="Allowed read paths"
-          helperText="Absolute directory prefixes the agent may read from. Empty = no restriction."
+          helperText="Directories the agent may read from, via file_read and file_list. Empty = no restriction."
           items={value.allowFileReadPaths}
-          placeholder="/workspace/"
+          placeholder="docs/"
           onChange={v => set("allowFileReadPaths", v)}
         />
+        <p className="form-field__helper" style={{ marginTop: 4 }}>
+          Setting either list also blocks custom shell tools: a command runs
+          outside these paths and offers nothing to check, so it is refused
+          rather than let through unchecked.
+        </p>
       </div>
 
       <div className="perm-editor__section">
-        <h4 className="perm-editor__section-title">Shell &amp; Network</h4>
+        <h4 className="perm-editor__section-title">Shell</h4>
         <TagList
-          label="Allowed shell commands"
-          helperText="Command name prefixes (e.g. git, npm). Empty = no restriction."
+          label="Allowed shell programs"
+          helperText="Program names a custom shell tool may run (e.g. git, npm). Matched against the program, not the arguments. Empty = no restriction."
           items={value.allowShellCommands}
           placeholder="git"
           onChange={v => set("allowShellCommands", v)}
-        />
-        <TagList
-          label="Allowed network hosts"
-          helperText="Hostname allow-list (e.g. api.github.com). Empty = no restriction."
-          items={value.allowNetworkHosts}
-          placeholder="api.github.com"
-          onChange={v => set("allowNetworkHosts", v)}
         />
       </div>
     </div>
