@@ -162,11 +162,14 @@ fn stderr_trimmed(out: &Output) -> String {
 
 /// Where per-run worktrees live: `<app data>/worktrees`.
 ///
+/// Resolved through `db::paths`, so `RUSTYAGENT_DATA_DIR` gives a branch build
+/// its own worktree tree instead of sharing the developer's real one.
+///
 /// `None` when the app data directory cannot be resolved, in which case a run
 /// falls back to un-isolated execution and records that it did.
 pub fn dir_for<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
     use tauri::Manager;
-    app.path().app_data_dir().ok().map(|d| d.join("worktrees"))
+    db::paths::with_override(app.path().app_data_dir().ok()).map(|d| d.join("worktrees"))
 }
 
 // ---------------------------------------------------------------------------

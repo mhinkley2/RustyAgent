@@ -36,9 +36,12 @@ pub struct AppSettings {
 
 impl AppSettings {
     /// Canonical path for the settings file.
+    ///
+    /// Goes through `db::paths` so `RUSTYAGENT_DATA_DIR` moves settings along
+    /// with the database it configures; a half-moved data directory is worse
+    /// than none.
     pub fn settings_path(app: &AppHandle) -> PathBuf {
-        app.path()
-            .app_data_dir()
+        db::paths::with_override(app.path().app_data_dir().ok())
             .expect("Failed to resolve app data directory")
             .join("settings.json")
     }

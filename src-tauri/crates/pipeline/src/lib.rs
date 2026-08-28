@@ -114,9 +114,7 @@ struct LocalSettings {
 }
 
 fn load_settings(app: &tauri::AppHandle) -> LocalSettings {
-    let path = app
-        .path()
-        .app_data_dir()
+    let path = db::paths::with_override(app.path().app_data_dir().ok())
         .expect("app data dir")
         .join("settings.json");
     std::fs::read_to_string(&path)
