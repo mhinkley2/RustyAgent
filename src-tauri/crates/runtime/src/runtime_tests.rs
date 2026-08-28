@@ -11,9 +11,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use api::mock::{MockResponse, RecordedCall};
-use api::{ChatMessage, CompletionConfig, MessageRole, MockLlmProvider, ToolCall};
-use db::testing::{make_test_pool, run_events, run_status, seed_profile, seed_story};
+use api::mock::{MockResponse, RecordedCall, DEFAULT_MOCK_USAGE};
+use api::{ChatMessage, CompletionConfig, MessageRole, MockLlmProvider, ToolCall, Usage};
+use db::testing::{
+    make_test_pool, run_events, run_status, run_usage, seed_profile, seed_story, RunUsage,
+};
 use db::DbPool;
 use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 
@@ -70,6 +72,32 @@ impl Tool for StubTool {
     }
 }
 
+/// A tool that cancels the run as a side effect of being called.
+///
+/// Cancelling from outside the loop races the loop; cancelling from inside a
+/// tool call pins the stop to a known point — after the first provider call's
+/// usage has been recorded, before the second is made.
+struct CancellingTool {
+    cancel: CancelFlag,
+}
+
+#[async_trait]
+impl Tool for CancellingTool {
+    fn name(&self) -> &str {
+        "cancel_me"
+    }
+    fn description(&self) -> &str {
+        "cancels the run"
+    }
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolOutput {
+        self.cancel.cancel();
+        ToolOutput::ok("cancelled")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -93,6 +121,12 @@ struct Harness {
 
 impl Harness {
     async fn new(script: Vec<MockResponse>) -> Self {
+        Self::with_provider(MockLlmProvider::script(script)).await
+    }
+
+    /// As `new`, but with a mock the caller has configured — the token
+    /// accounting tests need to vary what the provider reports.
+    async fn with_provider(provider: MockLlmProvider) -> Self {
         let db = make_test_pool().await;
         seed_profile(&db, PROFILE_ID, "Test Agent").await;
         seed_story(&db, STORY_ID, "Test Story", "ready").await;
@@ -101,7 +135,7 @@ impl Harness {
             db,
             sink: RecordingSink::new(),
             gate: Arc::new(ApprovalGate::new()),
-            provider: Arc::new(MockLlmProvider::script(script)),
+            provider: Arc::new(provider),
             registry: Arc::new(Mutex::new(ToolRegistry::new())),
             cancel: CancelFlag::new(),
             policy: PermissionPolicy::allow_all(),
@@ -155,6 +189,10 @@ impl Harness {
 
     async fn events(&self, run_id: &str) -> Vec<(String, String)> {
         run_events(&self.db, run_id).await
+    }
+
+    async fn usage(&self, run_id: &str) -> RunUsage {
+        run_usage(&self.db, run_id).await
     }
 
     fn calls(&self) -> Vec<RecordedCall> {
@@ -764,4 +802,222 @@ async fn the_approval_request_row_records_the_tool_name_and_input() {
 
     h.gate.resolve(&approval_id, true);
     runner.await.expect("join").expect("run");
+}
+
+// ---------------------------------------------------------------------------
+// Token accounting
+//
+// `story_runs.input_tokens` / `output_tokens` / `estimated_cost_usd` are read
+// by the runs list and the run detail panel. Nothing else writes them, so if
+// the loop stops folding usage in, every run in the app silently reads back as
+// free.
+// ---------------------------------------------------------------------------
+
+/// A model the price table knows, so a cost can actually be quoted.
+const PRICED_MODEL: &str = "claude-opus-5";
+
+/// One mock call on `PRICED_MODEL`: 100 uncached input, 20 output, 7 cache-read
+/// and 3 cache-write tokens at $5/$25 per MTok (reads 0.1x, writes 1.25x).
+const ONE_CALL_COST: f64 = 0.00102225;
+
+#[tokio::test]
+async fn a_completed_run_persists_the_token_counts_the_provider_reported() {
+    let mut h = Harness::new(vec![MockResponse::text("done")]).await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let run_id = h.run().await;
+
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64);
+    assert_eq!(usage.output_tokens, DEFAULT_MOCK_USAGE.output_tokens as i64);
+    assert!(
+        usage.input_tokens > 0 && usage.output_tokens > 0,
+        "a completed run must not read back as zero tokens"
+    );
+}
+
+#[tokio::test]
+async fn cache_reads_and_writes_are_recorded_apart_from_uncached_input() {
+    // They are billed at different rates, and the saving is only visible if
+    // they are not folded into the input count.
+    let mut h = Harness::new(vec![MockResponse::text("done")]).await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let run_id = h.run().await;
+
+    let usage = h.usage(&run_id).await;
+    assert_eq!(
+        usage.cache_read_input_tokens,
+        DEFAULT_MOCK_USAGE.cache_read_input_tokens as i64
+    );
+    assert_eq!(
+        usage.cache_creation_input_tokens,
+        DEFAULT_MOCK_USAGE.cache_creation_input_tokens as i64
+    );
+    assert_eq!(
+        usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64,
+        "cached tokens must not be added into the uncached count"
+    );
+}
+
+#[tokio::test]
+async fn a_known_model_gets_a_non_zero_cost_from_the_price_table() {
+    let mut h = Harness::new(vec![MockResponse::text("done")]).await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let run_id = h.run().await;
+
+    let cost = h.usage(&run_id).await.estimated_cost_usd;
+    assert!(cost > 0.0, "a priced model must produce a cost, got {cost}");
+    assert!(
+        (cost - ONE_CALL_COST).abs() < 1e-9,
+        "expected {ONE_CALL_COST}, got {cost}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_model_records_real_tokens_and_no_fabricated_cost() {
+    // The harness default model is not in the price table.
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    let run_id = h.run().await;
+
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64);
+    assert_eq!(usage.output_tokens, DEFAULT_MOCK_USAGE.output_tokens as i64);
+    assert_eq!(
+        usage.estimated_cost_usd, 0.0,
+        "an unpriced model must not be quoted at some other model's rate"
+    );
+}
+
+#[tokio::test]
+async fn a_multi_iteration_run_reports_the_sum_of_every_call_not_the_last_one() {
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "get_story", json!({})),
+        MockResponse::text("and done"),
+    ])
+    .await
+    .with_tool(Box::new(StubTool::new("get_story", "a story")))
+    .await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.provider.call_count(), 2, "the run made two provider calls");
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, 2 * DEFAULT_MOCK_USAGE.input_tokens as i64);
+    assert_eq!(usage.output_tokens, 2 * DEFAULT_MOCK_USAGE.output_tokens as i64);
+    assert_eq!(
+        usage.cache_read_input_tokens,
+        2 * DEFAULT_MOCK_USAGE.cache_read_input_tokens as i64
+    );
+    assert!(
+        (usage.estimated_cost_usd - 2.0 * ONE_CALL_COST).abs() < 1e-9,
+        "cost should double with the second call, got {}",
+        usage.estimated_cost_usd
+    );
+}
+
+#[tokio::test]
+async fn a_run_that_fails_mid_way_still_persists_what_it_already_spent() {
+    // First call succeeds and is billed; the second never returns a stream.
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "get_story", json!({})),
+        MockResponse::ProviderError("upstream down".into()),
+    ])
+    .await
+    .with_tool(Box::new(StubTool::new("get_story", "a story")))
+    .await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let result = rt.run().await;
+
+    assert!(result.is_err(), "the run should surface the provider error");
+    assert_eq!(h.status(&run_id).await, "failed");
+    let usage = h.usage(&run_id).await;
+    assert_eq!(
+        usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64,
+        "the completed first call still cost what it cost"
+    );
+    assert!(usage.estimated_cost_usd > 0.0);
+}
+
+#[tokio::test]
+async fn a_cancelled_run_still_persists_what_it_already_spent() {
+    let h = Harness::new(vec![
+        MockResponse::tool_call("c1", "cancel_me", json!({})),
+        MockResponse::text("never reached"),
+    ])
+    .await;
+    let cancelling = CancellingTool { cancel: h.cancel.clone() };
+    let mut h = h.with_tool(Box::new(cancelling)).await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "cancelled");
+    assert_eq!(h.provider.call_count(), 1);
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64);
+    assert_eq!(usage.output_tokens, DEFAULT_MOCK_USAGE.output_tokens as i64);
+    assert!(usage.estimated_cost_usd > 0.0, "cancelled work is still billed");
+}
+
+#[tokio::test]
+async fn a_run_cancelled_before_its_first_call_records_nothing() {
+    let mut h = Harness::new(vec![MockResponse::text("never reached")]).await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+    h.cancel.cancel();
+
+    let run_id = h.run().await;
+
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, 0);
+    assert_eq!(usage.output_tokens, 0);
+    assert_eq!(usage.estimated_cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn a_provider_that_reports_no_usage_leaves_the_counts_at_zero() {
+    // Honest degradation: no counts recorded rather than invented ones, even
+    // though the model itself is priced.
+    let mut h = Harness::with_provider(
+        MockLlmProvider::script(vec![MockResponse::text("done")]).without_usage(),
+    )
+    .await;
+    h.config = CompletionConfig::new(PRICED_MODEL, 1024);
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, 0);
+    assert_eq!(usage.output_tokens, 0);
+    assert_eq!(usage.estimated_cost_usd, 0.0);
+}
+
+#[tokio::test]
+async fn a_run_that_hits_the_iteration_cap_records_every_call_it_made() {
+    let mut h = Harness::with_provider(
+        MockLlmProvider::script(vec![
+            MockResponse::tool_call("c1", "spin", json!({})),
+            MockResponse::tool_call("c2", "spin", json!({})),
+            MockResponse::tool_call("c3", "spin", json!({})),
+        ])
+        .with_usage(Usage::new(10, 4)),
+    )
+    .await
+    .with_tool(Box::new(StubTool::new("spin", "again")))
+    .await;
+    h.max_iterations = 3;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "failed");
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.input_tokens, 30, "three calls at 10 input each");
+    assert_eq!(usage.output_tokens, 12);
 }
