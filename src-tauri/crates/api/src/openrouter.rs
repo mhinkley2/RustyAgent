@@ -6,8 +6,9 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use crate::{
     error::ApiError,
+    openai_sse::{split_lines, OpenAiSseDecoder},
     provider::{EventStream, LlmProvider},
-    types::{ChatMessage, CompletionConfig, MessageRole, StreamEvent, ToolCall, ToolDefinition},
+    types::{ChatMessage, CompletionConfig, MessageRole, ToolDefinition},
 };
 
 const BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -128,73 +129,20 @@ impl LlmProvider for OpenRouterClient {
         let mut byte_stream = response.bytes_stream();
 
         let stream = try_stream! {
+            let mut decoder = OpenAiSseDecoder::new();
             let mut leftover = String::new();
 
             while let Some(chunk) = byte_stream.next().await {
                 let chunk: Bytes = chunk?;
                 leftover.push_str(&String::from_utf8_lossy(&chunk));
 
-                while let Some(pos) = leftover.find('\n') {
-                    let line = leftover[..pos].trim().to_string();
-                    leftover = leftover[pos + 1..].to_string();
-
-                    let data = match line.strip_prefix("data: ") {
-                        Some(d) => d.trim().to_string(),
-                        None => continue,
-                    };
-
-                    if data == "[DONE]" {
-                        yield StreamEvent::Done { stop_reason: "stop".to_string() };
-                        return;
+                for line in split_lines(&mut leftover) {
+                    let decoded = decoder.decode_line(&line)?;
+                    for event in decoded.events {
+                        yield event;
                     }
-
-                    let parsed: Value = serde_json::from_str(&data)
-                        .map_err(|e| ApiError::Serialization(e))?;
-
-                    // OpenAI-compatible delta format
-                    if let Some(choices) = parsed.get("choices").and_then(|c| c.as_array()) {
-                        for choice in choices {
-                            let delta = &choice["delta"];
-
-                            // Text content
-                            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
-                                    yield StreamEvent::TextDelta(text.to_string());
-                                }
-                            }
-
-                            // Tool calls
-                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                                for tc in tool_calls {
-                                    let id = tc.get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let name = tc.get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let input_str = tc.get("function")
-                                        .and_then(|f| f.get("arguments"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("{}");
-                                    let input: Value = serde_json::from_str(input_str)
-                                        .unwrap_or(json!({}));
-
-                                    if !name.is_empty() {
-                                        yield StreamEvent::ToolCallDelta(ToolCall { id, name, input });
-                                    }
-                                }
-                            }
-
-                            // Check finish_reason
-                            if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                                if !reason.is_empty() && reason != "null" {
-                                    yield StreamEvent::Done { stop_reason: reason.to_string() };
-                                }
-                            }
-                        }
+                    if decoded.terminal {
+                        return;
                     }
                 }
             }

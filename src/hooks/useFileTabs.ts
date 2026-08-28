@@ -122,12 +122,23 @@ export function useFileTabs(workspaceId?: string | null): UseFileTabsReturn {
   // Track previous workspace so we can save before clearing.
   const prevWorkspaceRef = useRef<string | null | undefined>(workspaceId);
 
+  // True while `tabs` does not yet belong to `workspaceId` — i.e. between a
+  // workspace switch and the restore that follows it.
+  //
+  // The persist effect below keys on `workspaceId`, so without this guard it
+  // fires during that window and writes the *outgoing* workspace's tabs under
+  // the *incoming* workspace's key, permanently clobbering the list it was
+  // about to restore. The visible symptom was that switching workspaces
+  // carried the previous workspace's open files across.
+  const restorePendingRef = useRef(false);
+
   // When workspaceId changes: save current state, clear tabs, restore saved paths.
   useEffect(() => {
     const prevId = prevWorkspaceRef.current;
     prevWorkspaceRef.current = workspaceId;
 
     if (prevId === workspaceId) return;
+    restorePendingRef.current = true;
 
     // Save tabs for the outgoing workspace.
     setTabs(prev => {
@@ -146,9 +157,19 @@ export function useFileTabs(workspaceId?: string | null): UseFileTabsReturn {
     if (tabs.length > 0) return; // not cleared yet
     restoredRef.current = workspaceId;
 
-    if (!workspaceId) return;
+    if (!workspaceId) {
+      restorePendingRef.current = false;
+      return;
+    }
     const { paths, activePath } = loadSavedPaths(workspaceId);
-    if (paths.length === 0) return;
+    if (paths.length === 0) {
+      restorePendingRef.current = false;
+      return;
+    }
+
+    // Hold off persistence until the restore lands, so the interim empty state
+    // is never written over the list being restored.
+    restorePendingRef.current = true;
 
     // Reopen files sequentially; failures are silently skipped.
     (async () => {
@@ -165,6 +186,7 @@ export function useFileTabs(workspaceId?: string | null): UseFileTabsReturn {
           // file no longer exists or inaccessible — skip it
         }
       }
+      restorePendingRef.current = false;
       if (opened.length > 0) {
         setTabs(opened);
         const restoreActive = activePath && opened.some(t => t.path === activePath)
@@ -177,6 +199,7 @@ export function useFileTabs(workspaceId?: string | null): UseFileTabsReturn {
 
   // Persist tab paths whenever tabs or activeTabPath change.
   useEffect(() => {
+    if (restorePendingRef.current) return;
     saveTabsToStorage(workspaceId, tabs.map(t => t.path), activeTabPath);
   }, [workspaceId, tabs, activeTabPath]);
 

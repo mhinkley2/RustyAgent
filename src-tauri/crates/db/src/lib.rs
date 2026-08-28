@@ -7,6 +7,9 @@ use tracing::info;
 
 pub type DbPool = SqlitePool;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 pub struct WorkspaceRecord {
     pub id: String,
     pub name: String,
@@ -112,6 +115,36 @@ pub async fn list_workspaces(db: &DbPool) -> Result<Vec<WorkspaceRecord>> {
         })
         .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
         .context("Failed to decode workspace rows")
+}
+
+/// Look up a workspace by path, without creating one.
+///
+/// Unlike [`touch_workspace`], this never inserts. It is what lets an MCP
+/// client select only from workspaces the user has already opened in the app,
+/// rather than registering arbitrary directories on the machine.
+pub async fn find_workspace_by_path(
+    db: &DbPool,
+    path: &std::path::Path,
+) -> Option<WorkspaceRecord> {
+    let normalized_path = normalize_workspace_path(path);
+
+    sqlx::query_as::<_, (String, String, String, String, String)>(
+        "SELECT id, name, path, last_opened_at, created_at
+         FROM workspaces
+         WHERE path = ?",
+    )
+    .bind(&normalized_path)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id, name, path, last_opened_at, created_at)| WorkspaceRecord {
+        id,
+        name,
+        path,
+        last_opened_at,
+        created_at,
+    })
 }
 
 pub async fn touch_workspace(db: &DbPool, path: &std::path::Path) -> Result<WorkspaceRecord> {

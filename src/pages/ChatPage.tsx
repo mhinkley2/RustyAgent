@@ -75,6 +75,79 @@ type Turn = UserTurn | AssistantTurn;
 
 const ACTIVE_CHAT_SESSION_KEY = "rustyagent.chat.activeSessionId";
 
+// Module-level event buffer to preserve events when component unmounts during streaming.
+// Maps run_id → accumulated events. This survives component mount/unmount.
+const runEventBuffer = new Map<string, RunEventPayload[]>();
+
+interface TrackedRunState {
+  sessionId: string;
+  agentProfileId: string;
+  assistantText: string;
+  persisted: boolean;
+}
+
+const trackedRuns = new Map<string, TrackedRunState>();
+
+function isTerminalEvent(payload: RunEventPayload): payload is Extract<RunEventPayload, { type: "complete" | "failed" | "cancelled" }> {
+  return payload.type === "complete" || payload.type === "failed" || payload.type === "cancelled";
+}
+
+async function persistTrackedAssistant(runId: string, fallbackText = ""): Promise<void> {
+  const run = trackedRuns.get(runId);
+  if (!run || run.persisted) return;
+
+  const text = (run.assistantText.trim() || fallbackText.trim()).trim();
+  run.persisted = true;
+
+  if (!text) {
+    trackedRuns.delete(runId);
+    return;
+  }
+
+  try {
+    await invoke("append_chat_session_message", {
+      sessionId: run.sessionId,
+      role: "assistant",
+      content: text,
+      agentProfileId: run.agentProfileId,
+    });
+  } catch (err) {
+    run.persisted = false;
+    console.error("Failed to persist assistant message for run", err);
+    return;
+  }
+
+  trackedRuns.delete(runId);
+}
+
+// Global event listener that persists across component instances.
+// Set up once per module load; never cleaned up by individual component unmounts.
+let globalEventListenerReady = false;
+
+function ensureGlobalEventListener() {
+  if (globalEventListenerReady) return;
+  globalEventListenerReady = true;
+
+  listen<RunEventPayload>("run-event", ({ payload }) => {
+    // Buffer all events by run_id, regardless of component state
+    if (!runEventBuffer.has(payload.run_id)) {
+      runEventBuffer.set(payload.run_id, []);
+    }
+    runEventBuffer.get(payload.run_id)!.push(payload);
+
+    const tracked = trackedRuns.get(payload.run_id);
+    if (tracked && payload.type === "token") {
+      tracked.assistantText += payload.content;
+    }
+
+    if (isTerminalEvent(payload)) {
+      const fallback = payload.type === "failed" ? payload.message : "";
+      void persistTrackedAssistant(payload.run_id, fallback);
+      runEventBuffer.delete(payload.run_id);
+    }
+  }).catch(console.error);
+}
+
 interface Profile {
   id: string;
   name: string;
@@ -360,6 +433,8 @@ export default function ChatPage() {
   const [filterMode, setFilterMode] = useState<ChatFilterMode>("answers");
 
   const entryIdRef = useRef(0);
+    const [editingMessageIdx, setEditingMessageIdx] = useState<number | null>(null);
+    const [editingText, setEditingText] = useState<string>("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -530,8 +605,14 @@ export default function ChatPage() {
     }
   }, [turns]);
 
-  useEffect(() => () => {
-    unlistenRef.current?.();
+  useEffect(() => {
+    // Don't clean up the event listener on unmount.
+    // The listener persists across tab switches so we continue receiving
+    // streaming events even when the component unmounts.
+    // handleTerminalEvent will clean it up when the run completes.
+    return () => {
+      // Intentionally empty — listener cleanup is handled by handleTerminalEvent
+    };
   }, []);
 
   const hydrateTurns = useCallback((messages: ChatSessionMessage[]) => {
@@ -567,6 +648,9 @@ export default function ChatPage() {
     sessionTitle: string,
     persistUserText?: string,
   ) => {
+    // Ensure global listener is set up
+    ensureGlobalEventListener();
+
     unlistenRef.current?.();
 
     const mkEntry = (partial: Omit<LogEntry, "id">): LogEntry => ({
@@ -576,87 +660,94 @@ export default function ChatPage() {
 
     let activeRunId: string | null = null;
     let assistantText = "";
-    let persistedAssistant = false;
+    let lastProcessedEventIndex = 0;
 
-    const handleTerminalEvent = (sessionId: string, payload: Extract<RunEventPayload, { type: "complete" | "failed" | "cancelled" }>) => {
-      if (!persistedAssistant) {
-        persistedAssistant = true;
-        const terminalText = assistantText.trim() || (payload.type === "failed" ? payload.message : "");
-        if (terminalText) {
-          void invoke("append_chat_session_message", {
-            sessionId,
-            role: "assistant",
-            content: terminalText,
-            agentProfileId: profileId,
-          }).then(loadSessions).catch(console.error);
+    const handleTerminalEvent = (payload: Extract<RunEventPayload, { type: "complete" | "failed" | "cancelled" }>) => {
+      if (activeRunId) {
+        const tracked = trackedRuns.get(activeRunId);
+        if (tracked) {
+          tracked.assistantText = assistantText;
         }
+        const fallback = payload.type === "failed" ? payload.message : "";
+        void persistTrackedAssistant(activeRunId, fallback).then(() => loadSessions()).catch(console.error);
       }
 
       setIsRunning(false);
       runIdRef.current = null;
       unlistenRef.current?.();
       unlistenRef.current = null;
+
+      // Clear in-memory stream buffer when the run is terminal.
+      if (activeRunId) {
+        runEventBuffer.delete(activeRunId);
+      }
     };
 
+    const processEvent = (payload: RunEventPayload) => {
+      if (!activeRunId || payload.run_id !== activeRunId) return false;
+      if (payload.type === "token") assistantText += payload.content;
+
+      setTurns(prev => {
+        const next = [...prev];
+        const turn = next[targetTurnIdx];
+        if (!turn || turn.role !== "assistant") return prev;
+
+        const variants = [...turn.variants];
+        const variant = { ...variants[targetVarIdx], entries: [...variants[targetVarIdx].entries] };
+
+        switch (payload.type) {
+          case "token": {
+            const last = variant.entries[variant.entries.length - 1];
+            if (last?.kind === "token") {
+              variant.entries = [
+                ...variant.entries.slice(0, -1),
+                { ...last, content: (last.content ?? "") + payload.content },
+              ];
+            } else {
+              variant.entries = [...variant.entries, mkEntry({ kind: "token", content: payload.content })];
+            }
+            break;
+          }
+          case "tool_call":
+            variant.entries = [...variant.entries, mkEntry({ kind: "tool_call", toolName: payload.tool_name, toolInput: payload.input })];
+            break;
+          case "tool_result":
+            variant.entries = [...variant.entries, mkEntry({
+              kind: "tool_result",
+              toolName: payload.tool_name,
+              toolOutput: payload.output,
+              isError: payload.is_error,
+            })];
+            break;
+          case "complete":
+            variant.entries = [...variant.entries, mkEntry({ kind: "complete", stopReason: payload.stop_reason })];
+            variant.status = "complete";
+            break;
+          case "failed":
+            variant.entries = [...variant.entries, mkEntry({ kind: "failed", message: payload.message })];
+            variant.status = "failed";
+            break;
+          case "cancelled":
+            variant.entries = [...variant.entries, mkEntry({ kind: "cancelled" })];
+            variant.status = "cancelled";
+            break;
+        }
+
+        variants[targetVarIdx] = variant;
+        next[targetTurnIdx] = { ...turn, variants } as AssistantTurn;
+        return next;
+      });
+
+      if (payload.type === "complete" || payload.type === "failed" || payload.type === "cancelled") {
+        handleTerminalEvent(payload);
+      }
+      return true;
+    };
+
+    // Set up listener that processes both real-time and buffered events
     try {
       const unlisten = await listen<RunEventPayload>("run-event", ({ payload }) => {
-        if (!activeRunId || payload.run_id !== activeRunId) return;
-        if (payload.type === "token") assistantText += payload.content;
-
-        setTurns(prev => {
-          const next = [...prev];
-          const turn = next[targetTurnIdx];
-          if (!turn || turn.role !== "assistant") return prev;
-
-          const variants = [...turn.variants];
-          const variant = { ...variants[targetVarIdx], entries: [...variants[targetVarIdx].entries] };
-
-          switch (payload.type) {
-            case "token": {
-              const last = variant.entries[variant.entries.length - 1];
-              if (last?.kind === "token") {
-                variant.entries = [
-                  ...variant.entries.slice(0, -1),
-                  { ...last, content: (last.content ?? "") + payload.content },
-                ];
-              } else {
-                variant.entries = [...variant.entries, mkEntry({ kind: "token", content: payload.content })];
-              }
-              break;
-            }
-            case "tool_call":
-              variant.entries = [...variant.entries, mkEntry({ kind: "tool_call", toolName: payload.tool_name, toolInput: payload.input })];
-              break;
-            case "tool_result":
-              variant.entries = [...variant.entries, mkEntry({
-                kind: "tool_result",
-                toolName: payload.tool_name,
-                toolOutput: payload.output,
-                isError: payload.is_error,
-              })];
-              break;
-            case "complete":
-              variant.entries = [...variant.entries, mkEntry({ kind: "complete", stopReason: payload.stop_reason })];
-              variant.status = "complete";
-              break;
-            case "failed":
-              variant.entries = [...variant.entries, mkEntry({ kind: "failed", message: payload.message })];
-              variant.status = "failed";
-              break;
-            case "cancelled":
-              variant.entries = [...variant.entries, mkEntry({ kind: "cancelled" })];
-              variant.status = "cancelled";
-              break;
-          }
-
-          variants[targetVarIdx] = variant;
-          next[targetTurnIdx] = { ...turn, variants } as AssistantTurn;
-          return next;
-        });
-
-        if (payload.type === "complete" || payload.type === "failed" || payload.type === "cancelled") {
-          handleTerminalEvent(sessionIdRef.current ?? "", payload);
-        }
+        processEvent(payload);
       });
 
       unlistenRef.current = unlisten;
@@ -682,6 +773,25 @@ export default function ChatPage() {
       if (!sessionIdRef.current) {
         sessionIdRef.current = resp.session_id;
         setSessionId(resp.session_id);
+      }
+
+      const seedText = (runEventBuffer.get(activeRunId) ?? [])
+        .filter((event): event is Extract<RunEventPayload, { type: "token" }> => event.type === "token")
+        .map((event) => event.content)
+        .join("");
+
+      trackedRuns.set(activeRunId, {
+        sessionId: resp.session_id,
+        agentProfileId: profileId,
+        assistantText: seedText,
+        persisted: false,
+      });
+
+      // Process any buffered events that came in while we were setting up
+      const buffered = runEventBuffer.get(activeRunId) || [];
+      for (let i = lastProcessedEventIndex; i < buffered.length; i++) {
+        processEvent(buffered[i]);
+        lastProcessedEventIndex = i + 1;
       }
     } catch (err) {
       unlistenRef.current?.();
@@ -782,6 +892,48 @@ export default function ChatPage() {
     });
   }, []);
 
+    const editMessage = useCallback(async (turnIdx: number, newText: string) => {
+      if (isRunning || !newText.trim()) return;
+
+      const userTurn = turns[turnIdx];
+      if (!userTurn || userTurn.role !== "user") return;
+
+      // Update the user message
+      setTurns(prev => {
+        const next = [...prev];
+        (next[turnIdx] as UserTurn).content = newText;
+      
+        // Remove the assistant response that follows (if it exists)
+        if (next[turnIdx + 1]?.role === "assistant") {
+          next.splice(turnIdx + 1, 1);
+        }
+      
+        return next;
+      });
+
+      setEditingMessageIdx(null);
+      setEditingText("");
+      setIsRunning(true);
+
+      // Regenerate response with updated message
+      const messagesBeforeEdit = buildMessages(turns.slice(0, turnIdx));
+      const newMessages = [...messagesBeforeEdit, { role: "user", content: newText }];
+      const newTitle = newText.slice(0, 60);
+
+      // Add a new assistant turn for the regenerated response
+      setTurns(prev => {
+        const next = [...prev];
+        next.push({
+          role: "assistant",
+          variants: [{ entries: [], status: "running" }],
+          activeIndex: 0,
+        });
+        return next;
+      });
+
+      await streamInto(newMessages, turnIdx + 1, 0, newTitle, undefined);
+    }, [isRunning, turns, streamInto, buildMessages]);
+
   const stopRun = useCallback(async () => {
     const rid = runIdRef.current;
     if (!rid) return;
@@ -797,6 +949,90 @@ export default function ChatPage() {
     await createEmptySession();
   }, [createEmptySession]);
 
+  // Reattach the component-level streaming listener to an already-running run (e.g. after
+  // navigating away and back while a response was still streaming or pending).
+  const reattachToRun = useCallback((runId: string, targetTurnIdx: number, targetVarIdx: number) => {
+    ensureGlobalEventListener();
+    runIdRef.current = runId;
+
+    const mkEntry = (partial: Omit<LogEntry, "id">): LogEntry => ({
+      id: ++entryIdRef.current,
+      ...partial,
+    });
+
+    let assistantText = trackedRuns.get(runId)?.assistantText ?? "";
+
+    const applyEvent = (payload: RunEventPayload) => {
+      if (payload.run_id !== runId) return;
+      if (payload.type === "token") assistantText += payload.content;
+
+      setTurns(prev => {
+        const next = [...prev];
+        const turn = next[targetTurnIdx];
+        if (!turn || turn.role !== "assistant") return prev;
+        const variants = [...turn.variants];
+        const variant = { ...variants[targetVarIdx], entries: [...variants[targetVarIdx].entries] };
+
+        switch (payload.type) {
+          case "token": {
+            const last = variant.entries[variant.entries.length - 1];
+            if (last?.kind === "token") {
+              variant.entries = [...variant.entries.slice(0, -1), { ...last, content: (last.content ?? "") + payload.content }];
+            } else {
+              variant.entries = [...variant.entries, mkEntry({ kind: "token", content: payload.content })];
+            }
+            break;
+          }
+          case "tool_call":
+            variant.entries = [...variant.entries, mkEntry({ kind: "tool_call", toolName: payload.tool_name, toolInput: payload.input })];
+            break;
+          case "tool_result":
+            variant.entries = [...variant.entries, mkEntry({ kind: "tool_result", toolName: payload.tool_name, toolOutput: payload.output, isError: payload.is_error })];
+            break;
+          case "complete":
+            variant.entries = [...variant.entries, mkEntry({ kind: "complete", stopReason: payload.stop_reason })];
+            variant.status = "complete";
+            break;
+          case "failed":
+            variant.entries = [...variant.entries, mkEntry({ kind: "failed", message: payload.message })];
+            variant.status = "failed";
+            break;
+          case "cancelled":
+            variant.entries = [...variant.entries, mkEntry({ kind: "cancelled" })];
+            variant.status = "cancelled";
+            break;
+        }
+
+        variants[targetVarIdx] = variant;
+        next[targetTurnIdx] = { ...turn, variants } as AssistantTurn;
+        return next;
+      });
+
+      if (payload.type === "complete" || payload.type === "failed" || payload.type === "cancelled") {
+        const tracked = trackedRuns.get(runId);
+        if (tracked) tracked.assistantText = assistantText;
+        const fallback = payload.type === "failed" ? payload.message : "";
+        void persistTrackedAssistant(runId, fallback).then(() => loadSessions()).catch(console.error);
+        setIsRunning(false);
+        runIdRef.current = null;
+        unlistenRef.current?.();
+        unlistenRef.current = null;
+        runEventBuffer.delete(runId);
+      }
+    };
+
+    // Seed with any already-buffered events
+    const buffered = runEventBuffer.get(runId) ?? [];
+    for (const ev of buffered) applyEvent(ev);
+
+    // Set up a per-component listener for events that arrive after this point
+    listen<RunEventPayload>("run-event", ({ payload }) => {
+      applyEvent(payload);
+    }).then(unlisten => {
+      unlistenRef.current = unlisten;
+    }).catch(console.error);
+  }, [loadSessions]);
+
   const openSession = useCallback(async (id: string) => {
     if (isRunning) return;
     setLoadingSessionId(id);
@@ -807,11 +1043,28 @@ export default function ChatPage() {
 
       unlistenRef.current?.();
       runIdRef.current = null;
-      setIsRunning(false);
       setDraft("");
       setSessionId(id);
       sessionIdRef.current = id;
-      setTurns(hydrateTurns(messages));
+
+      // Check if there's an in-progress run for this session that we should reattach to
+      const activeEntry = [...trackedRuns.entries()].find(([, s]) => s.sessionId === id && !s.persisted);
+      if (activeEntry) {
+        const [activeRunId] = activeEntry;
+        const hydrated = hydrateTurns(messages);
+        // Append a skeleton running assistant turn for the in-progress response
+        const skeletonTurn: AssistantTurn = {
+          role: "assistant",
+          activeIndex: 0,
+          variants: [{ entries: [], status: "running" }],
+        };
+        setTurns([...hydrated, skeletonTurn]);
+        setIsRunning(true);
+        reattachToRun(activeRunId, hydrated.length, 0);
+      } else {
+        setIsRunning(false);
+        setTurns(hydrateTurns(messages));
+      }
 
       if (preferredProfile && profiles.some(p => p.id === preferredProfile)) {
         setProfileId(preferredProfile);
@@ -821,7 +1074,7 @@ export default function ChatPage() {
     } finally {
       setLoadingSessionId(null);
     }
-  }, [isRunning, sessions, profiles, hydrateTurns]);
+  }, [isRunning, sessions, profiles, hydrateTurns, reattachToRun]);
 
   useEffect(() => {
     if (initializedDraftSessionRef.current) return;
@@ -1130,16 +1383,67 @@ export default function ChatPage() {
 
             {turns.map((turn, idx) => {
               if (turn.role === "user") {
-                return (
-                  <div key={idx} className="chat-user">
-                    <div className="chat-bubble chat-bubble--user">{turn.content}</div>
-                  </div>
-                );
+                  const isLast = idx === turns.length - 1;
+                  const isEditing = editingMessageIdx === idx;
+
+                  if (isEditing) {
+                    return (
+                      <div key={idx} className="chat-user">
+                        <div className="chat-bubble chat-bubble--user">
+                          <textarea
+                            autoFocus
+                            value={editingText}
+                            onChange={e => setEditingText(e.target.value)}
+                            className="chat-edit-textarea"
+                            rows={3}
+                          />
+                          <div className="chat-edit-actions">
+                            <button
+                              onClick={() => editMessage(idx, editingText)}
+                              disabled={!editingText.trim()}
+                              className="chat-edit-btn chat-edit-btn--confirm"
+                            >
+                              <Check size={14} /> Save
+                            </button>
+                            <button
+                              onClick={() => {
+                                setEditingMessageIdx(null);
+                                setEditingText("");
+                              }}
+                              className="chat-edit-btn chat-edit-btn--cancel"
+                            >
+                              <X size={14} /> Cancel
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div key={idx} className="chat-user">
+                      <div className="chat-bubble chat-bubble--user">
+                        {turn.content}
+                        {isLast && !isRunning && (
+                          <button
+                            onClick={() => {
+                              setEditingMessageIdx(idx);
+                              setEditingText(turn.content);
+                            }}
+                            className="chat-edit-btn-small"
+                            title="Edit message"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
               }
 
               return (
                 <AssistantBubble
-                  key={idx}
+                    key={idx}  
                   turn={turn}
                   isLast={idx === lastAssistantIdx}
                   isRunning={isRunning}

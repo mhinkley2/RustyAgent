@@ -3,7 +3,7 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::{Emitter, State};
+use tauri::{Emitter};
 
 // ---------------------------------------------------------------------------
 // Active workspace state (managed by Tauri runtime)
@@ -67,8 +67,8 @@ pub async fn get_active_workspace_path(db: &DbPool) -> Option<std::path::PathBuf
 /// and return the workspace. Called by the frontend after the user picks a folder.
 pub async fn open_workspace(
     path: String,
-    db: State<'_, DbPool>,
-    active_ws: State<'_, ActiveWorkspace>,
+    db: &DbPool,
+    active_ws: &ActiveWorkspace,
     app: tauri::AppHandle,
 ) -> Result<Workspace, String> {
     // Validate the path exists and is a directory.
@@ -98,7 +98,7 @@ pub async fn open_workspace(
     .bind(&id)
     .bind(&canonical_str)
     .bind(&name)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -106,7 +106,7 @@ pub async fn open_workspace(
         "SELECT id, path, name, last_opened_at, created_at FROM workspaces WHERE path = ?"
     )
     .bind(&canonical_str)
-    .fetch_one(db.inner())
+    .fetch_one(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -125,7 +125,7 @@ pub async fn open_workspace(
     if let Err(e) = workspace::ensure_rusty_dir(ws_path) {
         tracing::warn!("ensure_rusty_dir failed: {e}");
     }
-    if let Err(e) = workspace::sync_profiles_for_workspace(db.inner(), &ws.id, Some(ws_path)).await {
+    if let Err(e) = workspace::sync_profiles_for_workspace(db, &ws.id, Some(ws_path)).await {
         tracing::warn!("sync_profiles failed: {e}");
     }
 
@@ -134,13 +134,13 @@ pub async fn open_workspace(
 
 /// List the most recently opened workspaces.
 pub async fn get_recent_workspaces(
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<Workspace>, String> {
     let rows = sqlx::query(
         "SELECT id, path, name, last_opened_at, created_at
          FROM workspaces ORDER BY last_opened_at DESC LIMIT 20"
     )
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -150,11 +150,11 @@ pub async fn get_recent_workspaces(
 /// Remove a workspace from the recent list.
 pub async fn remove_workspace(
     id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     sqlx::query("DELETE FROM workspaces WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?;
     Ok(())

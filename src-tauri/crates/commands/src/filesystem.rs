@@ -3,7 +3,6 @@
 // path traversal attacks.
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
 use db::DbPool;
 
 use crate::workspace::get_active_workspace_path;
@@ -85,16 +84,24 @@ fn workspace_canonical(workspace_root: &std::path::Path) -> Result<std::path::Pa
 /// Skips common non-essential entries (`.git`, `node_modules`, `target`).
 pub async fn list_directory(
     path: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<FileEntry>, String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
     let dir = safe_path(&path, &workspace_root)?;
+    list_directory_at(&dir, &path)
+}
 
+/// Directory listing itself, split out from the command so it can be exercised
+/// without a Tauri `State`.
+fn list_directory_at(
+    dir: &std::path::Path,
+    display_path: &str,
+) -> Result<Vec<FileEntry>, String> {
     if !dir.is_dir() {
-        return Err(format!("'{}' is not a directory", path));
+        return Err(format!("'{}' is not a directory", display_path));
     }
 
     const SKIP: &[&str] = &[
@@ -102,7 +109,7 @@ pub async fn list_directory(
         ".cache", ".venv", "venv", ".tox", "build", ".svn",
     ];
 
-    let mut entries: Vec<FileEntry> = std::fs::read_dir(&dir)
+    let mut entries: Vec<FileEntry> = std::fs::read_dir(dir)
         .map_err(|e| format!("Cannot read directory: {e}"))?
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -138,9 +145,9 @@ pub async fn list_directory(
 /// Read a file as UTF-8 text.
 pub async fn read_file_text(
     path: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -167,9 +174,9 @@ pub async fn read_file_text(
 pub async fn write_file_text(
     path: String,
     content: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -186,7 +193,7 @@ pub async fn write_file_text(
 pub async fn rename_path(
     old_path: String,
     new_name: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
     if new_name.is_empty() {
         return Err("Name cannot be empty".into());
@@ -195,7 +202,7 @@ pub async fn rename_path(
         return Err("Name cannot contain path separators".into());
     }
 
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -223,9 +230,9 @@ pub async fn rename_path(
 /// Returns the path of the new file.
 pub async fn duplicate_file(
     path: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -258,9 +265,9 @@ pub async fn duplicate_file(
 /// Delete a file or directory (recursively) within the workspace.
 pub async fn delete_path(
     path: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -287,9 +294,9 @@ pub async fn delete_path(
 /// Returns the canonical path of the created file.
 pub async fn create_empty_file(
     path: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -311,9 +318,9 @@ pub async fn create_empty_file(
 /// Returns the canonical path of the created directory.
 pub async fn create_dir_fs(
     path: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<String, String> {
-    let workspace_root = get_active_workspace_path(db.inner())
+    let workspace_root = get_active_workspace_path(db)
         .await
         .ok_or("No workspace is open")?;
 
@@ -331,3 +338,307 @@ pub async fn create_dir_fs(
     Ok(dir_path.to_string_lossy().into_owned())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// A workspace rooted at a real temp directory, canonicalised so assertions
+    /// compare like with like (Windows temp can hand back an 8.3 short name).
+    fn workspace() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("temp dir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        (dir, root)
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    // -- safe_path -----------------------------------------------------------
+
+    #[test]
+    fn safe_path_accepts_a_file_inside_the_workspace() {
+        let (_dir, root) = workspace();
+        let file = root.join("notes.md");
+        std::fs::write(&file, "x").expect("write");
+
+        let resolved = safe_path(&s(&file), &root).expect("should resolve");
+
+        assert!(resolved.ends_with("notes.md"));
+        assert!(resolved.starts_with(std::fs::canonicalize(&root).unwrap()));
+    }
+
+    #[test]
+    fn safe_path_accepts_the_workspace_root_itself() {
+        let (_dir, root) = workspace();
+
+        assert!(safe_path(&s(&root), &root).is_ok());
+    }
+
+    #[test]
+    fn safe_path_rejects_a_path_outside_the_workspace() {
+        let (_dir, root) = workspace();
+        let outside = TempDir::new().expect("outside");
+        let file = outside.path().join("secrets.txt");
+        std::fs::write(&file, "x").expect("write");
+
+        let err = safe_path(&s(&file), &root).expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_rejects_dotdot_traversal_out_of_the_workspace() {
+        let (_dir, root) = workspace();
+        let parent = root.parent().expect("parent").to_path_buf();
+        let planted = parent.join("rustyagent-escape-probe.txt");
+        std::fs::write(&planted, "x").expect("write");
+
+        let attempt = root.join("..").join("rustyagent-escape-probe.txt");
+        let result = safe_path(&s(&attempt), &root);
+        let _ = std::fs::remove_file(&planted);
+
+        let err = result.expect_err("should be rejected");
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_rejects_a_nonexistent_path_as_invalid() {
+        // canonicalize fails before the containment check, so a missing file is
+        // reported as an invalid path rather than an access denial.
+        let (_dir, root) = workspace();
+        let missing = root.join("nope.md");
+
+        let err = safe_path(&s(&missing), &root).expect_err("should be rejected");
+
+        assert!(err.contains("Invalid path"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_rejects_a_sibling_directory_sharing_the_root_prefix() {
+        let dir = TempDir::new().expect("temp dir");
+        let base = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let root = base.join("proj");
+        let sibling = base.join("proj-evil");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::create_dir_all(&sibling).expect("mkdir");
+        let loot = sibling.join("loot.txt");
+        std::fs::write(&loot, "x").expect("write");
+
+        let err = safe_path(&s(&loot), &root).expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn safe_path_resolves_a_junction_before_the_containment_check() {
+        let (_dir, root) = workspace();
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("loot.txt"), "x").expect("write");
+
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(root.join("escape"))
+            .arg(outside.path())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("skipping: could not create a directory junction here");
+            return;
+        }
+
+        let attempt = root.join("escape").join("loot.txt");
+        let err = safe_path(&s(&attempt), &root).expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn safe_path_resolves_a_symlink_before_the_containment_check() {
+        let (_dir, root) = workspace();
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("loot.txt"), "x").expect("write");
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).expect("symlink");
+
+        let attempt = root.join("escape").join("loot.txt");
+        let err = safe_path(&s(&attempt), &root).expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_reports_an_unresolvable_workspace_root() {
+        let (_dir, root) = workspace();
+        let file = root.join("notes.md");
+        std::fs::write(&file, "x").expect("write");
+        let bogus_root = root.join("does-not-exist");
+
+        let err = safe_path(&s(&file), &bogus_root).expect_err("should be rejected");
+
+        assert!(err.contains("Cannot resolve workspace root"), "got {err}");
+    }
+
+    // -- safe_path_for_new ---------------------------------------------------
+
+    #[test]
+    fn safe_path_for_new_accepts_a_target_whose_parent_is_inside() {
+        let (_dir, root) = workspace();
+        let target = root.join("new-file.md");
+
+        let resolved = safe_path_for_new(&s(&target), &root).expect("should resolve");
+
+        assert!(resolved.ends_with("new-file.md"));
+        assert!(!target.exists(), "the helper must not create anything");
+    }
+
+    #[test]
+    fn safe_path_for_new_accepts_a_target_in_an_existing_subdirectory() {
+        let (_dir, root) = workspace();
+        std::fs::create_dir_all(root.join("docs")).expect("mkdir");
+        let target = root.join("docs").join("new.md");
+
+        let resolved = safe_path_for_new(&s(&target), &root).expect("should resolve");
+
+        assert!(resolved.ends_with("new.md"));
+    }
+
+    #[test]
+    fn safe_path_for_new_rejects_a_target_whose_parent_is_outside() {
+        let (_dir, root) = workspace();
+        let outside = TempDir::new().expect("outside");
+        let target = outside.path().join("planted.txt");
+
+        let err = safe_path_for_new(&s(&target), &root).expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_for_new_rejects_a_dotdot_escape() {
+        let (_dir, root) = workspace();
+        let target = root.join("..").join("planted.txt");
+
+        let err = safe_path_for_new(&s(&target), &root).expect_err("should be rejected");
+
+        assert!(err.contains("outside the workspace"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_for_new_rejects_a_target_whose_parent_does_not_exist() {
+        let (_dir, root) = workspace();
+        let target = root.join("missing-dir").join("new.md");
+
+        let err = safe_path_for_new(&s(&target), &root).expect_err("should be rejected");
+
+        assert!(err.contains("Cannot resolve parent directory"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_for_new_rejects_a_path_with_no_parent() {
+        let (_dir, root) = workspace();
+        let filesystem_root = if cfg!(windows) { "C:\\" } else { "/" };
+
+        let err = safe_path_for_new(filesystem_root, &root).expect_err("should be rejected");
+
+        assert!(err.contains("no parent directory"), "got {err}");
+    }
+
+    #[test]
+    fn safe_path_for_new_rejects_a_bare_relative_name() {
+        // Path::parent on "notes.md" yields an empty path rather than None, so
+        // this fails at canonicalize instead of the no-parent branch.
+        let (_dir, root) = workspace();
+
+        let err = safe_path_for_new("notes.md", &root).expect_err("should be rejected");
+
+        assert!(err.contains("Cannot resolve parent directory"), "got {err}");
+    }
+
+    // -- list_directory_at ---------------------------------------------------
+
+    #[test]
+    fn list_directory_skips_build_and_vcs_directories() {
+        let (_dir, root) = workspace();
+        for skipped in [".git", "node_modules", "target", "dist", "__pycache__"] {
+            std::fs::create_dir_all(root.join(skipped)).expect("mkdir");
+        }
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("README.md"), "x").expect("write");
+
+        let entries = list_directory_at(&root, ".").expect("should list");
+
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["src", "README.md"]);
+    }
+
+    #[test]
+    fn list_directory_sorts_directories_first_then_alphabetically() {
+        let (_dir, root) = workspace();
+        std::fs::create_dir_all(root.join("zeta")).expect("mkdir");
+        std::fs::create_dir_all(root.join("alpha")).expect("mkdir");
+        std::fs::write(root.join("b.txt"), "x").expect("write");
+        std::fs::write(root.join("a.txt"), "x").expect("write");
+
+        let entries = list_directory_at(&root, ".").expect("should list");
+
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn list_directory_reports_size_for_files_and_zero_for_directories() {
+        let (_dir, root) = workspace();
+        std::fs::create_dir_all(root.join("adir")).expect("mkdir");
+        std::fs::write(root.join("five.txt"), "12345").expect("write");
+
+        let entries = list_directory_at(&root, ".").expect("should list");
+
+        let dir_entry = entries.iter().find(|e| e.name == "adir").expect("adir");
+        let file_entry = entries.iter().find(|e| e.name == "five.txt").expect("file");
+        assert!(dir_entry.is_dir);
+        assert_eq!(dir_entry.size, 0);
+        assert!(!file_entry.is_dir);
+        assert_eq!(file_entry.size, 5);
+    }
+
+    #[test]
+    fn list_directory_on_a_file_reports_not_a_directory() {
+        let (_dir, root) = workspace();
+        let file = root.join("notes.md");
+        std::fs::write(&file, "x").expect("write");
+
+        let err = list_directory_at(&file, "notes.md").expect_err("should be rejected");
+
+        assert!(err.contains("is not a directory"), "got {err}");
+    }
+
+    #[test]
+    fn list_directory_strips_the_windows_extended_length_prefix() {
+        let (_dir, root) = workspace();
+        std::fs::write(root.join("a.txt"), "x").expect("write");
+        let canonical = std::fs::canonicalize(&root).expect("canonicalize");
+
+        let entries = list_directory_at(&canonical, ".").expect("should list");
+
+        assert!(
+            !entries[0].path.starts_with(r"\\?\"),
+            "path leaked an extended-length prefix: {}",
+            entries[0].path
+        );
+    }
+
+    #[test]
+    fn list_directory_on_an_empty_directory_returns_no_entries() {
+        let (_dir, root) = workspace();
+
+        let entries = list_directory_at(&root, ".").expect("should list");
+
+        assert!(entries.is_empty());
+    }
+}

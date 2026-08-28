@@ -1,178 +1,22 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import ChatPage from "./ChatPage";
+import { beforeEach, describe, expect, it } from "vitest";
 
-const invokeMock = vi.fn();
-const listenMock = vi.fn();
+import { invokeMock } from "../test/tauriMock";
+import { createChatBackend } from "../test/backends/chatBackend";
 
-type RunEventPayload =
-  | { type: "token"; run_id: string; content: string }
-  | { type: "tool_call"; run_id: string; tool_name: string; input: unknown }
-  | { type: "tool_result"; run_id: string; tool_name: string; output: string; is_error: boolean }
-  | { type: "complete"; run_id: string; stop_reason: string }
-  | { type: "cancelled"; run_id: string }
-  | { type: "failed"; run_id: string; message: string };
-
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (...args: unknown[]) => invokeMock(...args),
-}));
-
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: (...args: unknown[]) => listenMock(...args),
-}));
-
-interface Profile {
-  id: string;
-  name: string;
-}
-
-interface ChatSessionSummary {
-  id: string;
-  title: string;
-  agent_profile_id: string | null;
-  agent_name: string | null;
-  last_message_preview: string | null;
-  last_updated_at: string;
-}
-
-interface ChatSessionMessage {
-  id: string;
-  session_id: string;
-  role: "user" | "assistant";
-  content: string;
-  agent_profile_id: string | null;
-  created_at: string;
-}
-
-function cloneSessions(sessions: ChatSessionSummary[]) {
-  return sessions.map((session) => ({ ...session }));
-}
-
-function cloneMessages(messages: Record<string, ChatSessionMessage[]>) {
-  return Object.fromEntries(
-    Object.entries(messages).map(([sessionId, entries]) => [
-      sessionId,
-      entries.map((entry) => ({ ...entry })),
-    ]),
-  ) as Record<string, ChatSessionMessage[]>;
-}
-
-function createChatBackend(options?: {
-  sessions?: ChatSessionSummary[];
-  messages?: Record<string, ChatSessionMessage[]>;
-  profiles?: Profile[];
-}) {
-  const profiles = options?.profiles ?? [{ id: "agent-1", name: "Agent One" }];
-  const sessions = cloneSessions(options?.sessions ?? []);
-  const messagesBySession = cloneMessages(options?.messages ?? {});
-  const runEventListeners = new Set<(event: { payload: RunEventPayload }) => void>();
-  let nextSessionCounter = sessions.length + 1;
-  let nextMessageCounter = 1;
-  let nextRunCounter = 1;
-
-  const findProfileName = (profileId: string | null | undefined) =>
-    profiles.find((profile) => profile.id === profileId)?.name ?? null;
-
-  const updateSessionFromMessage = (
-    sessionId: string,
-    role: "user" | "assistant",
-    content: string,
-    agentProfileId: string | null,
-  ) => {
-    const session = sessions.find((entry) => entry.id === sessionId);
-    if (!session) return;
-    session.last_message_preview = content;
-    session.last_updated_at = `2026-04-13T00:00:${String(nextMessageCounter).padStart(2, "0")}Z`;
-    session.agent_profile_id = agentProfileId;
-    session.agent_name = findProfileName(agentProfileId);
-
-    const nextMessage: ChatSessionMessage = {
-      id: `message-${nextMessageCounter++}`,
-      session_id: sessionId,
-      role,
-      content,
-      agent_profile_id: agentProfileId,
-      created_at: session.last_updated_at,
-    };
-
-    if (!messagesBySession[sessionId]) messagesBySession[sessionId] = [];
-    messagesBySession[sessionId].push(nextMessage);
-  };
-
-  listenMock.mockImplementation(async (eventName: string, callback: (event: { payload: RunEventPayload }) => void) => {
-    if (eventName === "run-event") {
-      runEventListeners.add(callback);
-      return () => {
-        runEventListeners.delete(callback);
-      };
-    }
-    return () => {};
-  });
-
-  invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
-    switch (command) {
-      case "get_profiles":
-        return profiles.map((profile) => ({ ...profile }));
-      case "list_chat_sessions":
-        return cloneSessions(sessions);
-      case "create_chat_session": {
-        const newSession: ChatSessionSummary = {
-          id: `session-${nextSessionCounter++}`,
-          title: typeof args?.title === "string" && args.title.trim() ? args.title.trim() : "New Chat",
-          agent_profile_id: null,
-          agent_name: null,
-          last_message_preview: null,
-          last_updated_at: `2026-04-13T00:00:${String(nextSessionCounter).padStart(2, "0")}Z`,
-        };
-        sessions.unshift(newSession);
-        messagesBySession[newSession.id] = [];
-        return { ...newSession };
-      }
-      case "start_chat_run": {
-        const sessionId = typeof args?.sessionId === "string" && args.sessionId ? args.sessionId : sessions[0]?.id;
-        const sessionTitle = typeof args?.sessionTitle === "string" ? args.sessionTitle.trim() : "";
-        const session = sessions.find((entry) => entry.id === sessionId);
-        if (session && sessionTitle && ["", "new chat", "chat session"].includes(session.title.trim().toLowerCase())) {
-          session.title = sessionTitle;
-        }
-        return {
-          run_id: `run-${nextRunCounter++}`,
-          session_id: sessionId,
-        };
-      }
-      case "append_chat_session_message": {
-        updateSessionFromMessage(
-          String(args?.sessionId),
-          args?.role as "user" | "assistant",
-          String(args?.content ?? ""),
-          (args?.agentProfileId as string | null | undefined) ?? null,
-        );
-        return undefined;
-      }
-      case "get_chat_session_messages":
-        return (messagesBySession[String(args?.sessionId)] ?? []).map((entry) => ({ ...entry }));
-      default:
-        throw new Error(`Unhandled invoke command: ${command}`);
-    }
-  });
-
-  return {
-    getSessions: () => cloneSessions(sessions),
-    getMessages: (sessionId: string) => (messagesBySession[sessionId] ?? []).map((entry) => ({ ...entry })),
-    emitRunEvent: async (payload: RunEventPayload) => {
-      await act(async () => {
-        for (const listener of runEventListeners) {
-          listener({ payload });
-        }
-      });
-    },
-  };
-}
+// ChatPage keeps module-level singletons (`runEventBuffer`, `trackedRuns`, and
+// a `globalEventListenerReady` flag) so a stream survives navigation. The setup
+// file resets the module registry before each test; re-importing here gives
+// every case its own instance of those singletons, which is what makes this
+// suite order-independent.
+let ChatPage: typeof import("./ChatPage").default;
 
 function getSessionOpenButton(sessionTitle: string) {
   const candidates = screen.getAllByRole("button", { name: new RegExp(sessionTitle, "i") });
-  const button = candidates.find((candidate) => candidate.className.includes("chat-page__session-open"));
+  const button = candidates.find((candidate) =>
+    candidate.className.includes("chat-page__session-open"),
+  );
   if (!button) {
     throw new Error(`Could not find session open button for ${sessionTitle}`);
   }
@@ -180,10 +24,8 @@ function getSessionOpenButton(sessionTitle: string) {
 }
 
 describe("ChatPage", () => {
-  beforeEach(() => {
-    invokeMock.mockReset();
-    listenMock.mockReset();
-    window.localStorage.clear();
+  beforeEach(async () => {
+    ChatPage = (await import("./ChatPage")).default;
   });
 
   it("creates an initial persisted draft session when none exist", async () => {
@@ -581,5 +423,226 @@ describe("ChatPage", () => {
 
     expect(await threadQueries.findByText("Saved question")).toBeInTheDocument();
     expect(await threadQueries.findByText("Saved answer")).toBeInTheDocument();
+  });
+
+  it("preserves streamed assistant response after navigating away and back", async () => {
+    const backend = createChatBackend({
+      sessions: [
+        {
+          id: "draft-1",
+          title: "New Chat",
+          agent_profile_id: null,
+          agent_name: null,
+          last_message_preview: null,
+          last_updated_at: "2026-04-13T00:00:01Z",
+        },
+      ],
+      messages: {
+        "draft-1": [],
+      },
+    });
+
+    const user = userEvent.setup();
+    const firstRender = render(<ChatPage />);
+
+    const textarea = await screen.findByPlaceholderText(/message the agent/i);
+    await user.type(textarea, "Keep streaming while I navigate");
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith(
+        "start_chat_run",
+        expect.objectContaining({
+          sessionId: "draft-1",
+          sessionTitle: "Keep streaming while I navigate",
+        }),
+      );
+    });
+
+    firstRender.unmount();
+
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: "Recovered" });
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: " response" });
+    await backend.emitRunEvent({ type: "complete", run_id: "run-1", stop_reason: "end_turn" });
+
+    const secondRender = render(<ChatPage />);
+    const thread = secondRender.container.querySelector(".chat-page__thread");
+    expect(thread).not.toBeNull();
+    const threadQueries = within(thread as HTMLElement);
+
+    expect(await threadQueries.findByText("Keep streaming while I navigate")).toBeInTheDocument();
+    expect(await threadQueries.findByText("Recovered response")).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // Streaming edge cases
+  // -------------------------------------------------------------------------
+
+  /** A backend with one empty draft session, ready to send into. */
+  function draftBackend() {
+    return createChatBackend({
+      sessions: [
+        {
+          id: "draft-1",
+          title: "New Chat",
+          agent_profile_id: null,
+          agent_name: null,
+          last_message_preview: null,
+          last_updated_at: "2026-04-13T00:00:01Z",
+        },
+      ],
+      messages: { "draft-1": [] },
+    });
+  }
+
+  /** Type a message and press Enter, then wait for the run to start. */
+  async function send(text: string) {
+    const user = userEvent.setup();
+    const textarea = await screen.findByPlaceholderText(/message the agent/i);
+    await user.type(textarea, text);
+    await user.keyboard("{Enter}");
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith(
+        "start_chat_run",
+        expect.objectContaining({ sessionId: "draft-1" }),
+      );
+    });
+    return user;
+  }
+
+  it("renders tool calls and their results in the transcript", async () => {
+    const backend = draftBackend();
+    const view = render(<ChatPage />);
+    await send("Write a file");
+
+    await backend.emitRunEvent({
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "file_write",
+      input: { path: "a.txt" },
+    });
+    await backend.emitRunEvent({
+      type: "tool_result",
+      run_id: "run-1",
+      tool_name: "file_write",
+      output: "Successfully wrote to 'a.txt'",
+      is_error: false,
+    });
+    await backend.emitRunEvent({ type: "complete", run_id: "run-1", stop_reason: "end_turn" });
+
+    // The transcript summarises tool activity rather than echoing raw names.
+    const thread = view.container.querySelector(".chat-page__thread") as HTMLElement;
+    await waitFor(() => {
+      expect(thread.textContent).toContain("tool action");
+    });
+    expect(thread.textContent).toContain("file write");
+  });
+
+  it("surfaces the message from a failed run and re-enables the composer", async () => {
+    const backend = draftBackend();
+    render(<ChatPage />);
+    await send("Do the thing");
+
+    await backend.emitRunEvent({
+      type: "failed",
+      run_id: "run-1",
+      message: "LLM call failed: upstream is down",
+    });
+
+    // The message renders inside a status entry (and so also matches its
+    // ancestors) — assert at least one match rather than exactly one.
+    const matches = await screen.findAllByText(/upstream is down/i);
+    expect(matches.length).toBeGreaterThan(0);
+    const textarea = await screen.findByPlaceholderText(/message the agent/i);
+    await waitFor(() => expect(textarea).not.toBeDisabled());
+  });
+
+  it("persists partial assistant text when a run is cancelled", async () => {
+    const backend = draftBackend();
+    render(<ChatPage />);
+    await send("Start something long");
+
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: "Partial " });
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: "answer" });
+    await backend.emitRunEvent({ type: "cancelled", run_id: "run-1" });
+
+    await waitFor(() => {
+      const roles = backend.getMessages("draft-1").map((m) => m.role);
+      expect(roles).toEqual(["user", "assistant"]);
+    });
+    expect(backend.getMessages("draft-1")[1].content).toBe("Partial answer");
+  });
+
+  it("does not persist an assistant message when the stream produced no text", async () => {
+    const backend = draftBackend();
+    render(<ChatPage />);
+    await send("Say nothing");
+
+    await backend.emitRunEvent({ type: "complete", run_id: "run-1", stop_reason: "end_turn" });
+
+    await waitFor(() => {
+      expect(backend.getMessages("draft-1").map((m) => m.role)).toEqual(["user"]);
+    });
+  });
+
+  it("buffers events for a session that is not on screen and replays them on return", async () => {
+    // The whole point of the module-level run buffer: a stream that continues
+    // while the user is looking at another session must not be lost.
+    const backend = createChatBackend({
+      sessions: [
+        {
+          id: "draft-1",
+          title: "New Chat",
+          agent_profile_id: null,
+          agent_name: null,
+          last_message_preview: null,
+          last_updated_at: "2026-04-13T00:00:02Z",
+        },
+        {
+          id: "session-2",
+          title: "Other Session",
+          agent_profile_id: "agent-1",
+          agent_name: "Agent One",
+          last_message_preview: "Older",
+          last_updated_at: "2026-04-13T00:00:01Z",
+        },
+      ],
+      messages: { "draft-1": [], "session-2": [] },
+    });
+
+    const view = render(<ChatPage />);
+    await send("Stream while I look away");
+
+    view.unmount();
+
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: "Buffered " });
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: "reply" });
+    await backend.emitRunEvent({ type: "complete", run_id: "run-1", stop_reason: "end_turn" });
+
+    await waitFor(() => {
+      expect(backend.getMessages("draft-1")[1]?.content).toBe("Buffered reply");
+    });
+
+    const second = render(<ChatPage />);
+    const thread = second.container.querySelector(".chat-page__thread") as HTMLElement;
+    expect(await within(thread).findByText("Buffered reply")).toBeInTheDocument();
+  });
+
+  it("ignores run events belonging to a different run", async () => {
+    const backend = draftBackend();
+    const view = render(<ChatPage />);
+    await send("Only mine");
+
+    // An event from an unrelated run must not land in this transcript.
+    await backend.emitRunEvent({ type: "token", run_id: "run-999", content: "NOT MINE" });
+    await backend.emitRunEvent({ type: "token", run_id: "run-1", content: "mine" });
+    await backend.emitRunEvent({ type: "complete", run_id: "run-1", stop_reason: "end_turn" });
+
+    const thread = view.container.querySelector(".chat-page__thread") as HTMLElement;
+    await waitFor(() => expect(thread.textContent).toContain("mine"));
+    expect(thread.textContent).not.toContain("NOT MINE");
+    await waitFor(() => {
+      expect(backend.getMessages("draft-1")[1]?.content).toBe("mine");
+    });
   });
 });

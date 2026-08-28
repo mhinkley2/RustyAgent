@@ -534,7 +534,7 @@ async fn fire_step_run(
         completion_config,
         max_iterations as u32,
         db.clone(),
-        app,
+        std::sync::Arc::new(app),
         cancel,
         memory_store,
         Some(pipeline_run_id_str),
@@ -742,7 +742,7 @@ async fn run_subtask_impl(
         config,
         max_iterations as u32,
         db.clone(),
-        app,
+        std::sync::Arc::new(app),
         cancel,
         memory_store,
         Some(pipeline_run_id),
@@ -779,7 +779,9 @@ async fn run_subtask_impl(
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn load_pipeline_config(story_id: &str, db: &DbPool) -> Result<PipelineConfig> {
+/// Load and parse a pipeline story's config. Public so the MCP server can
+/// offer a dry-run validation without starting the pipeline.
+pub async fn load_pipeline_config(story_id: &str, db: &DbPool) -> Result<PipelineConfig> {
     let row = sqlx::query(
         "SELECT pipeline_config FROM stories WHERE id = ? AND story_type = 'pipeline'",
     )
@@ -797,7 +799,9 @@ async fn load_pipeline_config(story_id: &str, db: &DbPool) -> Result<PipelineCon
         .context("Failed to parse pipeline_config JSON")
 }
 
-fn validate_pipeline_config(pipeline_story_id: &str, config: &PipelineConfig) -> Result<()> {
+/// Check a pipeline config for an empty step list, a self-reference, or a
+/// duplicate step story. Pure — safe to call as a dry run.
+pub fn validate_pipeline_config(pipeline_story_id: &str, config: &PipelineConfig) -> Result<()> {
     if config.steps.is_empty() {
         return Err(anyhow!("Pipeline must have at least one step"));
     }

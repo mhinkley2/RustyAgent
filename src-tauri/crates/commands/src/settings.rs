@@ -5,7 +5,7 @@ use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager};
 
 // ---------------------------------------------------------------------------
 // AppSettings — the on-disk schema
@@ -91,13 +91,13 @@ pub async fn save_settings(settings: AppSettings, app: AppHandle) -> Result<(), 
 /// Returns an empty JSON object `{}` if no override exists.
 pub async fn get_workspace_settings(
     workspace_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<serde_json::Value, String> {
     let row = sqlx::query(
         "SELECT settings_json FROM workspace_settings WHERE workspace_id = ?"
     )
     .bind(&workspace_id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -114,7 +114,7 @@ pub async fn get_workspace_settings(
 pub async fn save_workspace_settings(
     workspace_id: String,
     overrides: serde_json::Value,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     let json = serde_json::to_string(&overrides)
         .map_err(|e| format!("Serialize error: {e}"))?;
@@ -127,7 +127,7 @@ pub async fn save_workspace_settings(
     )
     .bind(&workspace_id)
     .bind(&json)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
     Ok(())

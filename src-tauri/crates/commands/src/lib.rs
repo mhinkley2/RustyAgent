@@ -91,11 +91,11 @@ pub async fn start_run(
     story_id: String,
     profile_id: String,
     app: AppHandle,
-    db: State<'_, DbPool>,
+    db: &DbPool,
     run_registry: State<'_, RunRegistry>,
     gate: State<'_, Arc<ApprovalGate>>,
 ) -> Result<String, String> {
-    let db = db.inner().clone();
+    let db = db.clone();
 
     // ------------------------------------------------------------------
     // Load the agent profile from the database.
@@ -248,7 +248,7 @@ pub async fn start_run(
         config,
         max_iterations as u32,
         db.clone(),
-        app.clone(),
+        std::sync::Arc::new(app.clone()),
         cancel,
         memory,
         workspace::get_active_workspace_path(&db).await,
@@ -318,13 +318,13 @@ pub async fn start_chat_run(
     session_title: Option<String>,
     workspace_id: Option<String>,
     app: AppHandle,
-    db: State<'_, DbPool>,
+    db: &DbPool,
     run_registry: State<'_, RunRegistry>,
     gate: State<'_, Arc<ApprovalGate>>,
 ) -> Result<ChatRunResponse, String> {
     use uuid::Uuid;
 
-    let db = db.inner().clone();
+    let db = db.clone();
 
     // Load the agent profile.
     let row = sqlx::query(
@@ -484,7 +484,7 @@ pub async fn start_chat_run(
         config,
         max_iterations as u32,
         db.clone(),
-        app.clone(),
+        std::sync::Arc::new(app.clone()),
         cancel,
         memory,
         workspace::get_active_workspace_path(&db).await,

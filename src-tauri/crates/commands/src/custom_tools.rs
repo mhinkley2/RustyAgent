@@ -3,7 +3,6 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::State;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -74,7 +73,7 @@ fn row_to_custom_tool(row: &sqlx::sqlite::SqliteRow) -> CustomTool {
 
 pub async fn get_custom_tools(
     workspace_id: Option<String>,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<CustomTool>, String> {
     let rows = match &workspace_id {
         Some(ws_id) => sqlx::query(
@@ -85,7 +84,7 @@ pub async fn get_custom_tools(
              ORDER BY name ASC",
         )
         .bind(ws_id)
-        .fetch_all(db.inner())
+        .fetch_all(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?,
         None => sqlx::query(
@@ -95,7 +94,7 @@ pub async fn get_custom_tools(
              WHERE workspace_id IS NULL
              ORDER BY name ASC",
         )
-        .fetch_all(db.inner())
+        .fetch_all(db)
         .await
         .map_err(|e| format!("DB error: {e}"))?,
     };
@@ -107,14 +106,14 @@ pub async fn get_custom_tools(
 // get_custom_tool
 // ---------------------------------------------------------------------------
 
-pub async fn get_custom_tool(id: String, db: State<'_, DbPool>) -> Result<CustomTool, String> {
+pub async fn get_custom_tool(id: String, db: &DbPool) -> Result<CustomTool, String> {
     let row = sqlx::query(
         "SELECT id, name, description, command, working_dir, timeout_secs,
                 workspace_id, created_at, updated_at
          FROM custom_tools WHERE id = ?",
     )
     .bind(&id)
-    .fetch_optional(db.inner())
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?
     .ok_or_else(|| format!("Custom tool '{id}' not found"))?;
@@ -128,7 +127,7 @@ pub async fn get_custom_tool(id: String, db: State<'_, DbPool>) -> Result<Custom
 
 pub async fn create_custom_tool(
     input: CreateCustomToolInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<CustomTool, String> {
     let id = Uuid::new_v4().to_string();
     let description = input.description.unwrap_or_default();
@@ -147,7 +146,7 @@ pub async fn create_custom_tool(
     .bind(&working_dir)
     .bind(timeout_secs)
     .bind(&input.workspace_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -161,9 +160,9 @@ pub async fn create_custom_tool(
 pub async fn update_custom_tool(
     id: String,
     input: UpdateCustomToolInput,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<CustomTool, String> {
-    let current = get_custom_tool(id.clone(), db.clone()).await?;
+    let current = get_custom_tool(id.clone(), db).await?;
 
     let name = input.name.unwrap_or(current.name);
     let description = input.description.unwrap_or(current.description);
@@ -183,7 +182,7 @@ pub async fn update_custom_tool(
     .bind(&working_dir)
     .bind(timeout_secs)
     .bind(&id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB update error: {e}"))?;
 
@@ -194,10 +193,10 @@ pub async fn update_custom_tool(
 // delete_custom_tool
 // ---------------------------------------------------------------------------
 
-pub async fn delete_custom_tool(id: String, db: State<'_, DbPool>) -> Result<(), String> {
+pub async fn delete_custom_tool(id: String, db: &DbPool) -> Result<(), String> {
     sqlx::query("DELETE FROM custom_tools WHERE id = ?")
         .bind(&id)
-        .execute(db.inner())
+        .execute(db)
         .await
         .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())
@@ -209,7 +208,7 @@ pub async fn delete_custom_tool(id: String, db: State<'_, DbPool>) -> Result<(),
 
 pub async fn get_custom_tool_bindings(
     agent_profile_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<Vec<CustomToolBinding>, String> {
     let rows = sqlx::query(
         "SELECT actb.agent_profile_id, actb.custom_tool_id, ct.name AS tool_name
@@ -219,7 +218,7 @@ pub async fn get_custom_tool_bindings(
          ORDER BY ct.name ASC",
     )
     .bind(&agent_profile_id)
-    .fetch_all(db.inner())
+    .fetch_all(db)
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
@@ -240,7 +239,7 @@ pub async fn get_custom_tool_bindings(
 pub async fn create_custom_tool_binding(
     agent_profile_id: String,
     custom_tool_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<CustomToolBinding, String> {
     sqlx::query(
         "INSERT OR IGNORE INTO agent_custom_tool_bindings
@@ -249,7 +248,7 @@ pub async fn create_custom_tool_binding(
     )
     .bind(&agent_profile_id)
     .bind(&custom_tool_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB insert error: {e}"))?;
 
@@ -261,7 +260,7 @@ pub async fn create_custom_tool_binding(
     )
     .bind(&agent_profile_id)
     .bind(&custom_tool_id)
-    .fetch_one(db.inner())
+    .fetch_one(db)
     .await
     .map_err(|e| format!("DB fetch error: {e}"))?;
 
@@ -279,7 +278,7 @@ pub async fn create_custom_tool_binding(
 pub async fn delete_custom_tool_binding(
     agent_profile_id: String,
     custom_tool_id: String,
-    db: State<'_, DbPool>,
+    db: &DbPool,
 ) -> Result<(), String> {
     sqlx::query(
         "DELETE FROM agent_custom_tool_bindings
@@ -287,7 +286,7 @@ pub async fn delete_custom_tool_binding(
     )
     .bind(&agent_profile_id)
     .bind(&custom_tool_id)
-    .execute(db.inner())
+    .execute(db)
     .await
     .map_err(|e| format!("DB delete error: {e}"))?;
     Ok(())

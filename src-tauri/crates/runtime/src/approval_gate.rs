@@ -79,3 +79,106 @@ impl Default for ApprovalGate {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn register_then_resolve_true_delivers_true() {
+        let gate = ApprovalGate::new();
+        let rx = gate.register("a1");
+
+        assert!(gate.resolve("a1", true), "resolve should find the entry");
+        assert!(rx.await.expect("sender kept alive"));
+    }
+
+    #[tokio::test]
+    async fn register_then_resolve_false_delivers_false() {
+        let gate = ApprovalGate::new();
+        let rx = gate.register("a1");
+
+        assert!(gate.resolve("a1", false));
+        assert!(!rx.await.expect("sender kept alive"));
+    }
+
+    #[test]
+    fn resolving_an_unknown_id_returns_false() {
+        let gate = ApprovalGate::new();
+
+        assert!(!gate.resolve("never-registered", true));
+    }
+
+    #[tokio::test]
+    async fn a_second_resolve_of_the_same_id_returns_false() {
+        // Guards against a double-click in the UI resolving twice.
+        let gate = ApprovalGate::new();
+        let rx = gate.register("a1");
+
+        assert!(gate.resolve("a1", true));
+        assert!(!gate.resolve("a1", false), "the entry must be consumed");
+        assert!(rx.await.expect("first decision wins"));
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_the_entry_so_the_receiver_errors() {
+        let gate = ApprovalGate::new();
+        let rx = gate.register("a1");
+
+        gate.cancel("a1");
+
+        assert!(rx.await.is_err(), "sender should have been dropped");
+        assert!(!gate.resolve("a1", true), "the entry is gone");
+    }
+
+    #[test]
+    fn cancelling_an_unknown_id_is_a_no_op() {
+        let gate = ApprovalGate::new();
+        gate.cancel("never-registered");
+    }
+
+    #[test]
+    fn resolving_after_the_receiver_is_dropped_still_reports_found() {
+        // The runtime's 5-minute timeout drops its receiver; a late decision
+        // must not be mistaken for "not found".
+        let gate = ApprovalGate::new();
+        let rx = gate.register("a1");
+        drop(rx);
+
+        assert!(gate.resolve("a1", true));
+    }
+
+    #[tokio::test]
+    async fn concurrent_registrations_resolve_independently_and_out_of_order() {
+        let gate = std::sync::Arc::new(ApprovalGate::new());
+        let ids: Vec<String> = (0..50).map(|i| format!("a{i}")).collect();
+        let receivers: Vec<_> = ids.iter().map(|id| gate.register(id)).collect();
+
+        // Resolve in reverse, alternating the decision.
+        for (i, id) in ids.iter().enumerate().rev() {
+            assert!(gate.resolve(id, i % 2 == 0));
+        }
+
+        for (i, rx) in receivers.into_iter().enumerate() {
+            assert_eq!(
+                rx.await.expect("delivered"),
+                i % 2 == 0,
+                "approval {i} got the wrong decision"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_task_is_woken_by_a_later_resolve() {
+        let gate = std::sync::Arc::new(ApprovalGate::new());
+        let rx = gate.register("a1");
+
+        let waiter = tokio::spawn(rx);
+
+        // The decision arrives after the waiter is already parked.
+        tokio::task::yield_now().await;
+        assert!(gate.resolve("a1", true));
+
+        assert!(waiter.await.expect("join").expect("delivered"));
+    }
+}

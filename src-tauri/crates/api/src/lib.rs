@@ -6,10 +6,14 @@ pub mod keychain;
 pub mod types;
 pub mod provider;
 pub mod anthropic;
+pub(crate) mod openai_sse;
 pub mod openrouter;
 pub mod ollama;
 pub mod deepseek;
 pub mod mock;
+
+#[cfg(test)]
+mod contract_tests;
 
 pub use error::ApiError;
 pub use keychain::ApiKeyStore;
