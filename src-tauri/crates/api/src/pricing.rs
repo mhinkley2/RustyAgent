@@ -1,4 +1,10 @@
-// Per-model price table for run cost estimation.
+// Per-model facts: price rates for run cost estimation, and context windows
+// for the input budget.
+//
+// Both are keyed the same way — by model-id prefix, longest match wins, after
+// the same [`normalize`] pass — so they live together rather than growing a
+// second copy of that machinery elsewhere. A model added to one table is
+// usually a model that needs adding to the other.
 //
 // `story_runs.estimated_cost_usd` is an *estimate*, and the only way to keep it
 // from being a fabrication is to price from a table that either knows a model
@@ -65,6 +71,58 @@ const PRICES: &[(&str, ModelPrice)] = &[
     ("claude-haiku-4-5", ModelPrice::anthropic(1.0, 5.0)),
 ];
 
+/// Context window, in tokens, for the models we know.
+///
+/// Keyed exactly like [`PRICES`]. Only documented windows belong here —
+/// guessing a window is worse than falling back to
+/// [`DEFAULT_CONTEXT_WINDOW`], because an invented window that is too large
+/// produces the overflow the budget exists to prevent.
+///
+/// (Anthropic's published windows, captured 2026-06-24.)
+const CONTEXT_WINDOWS: &[(&str, u64)] = &[
+    ("claude-fable-5", 1_000_000),
+    ("claude-mythos-5", 1_000_000),
+    ("claude-opus-5", 1_000_000),
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-6", 1_000_000),
+    ("claude-sonnet-5", 1_000_000),
+    ("claude-sonnet-4-6", 1_000_000),
+    ("claude-haiku-4-5", 200_000),
+];
+
+/// Window assumed for a model the table does not know — a local Ollama build,
+/// a new OpenRouter id, anything unlisted.
+///
+/// Deliberately small. The cost of guessing low is compacting a conversation
+/// that would have fit; the cost of guessing high is the provider rejecting
+/// the request and the run dying, which is the failure this exists to prevent.
+/// A profile that knows better sets `max_input_tokens` explicitly.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+/// Longest-matching-prefix lookup over a table keyed by normalised model id.
+fn lookup_by_prefix<T: Copy>(table: &[(&str, T)], model: &str) -> Option<T> {
+    let id = normalize(model);
+    table
+        .iter()
+        .filter(|(prefix, _)| id.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, value)| *value)
+}
+
+/// The model's context window in tokens, or `None` if it is not in the table.
+///
+/// `None` is the honest answer for an unknown model; callers fall back to
+/// [`DEFAULT_CONTEXT_WINDOW`] rather than assuming a generous one.
+pub fn context_window(model: &str) -> Option<u64> {
+    lookup_by_prefix(CONTEXT_WINDOWS, model)
+}
+
+/// The model's context window, or [`DEFAULT_CONTEXT_WINDOW`] when unknown.
+pub fn context_window_or_default(model: &str) -> u64 {
+    context_window(model).unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
 /// Reduce a provider-specific model id to the bare Anthropic-style id.
 ///
 /// OpenRouter scopes ids by vendor (`anthropic/claude-opus-5`) and may append a
@@ -78,12 +136,7 @@ fn normalize(model: &str) -> String {
 
 /// Look up a model's rates, or `None` if the table does not know it.
 pub fn lookup(model: &str) -> Option<ModelPrice> {
-    let id = normalize(model);
-    PRICES
-        .iter()
-        .filter(|(prefix, _)| id.starts_with(prefix))
-        .max_by_key(|(prefix, _)| prefix.len())
-        .map(|(_, price)| *price)
+    lookup_by_prefix(PRICES, model)
 }
 
 /// Estimated USD cost of `usage` on `model`, or `None` when the model is not
@@ -172,5 +225,45 @@ mod tests {
     #[test]
     fn an_empty_model_id_is_unknown_rather_than_a_partial_match() {
         assert_eq!(lookup(""), None);
+    }
+
+    #[test]
+    fn a_known_model_reports_its_published_context_window() {
+        assert_eq!(context_window("claude-opus-5"), Some(1_000_000));
+        assert_eq!(context_window("claude-haiku-4-5"), Some(200_000));
+    }
+
+    #[test]
+    fn context_windows_share_the_price_tables_id_normalisation() {
+        let bare = context_window("claude-sonnet-5").expect("sonnet 5");
+
+        assert_eq!(context_window("anthropic/claude-sonnet-5:beta"), Some(bare));
+        assert_eq!(context_window("CLAUDE-SONNET-5-20260101"), Some(bare));
+    }
+
+    #[test]
+    fn an_unknown_model_falls_back_to_the_conservative_default_window() {
+        assert_eq!(context_window("some-local-llama"), None);
+        assert_eq!(
+            context_window_or_default("some-local-llama"),
+            DEFAULT_CONTEXT_WINDOW
+        );
+        // The fallback must undershoot the models we do know, not overshoot:
+        // guessing a window too large is what sends the oversized request.
+        let known = context_window("claude-haiku-4-5").expect("haiku 4.5");
+        assert!(DEFAULT_CONTEXT_WINDOW < known);
+    }
+
+    #[test]
+    fn every_priced_model_also_has_a_context_window() {
+        // The two tables are keyed identically and are meant to be maintained
+        // together; a model priced but unwindowed silently budgets at the
+        // conservative default instead of its real capacity.
+        for (prefix, _) in PRICES {
+            assert!(
+                context_window(prefix).is_some(),
+                "'{prefix}' is priced but has no context window"
+            );
+        }
     }
 }
