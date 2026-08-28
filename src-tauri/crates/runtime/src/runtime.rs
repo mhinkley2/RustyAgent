@@ -732,6 +732,19 @@ impl ConversationRuntime {
         .await;
     }
 
+    /// Narrow a `u64` token counter for SQLite, which has no unsigned integer
+    /// type, saturating instead of wrapping.
+    ///
+    /// `as i64` reinterprets the bits, so any value above `i64::MAX` lands in
+    /// the database negative. `Usage` sums with `saturating_add` specifically so
+    /// that "a bad estimate beats a negative one" — which makes the wrap
+    /// reachable rather than hypothetical, since a saturated total sits at
+    /// `u64::MAX` and `u64::MAX as i64` is `-1`. Clamping carries that existing
+    /// decision through to the one place it was not applied.
+    fn clamp_to_i64(value: u64) -> i64 {
+        i64::try_from(value).unwrap_or(i64::MAX)
+    }
+
     /// Mark the run terminal and write down what it spent.
     ///
     /// Called on every exit path — completion, failure, cancellation — because
@@ -760,10 +773,10 @@ impl ConversationRuntime {
              WHERE id = ?"
         )
         .bind(status)
-        .bind(usage.input_tokens as i64)
-        .bind(usage.output_tokens as i64)
-        .bind(usage.cache_read_input_tokens as i64)
-        .bind(usage.cache_creation_input_tokens as i64)
+        .bind(Self::clamp_to_i64(usage.input_tokens))
+        .bind(Self::clamp_to_i64(usage.output_tokens))
+        .bind(Self::clamp_to_i64(usage.cache_read_input_tokens))
+        .bind(Self::clamp_to_i64(usage.cache_creation_input_tokens))
         .bind(cost)
         .bind(&self.run_id)
         .execute(&self.db)
