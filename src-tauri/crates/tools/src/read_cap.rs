@@ -51,8 +51,12 @@ pub fn lines_with_endings(content: &str) -> Vec<&str> {
 pub fn optional_positive(input: &Value, key: &str) -> Result<Option<usize>, String> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => match v.as_u64() {
-            Some(n) if n >= 1 => Ok(Some(n as usize)),
+        // `try_from` rather than `as`: a value beyond `usize` would wrap, and a
+        // line number that silently becomes a small one reads a different part
+        // of the file than was asked for. Out of range is rejected like any
+        // other invalid value.
+        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if n >= 1 => Ok(Some(n)),
             _ => Err(format!(
                 "Parameter '{key}' must be a positive integer (counting from 1); got {v}."
             )),
@@ -98,6 +102,16 @@ pub fn truncate_for_read(body: &str, max: usize) -> Option<&str> {
     let cut = match head.rfind('\n') {
         Some(i) => i + 1,
         None => head.len(),
+    };
+    // Never end on the `\r` of a CRLF pair. With no newline inside the cap —
+    // one very long CRLF-terminated first line — the fallback cut can land
+    // between the two bytes, producing a lone `\r` that is not a line ending
+    // anywhere on disk. That contradicts the byte-identical guarantee this
+    // function exists to keep, so back off the orphaned carriage return.
+    let cut = if body[..cut].ends_with('\r') && body[cut..].starts_with('\n') {
+        cut - 1
+    } else {
+        cut
     };
     Some(&body[..cut])
 }
@@ -171,7 +185,14 @@ pub fn read_page(
         None => (body, false),
     };
     let shown_lines = lines_with_endings(shown).len();
-    let last_shown = first_line + shown_lines.saturating_sub(1);
+    // An empty file has no lines, so the last line shown is the one before the
+    // first — not the first. Without this an empty file reported
+    // `last_line: 1, total_lines: 0`, which is not a range that exists.
+    let last_shown = if shown_lines == 0 {
+        first_line.saturating_sub(1)
+    } else {
+        first_line + shown_lines - 1
+    };
     let whole_file = !truncated && first_line == 1 && last_line == total_lines;
 
     if whole_file {
@@ -357,5 +378,52 @@ mod tests {
         let page = read_page("a\nb\nc\n", Some(3), None, "read_file", "a.txt").expect("page");
         assert!(page.partial, "it is still not the whole file");
         assert_eq!(page.next_offset, None);
+    }
+
+    /// A cut landing between the two bytes of a CRLF must keep neither.
+    ///
+    /// Reachable when the first newline is past the cap — one very long
+    /// CRLF-terminated line — so the newline fallback has nothing to find and
+    /// the cut lands on the carriage return. A lone CR is not a line ending
+    /// anywhere on disk, and returning one breaks the byte-identical guarantee
+    /// the shown range is supposed to keep.
+    #[test]
+    fn a_cut_between_a_carriage_return_and_its_newline_keeps_neither() {
+        let body = format!("{}\r\nsecond line\r\n", "x".repeat(9));
+
+        let shown = truncate_for_read(&body, 10).expect("over the cap");
+
+        assert!(
+            !shown.ends_with('\r'),
+            "kept an orphaned carriage return: {shown:?}"
+        );
+        assert_eq!(shown, "x".repeat(9));
+    }
+
+    /// An empty file has no line 1, so it cannot be the last line shown.
+    #[test]
+    fn an_empty_file_reports_a_line_range_that_exists() {
+        let page = read_page("", None, None, "file_read", "empty.txt").expect("page");
+
+        assert_eq!(page.total_lines, 0);
+        assert_eq!(page.last_line, 0, "reported a line the file does not have");
+        assert!(!page.truncated);
+    }
+
+    /// An absurd offset fails loudly, never as a wrapped small line number.
+    ///
+    /// `usize::try_from` replaced an `as usize` cast that would truncate above
+    /// `usize::MAX`. On a 64-bit target the two are the same width so nothing
+    /// is lost either way — the cast was only lossy on 32-bit, which this app
+    /// does not ship. What is worth pinning on every target is the outcome the
+    /// cast was risking: a caller asking for an impossible line is told so,
+    /// rather than silently handed a different part of the file.
+    #[test]
+    fn an_absurd_offset_is_refused_rather_than_silently_reinterpreted() {
+        let error = read_page("one\ntwo\n", Some(usize::MAX), None, "file_read", "f.txt")
+            .expect_err("an offset past the end must fail");
+
+        assert!(error.contains("offset"), "got {error}");
+        assert!(error.contains("2 line"), "should name the real length: {error}");
     }
 }

@@ -35,6 +35,14 @@ pub const MAX_PAGE_BYTES: usize = MAX_READ_BYTES;
 /// other row on it.
 pub const MAX_FIELD_BYTES: usize = 4 * 1024;
 
+/// Bytes reserved from [`MAX_PAGE_BYTES`] for everything that is not a row.
+///
+/// The envelope's keys and numbers, the array brackets, and the `notice` — the
+/// largest single part, since it names the tool, the subject and three counts.
+/// Reserving generously costs at most one row on a full page; not reserving at
+/// all means the advertised budget is not the figure the client receives.
+const ENVELOPE_OVERHEAD_BYTES: usize = 512;
+
 /// A validated `offset` / `limit` pair, 1-based like the file read path.
 #[derive(Debug, Clone, Copy)]
 pub struct PageRequest {
@@ -144,9 +152,16 @@ fn page_envelope_of(
 
     let start = request.offset - 1;
     let mut page: Vec<Value> = Vec::new();
-    let mut bytes = 0usize;
+    // The budget is spent on the whole reply, not just the rows in it.
+    //
+    // Summing only `to_string(&row)` ignores the separating commas, the
+    // enclosing brackets, and the envelope's own keys and `notice` — so a page
+    // that measured exactly at the limit still went over it on the wire, and
+    // the 32 KB this module advertises was never the number a client received.
+    let mut bytes = ENVELOPE_OVERHEAD_BYTES;
     for row in rows.into_iter().take(request.limit) {
-        let size = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0);
+        // `+ 1` for the comma or closing bracket this row brings with it.
+        let size = serde_json::to_string(&row).map(|s| s.len()).unwrap_or(0) + 1;
         // Always emit the first row even when it alone busts the budget.
         // Otherwise a single oversized row would return an empty page whose
         // `next_offset` pointed back at itself, and a paging client would spin
