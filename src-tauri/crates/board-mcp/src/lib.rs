@@ -20,6 +20,7 @@
 
 pub mod ctx;
 pub mod jsonrpc;
+pub mod paging;
 pub mod protocol;
 pub mod registry;
 pub mod tools;

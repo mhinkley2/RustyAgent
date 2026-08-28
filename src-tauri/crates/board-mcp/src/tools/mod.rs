@@ -2,6 +2,28 @@
 //!
 //! Registration order is the order `tools/list` reports, so tools are grouped
 //! by area to keep that listing readable.
+//!
+//! ## Response size
+//!
+//! Every tool here answers into an external agent's context. The four that
+//! could return unbounded text are bounded: `read_file` by the shared
+//! [`tools::read_cap`] cap, and `get_run_events`, `get_chat_session_messages`
+//! and `list_directory` by [`crate::paging`]. `get_app_logs` returns a bounded
+//! tail by default.
+//!
+//! Still unbounded, audited and knowingly left alone rather than overlooked:
+//!
+//! * `get_run_diff` — one `diff_output` blob, which `commands::runs` itself
+//!   notes "can be arbitrarily large". The largest remaining hole on this
+//!   surface.
+//! * `list_stories` — the shared agent tool, which returns every story's full
+//!   `description`. Capping it changes the internal agent tool too, so it is
+//!   not a board-mcp-local fix.
+//! * `list_runs`, `list_agent_profiles`, `list_workspaces`,
+//!   `list_pending_approvals`, `list_pending_human_requests`,
+//!   `list_custom_tools`, `get_custom_tool_bindings` — fixed-shape rows with no
+//!   free-text column, bounded in practice by how many of each thing a user
+//!   creates.
 
 pub mod agents;
 pub mod board;

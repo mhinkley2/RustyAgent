@@ -5,8 +5,18 @@ use tools::ToolOutput;
 
 use crate::{
     mcp_tool,
+    paging::{paged_rows, page_request},
     registry::{json_ok, json_result, opt_i64_arg, opt_str_arg, str_arg},
 };
+
+/// Messages per page by default, and the ceiling on `limit`.
+///
+/// A chat session is not bounded in practice: it is exactly the shape that
+/// grows without limit, one long assistant reply at a time. The per-message
+/// `content` cap matters more than the row count here, since a single message
+/// can carry a pasted file.
+const MESSAGE_DEFAULT_LIMIT: usize = 50;
+const MESSAGE_MAX_LIMIT: usize = 200;
 
 mcp_tool! {
     pub ListChatSessionsTool,
@@ -33,19 +43,56 @@ mcp_tool! {
 mcp_tool! {
     pub GetChatSessionMessagesTool,
     name        = "get_chat_session_messages",
-    description = "Read every message in a chat session, oldest first.",
+    description = "Read the messages in a chat session, oldest first. The reply is paged: it \
+                   returns at most 50 messages by default (200 with an explicit `limit`), \
+                   stops early when the page would exceed 32 KB, and reports `total`, \
+                   `complete` and a `next_offset` to continue from. A `content` value longer \
+                   than 4 KB is cut and marked in place.",
     schema      = {
         "type": "object",
-        "properties": { "session_id": { "type": "string" } },
+        "properties": {
+            "session_id": { "type": "string" },
+            "offset": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based index of the first message to return. Defaults to 1."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum messages to return. Defaults to 50, clamped to 200."
+            }
+        },
         "required": ["session_id"]
     },
     |input, ctx| {
         let Some(session_id) = str_arg(&input, "session_id") else {
             return ToolOutput::err("Missing required field: session_id");
         };
-        json_result(
-            commands::chat_sessions::get_chat_session_messages(session_id, &ctx.db).await,
+        let request = match page_request(&input, MESSAGE_DEFAULT_LIMIT, MESSAGE_MAX_LIMIT) {
+            Ok(request) => request,
+            Err(error) => return ToolOutput::err(error),
+        };
+        let messages = match commands::chat_sessions::get_chat_session_messages(
+            session_id.clone(),
+            &ctx.db,
         )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(error) => return ToolOutput::err(error),
+        };
+        match paged_rows(
+            messages,
+            request,
+            "get_chat_session_messages",
+            "messages",
+            &format!("session '{session_id}'"),
+            &["content"],
+        ) {
+            Ok(envelope) => json_ok(envelope),
+            Err(error) => ToolOutput::err(error),
+        }
     }
 }
 

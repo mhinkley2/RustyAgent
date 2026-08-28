@@ -77,70 +77,11 @@ fn resolve_path(requested: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
 // file_read
 // ---------------------------------------------------------------------------
 
-/// Cap on the bytes a single `file_read` returns.
-///
-/// Mirrors `shell::MAX_OUTPUT_BYTES`, and for the same reason: tool output is
-/// appended to the conversation and re-sent on every subsequent turn, so one
-/// unbounded read of a lockfile, a minified bundle or a log can exhaust the
-/// context window by itself. The value is deliberately the same 32 KB, so the
-/// codebase has a single number for "more tool output than a turn can carry".
-const MAX_READ_BYTES: usize = 32 * 1024;
-
-/// Split `content` into lines that still carry their original terminator.
-///
-/// `str::lines` drops the terminator, and re-joining with "\n" would hand back
-/// a CRLF file as LF. That is not cosmetic: the text the model reads here is
-/// the text it quotes back as `file_edit`'s `old_string`, so a silent CRLF to
-/// LF conversion on the way out guarantees the byte-exact match on the way in
-/// will fail. `split_inclusive` keeps the bytes exactly as they are on disk.
-fn lines_with_endings(content: &str) -> Vec<&str> {
-    content.split_inclusive('\n').collect()
-}
-
-/// Read an optional 1-based positive integer parameter.
-fn optional_positive(input: &Value, key: &str) -> Result<Option<usize>, String> {
-    match input.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => match v.as_u64() {
-            Some(n) if n >= 1 => Ok(Some(n as usize)),
-            _ => Err(format!(
-                "Parameter '{key}' must be a positive integer (1-based line numbers); got {v}."
-            )),
-        },
-    }
-}
-
-/// Largest index `<= max` that is a UTF-8 character boundary in `s`.
-///
-/// Slicing a `str` at a fixed byte offset panics when the offset falls
-/// mid-codepoint, which any file containing non-ASCII text can trigger.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    let mut cut = max.min(s.len());
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    cut
-}
-
-/// Cap `body` at `MAX_READ_BYTES`, cutting on a line boundary when there is
-/// one. Returns `None` when `body` already fits.
-///
-/// The cut is moved back to the last newline inside the cap deliberately: half
-/// a line handed to the model is half a line it will later quote back as an
-/// `old_string` that does not exist on disk. A file with no newline at all in
-/// its first 32 KB — a minified bundle — has no line boundary to find, so the
-/// cut falls back to the nearest character boundary.
-fn truncate_for_read(body: &str) -> Option<&str> {
-    if body.len() <= MAX_READ_BYTES {
-        return None;
-    }
-    let head = &body[..floor_char_boundary(body, MAX_READ_BYTES)];
-    let cut = match head.rfind('\n') {
-        Some(i) => i + 1,
-        None => head.len(),
-    };
-    Some(&body[..cut])
-}
+// The cap, the paging semantics and the truncation marker all live in
+// `crate::read_cap`, shared with the outward-facing `read_file` MCP tool in
+// the board-mcp crate. Both hand file text to a model, so both need the same
+// numbers and the same marker; a second copy here is how the two would drift.
+use crate::read_cap::{optional_positive, read_page};
 
 pub struct FileReadTool;
 
@@ -217,72 +158,10 @@ impl Tool for FileReadTool {
             }
         };
 
-        let lines = lines_with_endings(&content);
-        let total_lines = lines.len();
-        let total_bytes = content.len();
-
-        // Select the requested line range as a byte slice of the original
-        // content, so what comes back is byte-identical to what is on disk.
-        let first_line = offset.unwrap_or(1);
-        // `.max(1)` so that an empty file reads back as empty rather than as an
-        // out-of-range error: it has no line 1, but asking for line 1 of it is
-        // not a mistake.
-        if first_line > total_lines.max(1) {
-            return ToolOutput::err(format!(
-                "Parameter 'offset' is {first_line} but '{requested}' has {total_lines} line(s)."
-            ));
+        match read_page(&content, offset, limit, self.name(), requested) {
+            Ok(page) => ToolOutput::ok(page.text),
+            Err(error) => ToolOutput::err(error),
         }
-        let last_line = match limit {
-            Some(n) => (first_line - 1 + n).min(total_lines),
-            None => total_lines,
-        };
-        let start: usize = lines[..first_line - 1].iter().map(|l| l.len()).sum();
-        let end: usize =
-            start + lines[first_line - 1..last_line].iter().map(|l| l.len()).sum::<usize>();
-        let body = &content[start..end];
-
-        let (shown, truncated) = match truncate_for_read(body) {
-            Some(head) => (head, true),
-            None => (body, false),
-        };
-        let shown_lines = lines_with_endings(shown).len();
-        let last_shown = first_line + shown_lines.saturating_sub(1);
-
-        if !truncated && first_line == 1 && last_line == total_lines {
-            return ToolOutput::ok(shown.to_string());
-        }
-
-        // Anything short of the whole file carries a marker. It is bracketed,
-        // prefixed with the tool name and phrased as a statement about the read
-        // rather than about the subject matter, so it cannot be mistaken for a
-        // line of the file.
-        let mut out = String::with_capacity(shown.len() + 256);
-        out.push_str(shown);
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        if truncated {
-            // What is left to fetch, which is what the reader is about to act
-            // on — not `total_bytes - shown.len()`. With an `offset`, `shown`
-            // starts at byte `start`, so that form counts the skipped prefix as
-            // outstanding and overstates the remainder by exactly the bytes
-            // already behind the reader.
-            let remaining = total_bytes.saturating_sub(start + shown.len());
-            out.push_str(&format!(
-                "\n[file_read TRUNCATED: the text above is NOT the complete file. \
-                 '{requested}' is {total_bytes} bytes / {total_lines} lines; this reply \
-                 carries lines {first_line}-{last_shown} ({} bytes) and {remaining} bytes \
-                 remain after it. Call file_read again with \"offset\": {} to continue.]",
-                shown.len(),
-                last_shown + 1,
-            ));
-        } else {
-            out.push_str(&format!(
-                "\n[file_read PARTIAL: the text above is lines {first_line}-{last_shown} of \
-                 {total_lines} in '{requested}', not the complete file.]"
-            ));
-        }
-        ToolOutput::ok(out)
     }
 }
 
@@ -600,6 +479,7 @@ impl Tool for FileListTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read_cap::MAX_READ_BYTES;
     use crate::test_support::{make_ctx, make_test_pool};
     use tempfile::TempDir;
 
