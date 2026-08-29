@@ -36,6 +36,11 @@ impl Tool for SendNotificationTool {
         // No sink means no desktop to deliver to — the stdio MCP binary, or a
         // test. Say so rather than returning ok: a model told the user was
         // notified will go on to reason as though the user knows.
+        //
+        // The body is logged here and not on the success path below, which is
+        // the opposite of how it reads at first glance: nothing else recorded
+        // it, because nothing delivered it, so this line is the only trace of
+        // what the agent tried to say.
         let Some(notifier) = ctx.notifier.as_ref() else {
             warn!("send_notification called with no notification sink [{title}]: {body}");
             return ToolOutput::err(
@@ -47,7 +52,11 @@ impl Tool for SendNotificationTool {
 
         match notifier.notify(NotificationCategory::Agent, title, &body).await {
             Ok(()) => {
-                info!("NOTIFICATION [{title}]: {body}");
+                // Title only. The body has just been handed to the OS and
+                // shown to the user; repeating it here would leave a durable
+                // copy, in a log file that outlives the toast, of text the
+                // user saw once and the model chose freely.
+                info!(body_len = body.len(), "Notification delivered [{title}]");
                 ToolOutput::ok(format!("Notification delivered: {title} — {body}"))
             }
             Err(reason) => {
