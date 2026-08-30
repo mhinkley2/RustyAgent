@@ -258,14 +258,6 @@ export function useStories(): UseStoriesReturn {
       // story announces a board change, and a poll may also be in flight, so
       // the list can already contain what this is about to add — an append
       // that did not check would show the new card twice.
-      // Append only if a refetch has not already brought it in. Creating a
-      // story announces a board change, and a poll may also be in flight, so
-      // the list can already contain what this is about to add — an append
-      // that did not check would show the new card twice.
-      // Append only if a refetch has not already brought it in. Creating a
-      // story announces a board change, and a poll may also be in flight, so
-      // the list can already contain what this is about to add — an append
-      // that did not check would show the new card twice.
       setStories(prev =>
         prev.some(s => s.id === story.id) ? prev : [...prev, story],
       );
