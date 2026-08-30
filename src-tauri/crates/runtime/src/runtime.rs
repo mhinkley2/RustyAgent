@@ -62,6 +62,25 @@ pub enum RunEvent {
     Cancelled { run_id: String },
     /// The run failed with an error.
     Failed { run_id: String, message: String },
+    /// A gated tool call is parked, waiting for the user to decide.
+    ///
+    /// The run is not making progress and will not resume on its own. Emitted
+    /// so a live view can say so; without it a parked run is indistinguishable
+    /// from a slow one.
+    AwaitingApproval {
+        run_id: String,
+        approval_request_id: String,
+        tool_name: String,
+    },
+    /// The parked tool call was answered and the run is moving again.
+    ApprovalResolved {
+        run_id: String,
+        approval_request_id: String,
+        tool_name: String,
+        approved: bool,
+        /// How the decision was reached — see `ApprovalOutcome`.
+        outcome: String,
+    },
     /// The conversation was compacted to fit the input budget.
     ///
     /// Emitted once per compaction, before the provider call it made room
@@ -84,6 +103,57 @@ pub enum RunEvent {
         /// summarisation call failed and it degraded to plain eviction.
         summarized: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Approval outcomes
+// ---------------------------------------------------------------------------
+
+/// How a gated tool call stopped waiting.
+///
+/// Three of these four are *not* approved, and the difference between them
+/// matters to whoever reads the record later: only `Denied` is a decision a
+/// user made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// The user approved the call.
+    Approved,
+    /// The user rejected the call.
+    Denied,
+    /// A configured `approval_timeout` elapsed with no answer.
+    Expired,
+    /// The gate entry was dropped without a decision — the app is shutting
+    /// down, or the run was torn down around it.
+    Abandoned,
+}
+
+impl ApprovalOutcome {
+    /// The value written to `approval_requests.status`, and carried on the
+    /// `ApprovalResolved` event.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "rejected",
+            Self::Expired => "expired",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// A sentence for the model and for `rejection_reason`.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::Approved => "the user approved it",
+            Self::Denied => "the user declined it",
+            Self::Expired => concat!(
+                "the approval request expired before anyone answered it; ",
+                "this is not a decision the user made",
+            ),
+            Self::Abandoned => concat!(
+                "the approval request was discarded before anyone answered it; ",
+                "this is not a decision the user made",
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +276,24 @@ pub struct ConversationRuntime {
     /// `total_input_tokens()` is the size of the context that was last sent,
     /// which is the figure a context budget has to be measured against.
     pub last_usage: Option<Usage>,
+
+    /// Where automatic notifications go, and how `send_notification` reaches
+    /// the desktop. `None` in tests and wherever no desktop exists.
+    ///
+    /// Defaulted rather than taken as a constructor argument, for the reason
+    /// given on `context_policy`: the constructors already carry nineteen
+    /// parameters. A runtime built without one still runs — it just cannot
+    /// call the user back.
+    pub notifier: Option<Arc<dyn tools::Notifier>>,
+
+    /// How long a gated tool call waits for the user before giving up.
+    ///
+    /// `None` — the default — waits indefinitely, which is the whole point of
+    /// the setting: an unattended run must survive the user walking away, and
+    /// a timeout that denies is a decision the user never made. A `Some` value
+    /// is honoured for anyone who would rather a run fail than sit parked, and
+    /// expiry is then recorded as `expired`, never as a rejection.
+    pub approval_timeout: Option<std::time::Duration>,
 
     /// How this profile wants an over-budget conversation handled.
     ///
@@ -330,6 +418,8 @@ impl ConversationRuntime {
             worktree: None,
             usage_total: Usage::default(),
             last_usage: None,
+            notifier: None,
+            approval_timeout: None,
             context_policy: ContextPolicy::default(),
             last_raw_estimate: None,
             estimate_scale: 1.0,
@@ -725,36 +815,65 @@ impl ConversationRuntime {
                     });
                     self.app.emit_event("approval-request-created", payload);
 
-                    // Wait up to 5 minutes for the user to decide.
-                    let decision = tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
-                        rx,
+                    // The run stops here until somebody answers. Say so on the
+                    // timeline and on the event bus, so a parked run reads as
+                    // parked rather than as one that has simply gone quiet.
+                    self.persist_event(
+                        "approval_request",
+                        &serde_json::json!({
+                            "approvalRequestId": approval_id,
+                            "toolName": call.name,
+                        }),
+                    )
+                    .await;
+                    self.emit(RunEvent::AwaitingApproval {
+                        run_id: self.run_id.clone(),
+                        approval_request_id: approval_id.clone(),
+                        tool_name: call.name.clone(),
+                    });
+
+                    // Reach the user directly rather than hoping the agent
+                    // chooses to call `send_notification`. This is the one
+                    // point in a run where nothing further happens until a
+                    // human acts, so it is the one that must travel.
+                    self.notify(
+                        tools::NotificationCategory::Approval,
+                        "Approval needed",
+                        &format!(
+                            "{} is waiting to run '{}'.",
+                            self.story_title().await,
+                            call.name
+                        ),
                     )
                     .await;
 
-                    let approved = match decision {
-                        Ok(Ok(v))  => v,
-                        Ok(Err(_)) => false, // sender dropped
-                        Err(_) => {
-                            // Timeout — clean up the in-memory entry.
-                            self.approval_gate.cancel(&approval_id);
-                            // Mark DB row as rejected-by-timeout.
-                            let _ = sqlx::query(
-                                "UPDATE approval_requests \
-                                 SET status = 'rejected', \
-                                     rejection_reason = 'Approval timed out after 5 minutes', \
-                                     decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                                 WHERE id = ?",
-                            )
-                            .bind(&approval_id)
-                            .execute(&self.db)
-                            .await;
-                            false
-                        }
-                    };
+                    let outcome = self.await_approval(&approval_id, rx).await;
+                    let approved = outcome == ApprovalOutcome::Approved;
+
+                    self.emit(RunEvent::ApprovalResolved {
+                        run_id: self.run_id.clone(),
+                        approval_request_id: approval_id.clone(),
+                        tool_name: call.name.clone(),
+                        approved,
+                        outcome: outcome.as_str().to_string(),
+                    });
+                    self.persist_event(
+                        "approval_response",
+                        &serde_json::json!({
+                            "approvalRequestId": approval_id,
+                            "toolName": call.name,
+                            "approved": approved,
+                            "outcome": outcome.as_str(),
+                        }),
+                    )
+                    .await;
 
                     if !approved {
-                        let msg = format!("Tool '{}' was not approved", call.name);
+                        let msg = format!(
+                            "Tool '{}' was not approved: {}",
+                            call.name,
+                            outcome.explanation()
+                        );
                         warn!(run_id = %self.run_id, "{msg}");
                         self.emit(RunEvent::ToolResult {
                             run_id: self.run_id.clone(),
@@ -781,6 +900,7 @@ impl ConversationRuntime {
 
             let ctx = ToolContext {
                 db: self.db.clone(),
+                notifier: self.notifier.clone(),
                 agent_profile_id: self.agent_profile_id.clone(),
                 run_id: self.run_id.clone(),
                 pipeline_run_id: self.pipeline_run_id.clone(),
@@ -1137,6 +1257,97 @@ impl ConversationRuntime {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Approvals
+    // -----------------------------------------------------------------------
+
+    /// Wait for the user's decision on a gated tool call.
+    ///
+    /// With no `approval_timeout` this waits for as long as it takes. That is
+    /// the behaviour the feature exists for: the old fixed five-minute limit
+    /// denied the call and failed the tool the moment the user stepped away,
+    /// which turned "nobody was watching" into "the user said no" — a decision
+    /// they never made, recorded against their name.
+    ///
+    /// Whatever ends the wait, the `approval_requests` row is left settled: a
+    /// row still reading `pending` with nothing waiting on it would sit in the
+    /// Approvals UI offering a decision that can no longer reach anything.
+    async fn await_approval(
+        &self,
+        approval_id: &str,
+        rx: tokio::sync::oneshot::Receiver<bool>,
+    ) -> ApprovalOutcome {
+        let decision = match self.approval_timeout {
+            Some(limit) => tokio::time::timeout(limit, rx).await,
+            None => Ok(rx.await),
+        };
+
+        match decision {
+            Ok(Ok(true)) => ApprovalOutcome::Approved,
+            Ok(Ok(false)) => ApprovalOutcome::Denied,
+            // The sender was dropped without a decision — the gate entry was
+            // cleared out from under us.
+            Ok(Err(_)) => {
+                self.settle_unanswered(approval_id, ApprovalOutcome::Abandoned).await;
+                ApprovalOutcome::Abandoned
+            }
+            Err(_) => {
+                self.approval_gate.cancel(approval_id);
+                self.settle_unanswered(approval_id, ApprovalOutcome::Expired).await;
+                ApprovalOutcome::Expired
+            }
+        }
+    }
+
+    /// Close out an approval nobody answered.
+    ///
+    /// The status is `expired`, not `rejected`. `rejected` means the user
+    /// looked at the request and said no; conflating the two makes an audit of
+    /// what a user actually refused unreadable, and it is the same conflation
+    /// that made the old timeout so misleading.
+    async fn settle_unanswered(&self, approval_id: &str, outcome: ApprovalOutcome) {
+        let _ = sqlx::query(
+            "UPDATE approval_requests \
+             SET status = ?, rejection_reason = ?, \
+                 decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ? AND status = 'pending'",
+        )
+        .bind(outcome.as_str())
+        .bind(outcome.explanation())
+        .bind(approval_id)
+        .execute(&self.db)
+        .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifications
+    // -----------------------------------------------------------------------
+
+    /// Best-effort call to the user, through whatever sink was injected.
+    ///
+    /// Failure is logged and dropped: a run must not fail because the OS
+    /// refused a toast, and a suppressed category reports itself as an error
+    /// here too. The one caller that must know whether delivery happened is
+    /// `send_notification`, which asks the sink directly.
+    async fn notify(&self, category: tools::NotificationCategory, title: &str, body: &str) {
+        let Some(notifier) = self.notifier.as_ref() else { return };
+        if let Err(e) = notifier.notify(category, title, body).await {
+            debug!(run_id = %self.run_id, "Notification not delivered: {e}");
+        }
+    }
+
+    /// The story's title, for a notification body that says which work it is
+    /// about. Falls back to a generic phrase rather than failing the caller.
+    async fn story_title(&self) -> String {
+        sqlx::query_scalar::<_, String>("SELECT title FROM stories WHERE id = ?")
+            .bind(&self.story_id)
+            .fetch_optional(&self.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "A RustyAgent run".to_string())
+    }
+
     /// Persist a run event to the `run_events` table.
     ///
     /// Non-critical event types (`message`, `tool_call`, `tool_result`, `thought`) are
@@ -1336,6 +1547,35 @@ impl ConversationRuntime {
 
         if self.event_retention_runs > 0 {
             self.prune_old_run_events().await;
+        }
+
+        // Tell the user the run is over. Not on `cancelled`: the user stopped
+        // it themselves, so they are at the desk and already know.
+        //
+        // One notification per run, at the end — never per token or per tool
+        // call. A stream of toasts gets the whole feature muted, and a muted
+        // feature is exactly today's behaviour.
+        let title = self.story_title().await;
+        // `done`, not `completed` — see migration 20260410000016, which had to
+        // repair exactly that drift once already.
+        match status {
+            "done" => {
+                self.notify(
+                    tools::NotificationCategory::RunCompleted,
+                    "Run finished",
+                    &format!("{title} completed after {iterations} iterations."),
+                )
+                .await;
+            }
+            "failed" => {
+                self.notify(
+                    tools::NotificationCategory::RunFailed,
+                    "Run failed",
+                    &format!("{title} failed after {iterations} iterations."),
+                )
+                .await;
+            }
+            _ => {}
         }
     }
 

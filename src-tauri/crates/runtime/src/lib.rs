@@ -1,6 +1,7 @@
 pub mod approval_gate;
 pub mod context;
 pub mod git;
+pub mod notifier;
 pub mod permission;
 pub mod runtime;
 pub mod worktree;
@@ -21,7 +22,8 @@ mod runtime_tests;
 mod worktree_tests;
 
 pub use approval_gate::ApprovalGate;
+pub use notifier::AppNotifier;
 pub use context::{ContextPolicy, ContextStrategy};
 pub use permission::{PermissionPolicy, PolicyDecision, ToolRequest};
-pub use runtime::{CancelFlag, ConversationRuntime, RunEvent};
+pub use runtime::{ApprovalOutcome, CancelFlag, ConversationRuntime, RunEvent};
 pub use worktree::{Isolation, RunWorktree};

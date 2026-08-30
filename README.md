@@ -73,6 +73,29 @@ The variable is read from the launching environment, so `npm run tauri dev`
 picks up a shell export but a release build started from the desktop will not.
 That is deliberate: the default has to stay correct for normal users.
 
+## Unattended runs
+
+A run is meant to survive you walking away from it, which takes two things.
+
+**It calls you back.** Desktop notifications are raised once when a run
+finishes, once when it fails, and once when a gated tool call is waiting on
+your decision — never per token or per tool call. Agents can also raise one
+through the `send_notification` tool. Every category has its own switch under
+Settings → Notifications, beneath a master toggle. A notification that could
+not be delivered — permission refused, or a category switched off — is
+reported to the agent as a failure rather than as success, so a model is never
+told you know something you do not.
+
+**It waits rather than fail-closing.** A tool call that needs approval parks
+the run until you answer, for as long as that takes; the timeline, the run
+detail view and a notification all say the run is parked. Set an *approval
+timeout* in Settings if you would rather a run end than sit waiting. Expiry is
+recorded on the request as `expired`, never as `rejected`: only a decision you
+actually made is written down as one.
+
+The run detail view follows a run live, so an autonomous run can be watched
+while it works instead of only after it stops.
+
 ## MCP Server
 
 RustyAgent exposes its board, run history, agent configuration, and workspace

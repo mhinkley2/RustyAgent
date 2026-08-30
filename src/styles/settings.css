@@ -129,6 +129,50 @@
   line-height: 1.4;
 }
 
+/* ── Toggle ───────────────────────────────────────────────────────────────── */
+
+.settings-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  margin-bottom: 0.9rem;
+}
+
+.settings-toggle__input {
+  margin-top: 0.15rem;
+  flex-shrink: 0;
+  accent-color: var(--color-primary, #6366f1);
+  cursor: pointer;
+}
+
+.settings-toggle__label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  cursor: pointer;
+}
+
+.settings-toggle__title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-secondary, var(--text-primary));
+}
+
+.settings-toggle__hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* A category switched off by the master toggle still shows its own state —
+   dimmed rather than hidden, so turning notifications back on does not look
+   like it reset every preference underneath. */
+.settings-toggle--disabled .settings-toggle__input,
+.settings-toggle--disabled .settings-toggle__label {
+  cursor: default;
+  opacity: 0.5;
+}
+
 /* ── Save bar ─────────────────────────────────────────────────────────────── */
 
 .settings-save-bar {

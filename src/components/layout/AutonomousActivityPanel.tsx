@@ -25,6 +25,78 @@ interface RawEvent {
   is_error: boolean;
 }
 
+/**
+ * The `run-event` payload — `runtime::RunEvent` under its `type` tag.
+ *
+ * Only the variants that change what an agent is visibly doing are spelled
+ * out; anything else lands in the catch-all and is ignored.
+ */
+type LiveRunEvent =
+  | { type: "token"; run_id: string; content: string }
+  | { type: "tool_call"; run_id: string; tool_name: string }
+  | { type: "tool_result"; run_id: string; tool_name: string; is_error: boolean }
+  | { type: "awaiting_approval"; run_id: string; tool_name: string }
+  | { type: "failed"; run_id: string; message: string }
+  | { type: "complete" | "cancelled" | "context_compacted" | "approval_resolved"; run_id: string };
+
+/**
+ * Shape a live event like the `run_events` row this panel used to poll for, so
+ * `summarizeAction` keeps working off one representation either way.
+ */
+function liveEventToLastAction(event: LiveRunEvent): RawEvent | null {
+  const base = { role: null, content: null, tool_name: null, is_error: false };
+  switch (event.type) {
+    case "token":
+      return { ...base, event_type: "message", role: "assistant", content: event.content };
+    case "tool_call":
+      return { ...base, event_type: "tool_call", tool_name: event.tool_name };
+    case "tool_result":
+      return {
+        ...base,
+        event_type: "tool_result",
+        tool_name: event.tool_name,
+        is_error: event.is_error,
+      };
+    case "awaiting_approval":
+      return {
+        ...base,
+        event_type: "approval_request",
+        tool_name: event.tool_name,
+        content: `Waiting for approval to run '${event.tool_name}'`,
+      };
+    case "failed":
+      return { ...base, event_type: "error", content: event.message, is_error: true };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Record `row` as what `runId` is doing, unless it cannot change what is shown.
+ *
+ * `summarizeAction` renders every assistant message as the same "Drafting
+ * response" label, so the second and later tokens of a reply produce an
+ * identical panel. Returning the previous map by reference lets React skip the
+ * re-render entirely, which matters because tokens arrive by the thousand.
+ *
+ * Exported for its own test: the guard is invisible from the rendered output —
+ * that is the point of it.
+ */
+export function mergeLastAction(
+  prev: Record<string, RawEvent | null>,
+  runId: string,
+  row: RawEvent,
+): Record<string, RawEvent | null> {
+  const current = prev[runId];
+  const bothAssistantText =
+    row.event_type === "message" &&
+    row.role === "assistant" &&
+    current?.event_type === "message" &&
+    current.role === "assistant";
+
+  return bothAssistantText ? prev : { ...prev, [runId]: row };
+}
+
 interface ActivityRow {
   id: string;
   agentName: string;
@@ -36,6 +108,15 @@ interface ActivityRow {
   isActive: boolean;
 }
 
+/**
+ * How often the run *list* is refetched.
+ *
+ * Every four seconds this used to also fetch the full event log of up to ten
+ * running runs, to read one row off the end of each. The `run-event`
+ * subscription below delivers that same row as it happens, so what is left on
+ * the timer is a single cheap query — kept only because a run's status and its
+ * elapsed time change without any event announcing it.
+ */
 const POLL_INTERVAL_MS = 4000;
 
 function elapsedLabel(startedAtIso: string | null): string {
@@ -108,58 +189,71 @@ export default function AutonomousActivityPanel() {
     return map;
   }, [profiles]);
 
-  const refresh = useCallback(async () => {
-    if (inFlightRef.current) return;
-    inFlightRef.current = true;
-    setRefreshing(true);
-    try {
-      const runList = await invoke<RawRun[]>("get_runs", { filters: null });
-      const sorted = [...runList].sort(
-        (a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime(),
-      );
-      setRuns(sorted);
+  /**
+   * Fetch the run list, and optionally seed each active run's last action.
+   *
+   * `withEvents` is for the cases where there is nothing to subscribe to yet:
+   * the panel has just mounted, or the workspace changed underneath it, and
+   * the runs already in flight emitted their events before anyone was
+   * listening. Steady-state updates arrive through the subscription instead.
+   */
+  const refresh = useCallback(
+    async (withEvents = false) => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      setRefreshing(true);
+      try {
+        const runList = await invoke<RawRun[]>("get_runs", { filters: null });
+        const sorted = [...runList].sort(
+          (a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime(),
+        );
+        setRuns(sorted);
 
-      const activeRunIds = new Set(
-        Object.values(statuses)
-          .map((s) => s.activeRunId)
-          .filter((id): id is string => Boolean(id)),
-      );
+        if (!withEvents) return;
 
-      const targetRunIds: string[] = [];
-      for (const run of sorted) {
-        if (run.status === "running" || activeRunIds.has(run.id)) {
-          targetRunIds.push(run.id);
-        }
-        if (targetRunIds.length >= 10) break;
-      }
+        const activeRunIds = new Set(
+          Object.values(statuses)
+            .map((s) => s.activeRunId)
+            .filter((id): id is string => Boolean(id)),
+        );
 
-      const eventEntries = await Promise.all(
-        targetRunIds.map(async (runId) => {
-          try {
-            const events = await invoke<RawEvent[]>("get_run_events", { runId });
-            return [runId, events.length > 0 ? events[events.length - 1] : null] as const;
-          } catch {
-            return [runId, null] as const;
+        const targetRunIds: string[] = [];
+        for (const run of sorted) {
+          if (run.status === "running" || activeRunIds.has(run.id)) {
+            targetRunIds.push(run.id);
           }
-        }),
-      );
-
-      setLatestEvents((prev) => {
-        const next = { ...prev };
-        for (const [runId, evt] of eventEntries) {
-          next[runId] = evt;
+          if (targetRunIds.length >= 10) break;
         }
-        return next;
-      });
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-      inFlightRef.current = false;
-    }
-  }, [statuses]);
+
+        const eventEntries = await Promise.all(
+          targetRunIds.map(async (runId) => {
+            try {
+              const events = await invoke<RawEvent[]>("get_run_events", { runId });
+              return [runId, events.length > 0 ? events[events.length - 1] : null] as const;
+            } catch {
+              return [runId, null] as const;
+            }
+          }),
+        );
+
+        setLatestEvents((prev) => {
+          const next = { ...prev };
+          for (const [runId, evt] of eventEntries) {
+            next[runId] = evt;
+          }
+          return next;
+        });
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+        inFlightRef.current = false;
+      }
+    },
+    [statuses],
+  );
 
   useEffect(() => {
-    void refresh();
+    void refresh(true);
   }, [refresh]);
 
   useEffect(() => {
@@ -167,12 +261,42 @@ export default function AutonomousActivityPanel() {
       void refresh();
     }, POLL_INTERVAL_MS);
     const unlisten = listen("workspace-changed", () => {
-      void refresh();
+      void refresh(true);
     });
 
     return () => {
       clearInterval(timer);
       unlisten.then((fn) => fn());
+    };
+  }, [refresh]);
+
+  // What each active run is doing, as it does it.
+  //
+  // The panel used to learn this by refetching every running run's whole event
+  // log every four seconds and keeping the last row. The same row arrives here
+  // the moment it is produced, for the cost of one subscription.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    void listen<LiveRunEvent>("run-event", ({ payload }) => {
+      const row = liveEventToLastAction(payload);
+      if (row) {
+        setLatestEvents((prev) => mergeLastAction(prev, payload.run_id, row));
+      }
+      // A run reaching a terminal state changes the list, not just the row:
+      // its status, its position, and whether it is still counted as active.
+      if (payload.type === "complete" || payload.type === "failed" || payload.type === "cancelled") {
+        void refresh();
+      }
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
   }, [refresh]);
 

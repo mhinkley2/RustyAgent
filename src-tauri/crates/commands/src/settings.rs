@@ -32,6 +32,22 @@ pub struct AppSettings {
     /// precedence; `pipeline::DEFAULT_MAX_PARALLEL_STEPS` applies when neither
     /// is set.
     pub max_parallel_steps: Option<u32>,
+
+    /// Which notifications the user wants delivered.
+    ///
+    /// The type is `tools::NotificationSettings` rather than a local copy
+    /// because `runtime::AppNotifier` reads this same field back out of
+    /// `settings.json` to decide whether to deliver.
+    #[serde(default)]
+    pub notifications: tools::NotificationSettings,
+
+    /// How long a gated tool call waits for a decision, in seconds.
+    ///
+    /// `None` — the default — waits indefinitely, so an unattended run parks
+    /// until the user comes back instead of failing the call five minutes
+    /// after they leave. A value is for anyone who would rather a run end than
+    /// sit parked; expiry is recorded as `expired`, never as a rejection.
+    pub approval_timeout_secs: Option<u64>,
 }
 
 impl AppSettings {
@@ -64,6 +80,16 @@ impl AppSettings {
             .map_err(|e| format!("Serialize error: {e}"))?;
         std::fs::write(path, json)
             .map_err(|e| format!("Cannot write settings.json: {e}"))
+    }
+
+    /// How long the approval gate should wait, as a `Duration`.
+    ///
+    /// `None` means wait indefinitely. Zero is treated as "no wait configured"
+    /// rather than "expire immediately": a zero-second gate would deny every
+    /// gated call the instant it was raised, which is a footgun with no use
+    /// case, and almost certainly a cleared input field.
+    pub fn approval_timeout(&self) -> Option<std::time::Duration> {
+        tools::approval_timeout_from_secs(self.approval_timeout_secs)
     }
 
     /// Convenience: strip empty strings to None.
@@ -142,4 +168,52 @@ pub async fn save_workspace_settings(
     .await
     .map_err(|e| format!("DB error: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `runtime::AppNotifier` reads `settings.json` back with its own struct
+    /// carrying only a `notifications` field, because `runtime` cannot depend
+    /// on this crate. That makes the *key name* a contract between the two,
+    /// and nothing else would fail if it were renamed here — the notifier
+    /// would simply fall back to defaults and quietly ignore the user's
+    /// preferences.
+    #[test]
+    fn notification_settings_serialize_under_the_key_the_notifier_reads() {
+        let json = serde_json::to_value(AppSettings::default()).expect("serialize");
+        let notifications = json
+            .get("notifications")
+            .expect("AppSettings must expose notification preferences as `notifications`");
+        assert_eq!(notifications["enabled"], serde_json::json!(true));
+        assert_eq!(notifications["onApproval"], serde_json::json!(true));
+    }
+
+    /// A settings file written before notifications existed must not read as
+    /// "the user turned everything off".
+    #[test]
+    fn settings_without_notifications_default_to_on() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"anthropic_api_key":"sk-ant-x"}"#).expect("parse");
+        assert!(settings.notifications.enabled);
+        assert!(settings.notifications.allows(tools::NotificationCategory::Approval));
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_waiting_indefinitely() {
+        assert_eq!(AppSettings::default().approval_timeout(), None);
+    }
+
+    #[test]
+    fn zero_approval_timeout_is_read_as_unset_not_as_instant_expiry() {
+        let settings = AppSettings { approval_timeout_secs: Some(0), ..Default::default() };
+        assert_eq!(settings.approval_timeout(), None);
+    }
+
+    #[test]
+    fn a_configured_approval_timeout_is_honoured() {
+        let settings = AppSettings { approval_timeout_secs: Some(900), ..Default::default() };
+        assert_eq!(settings.approval_timeout(), Some(std::time::Duration::from_secs(900)));
+    }
 }

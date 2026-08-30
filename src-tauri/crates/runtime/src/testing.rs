@@ -85,3 +85,72 @@ impl EventSink for RecordingSink {
             .push((name.to_string(), payload));
     }
 }
+
+/// A [`tools::Notifier`] that records deliveries instead of raising toasts.
+///
+/// Also stands in for a desktop that refuses: [`RecordingNotifier::refusing`]
+/// fails every delivery, which is how a test can check that a caller neither
+/// crashes nor pretends the user was reached.
+#[derive(Clone)]
+pub struct RecordingNotifier {
+    delivered: Arc<Mutex<Vec<(tools::NotificationCategory, String, String)>>>,
+    outcome: Result<(), String>,
+}
+
+impl Default for RecordingNotifier {
+    fn default() -> Self {
+        Self {
+            delivered: Arc::new(Mutex::new(Vec::new())),
+            outcome: Ok(()),
+        }
+    }
+}
+
+impl RecordingNotifier {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A sink whose every delivery fails with `reason`.
+    pub fn refusing(reason: &str) -> Self {
+        Self {
+            outcome: Err(reason.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// Wrap for `ConversationRuntime::notifier`; the clone still observes.
+    pub fn handle(&self) -> Arc<dyn tools::Notifier> {
+        Arc::new(self.clone())
+    }
+
+    /// Every delivery attempted, in order.
+    pub fn delivered(&self) -> Vec<(tools::NotificationCategory, String, String)> {
+        self.delivered.lock().expect("notifier poisoned").clone()
+    }
+
+    /// Deliveries in one category.
+    pub fn in_category(&self, category: tools::NotificationCategory) -> Vec<(String, String)> {
+        self.delivered()
+            .into_iter()
+            .filter(|(c, _, _)| *c == category)
+            .map(|(_, t, b)| (t, b))
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl tools::Notifier for RecordingNotifier {
+    async fn notify(
+        &self,
+        category: tools::NotificationCategory,
+        title: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        self.delivered
+            .lock()
+            .expect("notifier poisoned")
+            .push((category, title.to_string(), body.to_string()));
+        self.outcome.clone()
+    }
+}

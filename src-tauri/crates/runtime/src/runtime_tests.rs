@@ -23,7 +23,7 @@ use tools::{Tool, ToolContext, ToolOutput, ToolPermissionInfo, ToolRegistry};
 use crate::approval_gate::ApprovalGate;
 use crate::context::{ContextPolicy, SUMMARY_PREFIX};
 use crate::runtime::{CancelFlag, ConversationRuntime, RunEvent};
-use crate::testing::RecordingSink;
+use crate::testing::{RecordingNotifier, RecordingSink};
 use crate::PermissionPolicy;
 
 // ---------------------------------------------------------------------------
@@ -121,6 +121,10 @@ struct Harness {
     event_retention_runs: u32,
     context_policy: ContextPolicy,
     workspace_root: Option<std::path::PathBuf>,
+    /// How long the approval gate waits. `None` — the default — waits for as
+    /// long as it takes.
+    approval_timeout: Option<std::time::Duration>,
+    notifier: RecordingNotifier,
 }
 
 impl Harness {
@@ -149,6 +153,8 @@ impl Harness {
             event_retention_runs: 0,
             context_policy: ContextPolicy::default(),
             workspace_root: None,
+            approval_timeout: None,
+            notifier: RecordingNotifier::new(),
         }
     }
 
@@ -180,6 +186,8 @@ impl Harness {
         .await
         .expect("build runtime");
         rt.context_policy = self.context_policy;
+        rt.approval_timeout = self.approval_timeout;
+        rt.notifier = Some(self.notifier.handle());
         rt
     }
 
@@ -874,6 +882,180 @@ async fn a_write_tool_requiring_approval_blocks_until_the_gate_is_resolved() {
 
     assert_eq!(calls.lock().unwrap().len(), 1, "tool should run once approved");
     assert_eq!(h.status(&run_id).await, "done");
+}
+
+/// Move tokio's clock forward without waiting, and without leaving it paused:
+/// the SQLite pool arms its own acquire timeout on the same clock, and a
+/// paused clock outside this window makes the harness fail to connect at all.
+async fn advance(by: std::time::Duration) {
+    tokio::time::pause();
+    tokio::time::advance(by).await;
+    tokio::time::resume();
+}
+
+/// Read one approval request's status and reason.
+async fn approval_row(db: &DbPool, id: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT status, rejection_reason FROM approval_requests WHERE id = ?")
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .expect("fetch approval row")
+}
+
+/// The defect this replaced: the gate waited `timeout(300s, rx)` and treated
+/// expiry as "not approved", so every gated call failed five minutes after the
+/// user stepped away — and the row said `rejected`, as though they had decided.
+///
+/// The hour is advanced on tokio's clock rather than waited out, so the test
+/// is authoritative rather than merely slow: a five-minute limit still in that
+/// path would fire twelve times over. The clock is paused only around the
+/// wait — pausing for the whole test expires the SQLite pool's own acquire
+/// timeout before the harness can open a connection.
+#[tokio::test]
+async fn an_unanswered_approval_parks_the_run_instead_of_denying_it() {
+    let tool = StubTool::new("file_write", "written");
+    let calls = tool.calls();
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_write", json!({ "path": "a.txt" })),
+        MockResponse::text("saved"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.policy = approval_policy();
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let runner = tokio::spawn(async move { rt.run().await });
+
+    let approval_id = await_approval_id(&h.db).await;
+    advance(std::time::Duration::from_secs(3600)).await;
+
+    let (status, _) = approval_row(&h.db, &approval_id).await;
+    assert_eq!(status, "pending", "an hour of nobody answering is not a decision");
+    assert!(calls.lock().unwrap().is_empty(), "the tool must not have run");
+    assert!(!runner.is_finished(), "the run must still be parked, not failed");
+
+    // And it is still answerable whenever the user does come back.
+    assert!(h.gate.resolve(&approval_id, true));
+    runner.await.expect("join").expect("run");
+
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(h.status(&run_id).await, "done");
+}
+
+/// A parked run is not a silent one: the timeline, the event bus and the user
+/// are all told, because nothing further happens until somebody acts.
+#[tokio::test]
+async fn parking_on_an_approval_is_announced_on_every_channel() {
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_write", json!({ "path": "a.txt" })),
+        MockResponse::text("saved"),
+    ])
+    .await
+    .with_tool(Box::new(StubTool::new("file_write", "written")))
+    .await;
+    h.policy = approval_policy();
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let runner = tokio::spawn(async move { rt.run().await });
+
+    let approval_id = await_approval_id(&h.db).await;
+    assert!(h.gate.resolve(&approval_id, true));
+    runner.await.expect("join").expect("run");
+
+    let kinds = h.sink.kinds();
+    assert!(
+        kinds.contains(&"awaiting_approval".to_string()),
+        "a live view cannot tell a parked run from a slow one without this: {kinds:?}"
+    );
+    assert!(kinds.contains(&"approval_resolved".to_string()), "{kinds:?}");
+
+    let types: Vec<String> = h.events(&run_id).await.into_iter().map(|(t, _)| t).collect();
+    assert!(types.contains(&"approval_request".to_string()), "{types:?}");
+    assert!(types.contains(&"approval_response".to_string()), "{types:?}");
+
+    let notified = h.notifier.in_category(tools::NotificationCategory::Approval);
+    assert_eq!(notified.len(), 1, "the user is told once, not per poll");
+    assert!(notified[0].1.contains("file_write"), "{:?}", notified[0]);
+}
+
+/// Someone who would rather a run end than sit parked can set a limit. Expiry
+/// is then recorded as `expired` — never as a rejection, which is a claim
+/// about what a user decided.
+#[tokio::test]
+async fn a_configured_approval_timeout_expires_without_recording_a_user_decision() {
+    let tool = StubTool::new("file_write", "SHOULD NOT RUN");
+    let calls = tool.calls();
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_write", json!({ "path": "a.txt" })),
+        MockResponse::text("understood"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.policy = approval_policy();
+    h.approval_timeout = Some(std::time::Duration::from_secs(60));
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let runner = tokio::spawn(async move { rt.run().await });
+
+    let approval_id = await_approval_id(&h.db).await;
+    advance(std::time::Duration::from_secs(61)).await;
+    runner.await.expect("join").expect("run");
+
+    let (status, reason) = approval_row(&h.db, &approval_id).await;
+    assert_eq!(status, "expired", "expiry must not be spelled `rejected`");
+    let reason = reason.expect("an expired request explains itself");
+    assert!(
+        reason.contains("not a decision the user made"),
+        "the record must not read as a refusal: {reason}"
+    );
+    assert!(calls.lock().unwrap().is_empty(), "the tool must not run");
+    assert_eq!(h.status(&run_id).await, "done", "the run carries on past a refused tool");
+}
+
+/// The run ends; the user finds out. Once — a notification per token or per
+/// tool call gets the whole feature muted.
+#[tokio::test]
+async fn a_finished_run_notifies_the_user_exactly_once() {
+    let h = Harness::new(vec![MockResponse::text("all done")]).await;
+
+    h.run().await;
+
+    assert_eq!(
+        h.notifier.in_category(tools::NotificationCategory::RunCompleted).len(),
+        1
+    );
+    assert!(h.notifier.in_category(tools::NotificationCategory::RunFailed).is_empty());
+}
+
+/// A user who stopped the run themselves is at the desk and does not need
+/// telling.
+#[tokio::test]
+async fn a_cancelled_run_does_not_notify() {
+    let h = Harness::new(vec![MockResponse::text("never reached")]).await;
+    h.cancel.cancel();
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "cancelled");
+    assert!(h.notifier.delivered().is_empty(), "{:?}", h.notifier.delivered());
+}
+
+/// A desktop that refuses to show a notification must not take the run down
+/// with it.
+#[tokio::test]
+async fn a_refused_notification_does_not_fail_the_run() {
+    let mut h = Harness::new(vec![MockResponse::text("all done")]).await;
+    h.notifier = RecordingNotifier::refusing("Notifications are turned off in Settings.");
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert_eq!(h.notifier.delivered().len(), 1, "it was attempted");
 }
 
 #[tokio::test]

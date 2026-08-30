@@ -31,6 +31,115 @@ pub type SpawnSubtaskFn = Arc<
     + Sync,
 >;
 
+// ---------------------------------------------------------------------------
+// Notification sink
+// ---------------------------------------------------------------------------
+
+/// Delivers an OS notification on behalf of a tool.
+///
+/// Injected rather than called directly because this crate cannot depend on
+/// Tauri: the standalone `rustyagent-board-mcp` binary links `tools` without an
+/// app to deliver through, and so supplies `None`. A tool that finds `None`
+/// must report that it could not notify — see `SendNotificationTool`.
+#[async_trait]
+pub trait Notifier: Send + Sync + 'static {
+    /// Deliver `title`/`body`, or return why it could not be delivered.
+    ///
+    /// The error string is shown to the model, so it should say what went
+    /// wrong in terms the model can act on ("permission refused" rather than a
+    /// plugin error code).
+    ///
+    /// `category` is what the user's per-category preferences are keyed on, so
+    /// suppression lives in the implementation rather than at each call site —
+    /// one place to get right, and the same answer for an agent-initiated
+    /// notification as for an automatic one.
+    async fn notify(
+        &self,
+        category: NotificationCategory,
+        title: &str,
+        body: &str,
+    ) -> Result<(), String>;
+}
+
+/// The user's notification preferences.
+///
+/// Lives here, beside [`NotificationCategory`], so the switch and the thing it
+/// switches cannot drift apart: `commands::AppSettings` stores this type
+/// verbatim and `runtime::AppNotifier` reads the same one back.
+///
+/// Every field defaults to on. Notifications are the whole point of an
+/// unattended run — a default-off delivery path is the stub this replaced,
+/// only with a settings screen in front of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NotificationSettings {
+    /// Master switch. Off suppresses every category.
+    pub enabled: bool,
+    /// A gated tool call is waiting on the user.
+    pub on_approval: bool,
+    /// A run ended in `failed`.
+    pub on_run_failed: bool,
+    /// A run ended in `done`.
+    pub on_run_completed: bool,
+    /// An agent called `send_notification` itself.
+    pub on_agent_request: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            on_approval: true,
+            on_run_failed: true,
+            on_run_completed: true,
+            on_agent_request: true,
+        }
+    }
+}
+
+impl NotificationSettings {
+    /// Whether a delivery in `category` should go out.
+    pub fn allows(&self, category: NotificationCategory) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match category {
+            NotificationCategory::Agent => self.on_agent_request,
+            NotificationCategory::Approval => self.on_approval,
+            NotificationCategory::RunFailed => self.on_run_failed,
+            NotificationCategory::RunCompleted => self.on_run_completed,
+        }
+    }
+}
+
+/// Interpret a configured approval-timeout value.
+///
+/// `None` — and zero — mean "wait indefinitely". Zero is not "expire
+/// immediately": a zero-second gate would deny every gated call the instant it
+/// was raised, which has no use case and is almost certainly a cleared input
+/// field.
+///
+/// Lives here because two crates read the same setting: `commands::AppSettings`
+/// exposes it to the UI, and `runtime` reads it back out of `settings.json`
+/// where it cannot see `commands`. One rule, both readers.
+pub fn approval_timeout_from_secs(secs: Option<u64>) -> Option<std::time::Duration> {
+    secs.filter(|s| *s > 0).map(std::time::Duration::from_secs)
+}
+
+/// Which switch in the user's notification preferences governs a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationCategory {
+    /// An agent called `send_notification` itself.
+    Agent,
+    /// A tool call is gated and the run is parked until the user decides.
+    Approval,
+    /// A run reached `failed`.
+    RunFailed,
+    /// A run reached `completed`.
+    RunCompleted,
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub db: DbPool,
@@ -47,6 +156,9 @@ pub struct ToolContext {
     /// Workspace root directory. File tools are confined to this path.
     /// When None, file access is unrestricted (not recommended for production).
     pub workspace_root: Option<std::path::PathBuf>,
+    /// How `send_notification` reaches the desktop. `None` where no desktop
+    /// exists to reach — the stdio MCP binary, and most tests.
+    pub notifier: Option<Arc<dyn Notifier>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +330,7 @@ pub(crate) mod test_support {
             pipeline_depth: 0,
             spawn_subtask: None,
             workspace_root: None,
+            notifier: None,
         }
     }
 }
