@@ -239,7 +239,14 @@ export default function AutonomousActivityPanel() {
         setLatestEvents((prev) => {
           const next = { ...prev };
           for (const [runId, evt] of eventEntries) {
-            next[runId] = evt;
+            // Seed only what there is nothing for yet. This fetch started
+            // before it resolved, so anything the subscription delivered in
+            // the meantime is newer than what came back — and for a run that
+            // has only just started, what came back is `null`, which would
+            // blank a tool call that had already arrived.
+            if (!(runId in next)) {
+              next[runId] = evt;
+            }
           }
           return next;
         });
@@ -261,6 +268,9 @@ export default function AutonomousActivityPanel() {
       void refresh();
     }, POLL_INTERVAL_MS);
     const unlisten = listen("workspace-changed", () => {
+      // Drop what the old workspace's runs were doing, so the reseed below is
+      // filling an empty map rather than being skipped by the guard above.
+      setLatestEvents({});
       void refresh(true);
     });
 

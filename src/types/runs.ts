@@ -15,6 +15,16 @@ export type RunEventType =
   /** History was dropped to keep the request inside the model's input budget. */
   | "context_compacted"
   /**
+   * The run moved its story's card off `in_progress`, and this says where to
+   * and why. Written by all three paths that move a card on their own — a run
+   * finishing, a pipeline finishing, and the startup sweep — so a card that
+   * moves is always attributable to the run that moved it.
+   *
+   * Distinct from `interrupted`, which says the *run* was ended by a restart.
+   * A swept run carries both: what happened to it, and what became of its card.
+   */
+  | "story_status"
+  /**
    * The app exited while the run was still executing, and the startup sweep
    * closed the run out. Written only by `db::recovery::reconcile_orphaned_runs`
    * — the run itself was never there to write it.

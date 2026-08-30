@@ -14,6 +14,7 @@ pub mod paths;
 /// Startup reconciliation of runs and approvals a previous session left
 /// mid-flight, plus the per-process id that makes it safe.
 pub mod recovery;
+pub mod story_status;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -61,6 +61,11 @@ pub const INTERRUPTED_APPROVAL_REASON: &str =
     "Denied automatically: RustyAgent restarted while this request was pending. The run \
      waiting on the decision is gone, so approving it would have executed nothing.";
 
+/// What a swept run's `story_status` event gives as its reason.
+pub const INTERRUPTED_TRANSITION_REASON: &str =
+    "RustyAgent exited while this run was still executing, so its story was moved out of \
+     in_progress on the next startup rather than left claiming to be in flight";
+
 /// The status a `pipeline_step_runs` row is moved to alongside its run.
 const INTERRUPTED_STEP_STATUS: &str = "failed";
 
@@ -104,12 +109,17 @@ pub struct ReconcileReport {
     pub pipeline_steps: u64,
     /// `approval_requests` rows denied.
     pub approvals: u64,
+    /// Stories moved off `in_progress` because the run holding them is gone.
+    pub stories: u64,
 }
 
 impl ReconcileReport {
     /// True when the pass found nothing to do.
     pub fn is_empty(&self) -> bool {
-        self.runs.is_empty() && self.pipeline_steps == 0 && self.approvals == 0
+        self.runs.is_empty()
+            && self.pipeline_steps == 0
+            && self.approvals == 0
+            && self.stories == 0
     }
 }
 
@@ -138,13 +148,15 @@ impl ReconcileReport {
 /// The whole pass is one transaction: a run never ends up failed without the
 /// event that explains why.
 pub async fn reconcile_orphaned_runs(db: &DbPool, instance_id: &str) -> Result<ReconcileReport> {
+    let auto_advance = crate::story_status::auto_advance_enabled(db).await;
+
     let mut tx = db
         .begin()
         .await
         .context("Failed to open the startup reconciliation transaction")?;
 
-    let orphans: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM story_runs \
+    let orphans: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, story_id FROM story_runs \
          WHERE status = 'running' \
            AND (owner_instance_id IS NULL OR owner_instance_id <> ?)",
     )
@@ -154,8 +166,13 @@ pub async fn reconcile_orphaned_runs(db: &DbPool, instance_id: &str) -> Result<R
     .context("Failed to list runs left running by a previous session")?;
 
     let mut pipeline_steps = 0u64;
+    let mut stories = 0u64;
 
-    for run_id in &orphans {
+    // Read before the transaction: the setting is the user's, not part of the
+    // state being reconciled.
+    let stories_settled_allowed = auto_advance;
+
+    for (run_id, story_id) in &orphans {
         sqlx::query(&format!(
             "UPDATE story_runs SET status = ?, finished_at = {NOW_ISO8601} WHERE id = ?"
         ))
@@ -182,6 +199,36 @@ pub async fn reconcile_orphaned_runs(db: &DbPool, instance_id: &str) -> Result<R
         .execute(&mut *tx)
         .await
         .with_context(|| format!("Failed to record the interruption of run '{run_id}'"))?;
+
+        // The card too, or the sweep leaves a story claiming to be in flight
+        // after everything else about the run has been cleaned up. `blocked`,
+        // not `ready`: nothing was concluded about the work, and a story
+        // returned to `ready` is one a continuous-mode profile picks straight
+        // back up.
+        if stories_settled_allowed
+            && crate::story_status::settle_story(
+                &mut *tx,
+                story_id,
+                crate::story_status::RunOutcome::Interrupted,
+            )
+            .await
+            .with_context(|| format!("Failed to settle the story of run '{run_id}'"))?
+        {
+            // Attributed like any other automatic move. The `interrupted`
+            // event above says the run ended; this says what became of the
+            // card, which is a different fact and the one a user looking at
+            // the board is asking about.
+            crate::story_status::record_transition(
+                &mut *tx,
+                run_id,
+                story_id,
+                crate::story_status::RunOutcome::Interrupted.story_status(),
+                INTERRUPTED_TRANSITION_REASON,
+            )
+            .await
+            .with_context(|| format!("Failed to record the story move of run '{run_id}'"))?;
+            stories += 1;
+        }
 
         let steps = sqlx::query(&format!(
             "UPDATE pipeline_step_runs SET status = ?, updated_at = {NOW_ISO8601} \
@@ -221,8 +268,9 @@ pub async fn reconcile_orphaned_runs(db: &DbPool, instance_id: &str) -> Result<R
         .context("Failed to commit the startup reconciliation")?;
 
     Ok(ReconcileReport {
-        runs: orphans,
+        runs: orphans.into_iter().map(|(run_id, _)| run_id).collect(),
         pipeline_steps,
         approvals,
+        stories,
     })
 }

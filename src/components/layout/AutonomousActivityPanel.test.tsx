@@ -118,6 +118,7 @@ describe("AutonomousActivityPanel live updates", () => {
   it("shows a tool call the moment the run emits it", async () => {
     renderPanel();
     await screen.findByText("Agent One");
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
 
     await tauriMock.emit("run-event", {
       type: "tool_call",
@@ -131,6 +132,7 @@ describe("AutonomousActivityPanel live updates", () => {
   it("shows a run parked on an approval", async () => {
     renderPanel();
     await screen.findByText("Agent One");
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
 
     await tauriMock.emit("run-event", {
       type: "awaiting_approval",
@@ -146,6 +148,7 @@ describe("AutonomousActivityPanel live updates", () => {
   it("reports a tool that failed", async () => {
     renderPanel();
     await screen.findByText("Agent One");
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
 
     await tauriMock.emit("run-event", {
       type: "tool_result",
@@ -164,6 +167,7 @@ describe("AutonomousActivityPanel live updates", () => {
   it("refetches the run list when a run finishes", async () => {
     renderPanel();
     await screen.findByText("Agent One");
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
     const before = tauriMock.callCount("get_runs");
 
     await tauriMock.emit("run-event", {
@@ -180,6 +184,7 @@ describe("AutonomousActivityPanel live updates", () => {
   it("ignores an event for a run it is not showing", async () => {
     renderPanel();
     await screen.findByText("Agent One");
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
 
     await tauriMock.emit("run-event", {
       type: "tool_call",
@@ -188,6 +193,39 @@ describe("AutonomousActivityPanel live updates", () => {
     });
 
     expect(screen.queryByText("Using should_not_appear")).not.toBeInTheDocument();
+  });
+
+  // The mount seeds each active run's last action from `get_run_events`, which
+  // for a run that has only just started comes back empty — i.e. `null`. A
+  // live event arriving while that fetch is in flight must not then be blanked
+  // by it. This failed only in CI, where the fetch is slow enough to lose.
+  it("keeps a live event that arrives before the seeding fetch resolves", async () => {
+    let release: (rows: unknown[]) => void = () => {};
+    tauriMock.handleAll({
+      get_runs: () => [rawRun({ id: "run-1" })],
+      get_all_agent_runtime_statuses: () => [runtimeStatus()],
+      get_profiles: () => [{ id: "agent-1", name: "Agent One" }],
+      get_run_events: () => new Promise((resolve) => { release = resolve; }),
+    });
+    render(
+      <MemoryRouter>
+        <AutonomousActivityPanel />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(tauriMock.listenerCount("run-event")).toBe(1));
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "file_write",
+    });
+    expect(await screen.findByText("Using file_write")).toBeInTheDocument();
+
+    // The seeding fetch now lands, carrying nothing.
+    release([]);
+
+    await waitFor(() => expect(tauriMock.called("get_run_events")).toBe(true));
+    expect(screen.getByText("Using file_write")).toBeInTheDocument();
   });
 
   it("stops listening when the panel unmounts", async () => {

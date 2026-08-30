@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tauri::Manager;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
+
+#[cfg(test)]
+mod story_tests;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -145,6 +148,84 @@ pub fn resolve_parallel_limit(workspace: Option<u32>, global: Option<u32>) -> us
         .or(global)
         .map(|n| n.max(1) as usize)
         .unwrap_or(DEFAULT_MAX_PARALLEL_STEPS)
+}
+
+/// Claim a pipeline's own story card as the pipeline starts.
+///
+/// This used to be a bare `UPDATE stories SET status = 'in_progress'`, which
+/// answered to nothing: not the workspace toggle, and not the rule that an
+/// automatic transition may not overwrite a status somebody chose. A pipeline
+/// started against a card a human had moved to `blocked` dragged it back into
+/// the in-progress column.
+///
+/// Split out for the same reason as [`settle_pipeline_story`]: the function
+/// around it needs a concrete `tauri::AppHandle` and this does not.
+pub(crate) async fn claim_pipeline_story(db: &DbPool, story_id: &str) {
+    if !db::story_status::auto_advance_enabled(db).await {
+        return;
+    }
+    match db::story_status::claim_story(db, story_id).await {
+        Ok(true) => debug!(story_id = %story_id, "Pipeline story claimed"),
+        Ok(false) => debug!(
+            story_id = %story_id,
+            "Pipeline story was not ready; leaving it where it is"
+        ),
+        Err(e) => error!(story_id = %story_id, "Failed to claim the pipeline story: {e}"),
+    }
+}
+
+/// Move a finished pipeline's own story card.
+///
+/// Each step owns a separate story and settles its own card through
+/// `finish_run`; this is the *parent's*, and it moves once — here, on the
+/// whole pipeline's outcome — rather than on whichever step happened to finish
+/// last.
+///
+/// Split out of the spawned completion task so it can be tested: the task
+/// around it needs a concrete `tauri::AppHandle`, and this does not.
+pub(crate) async fn settle_pipeline_story(
+    db: &DbPool,
+    pipeline_run_id: &str,
+    story_id: &str,
+    final_status: &str,
+) {
+    if !db::story_status::auto_advance_enabled(db).await {
+        return;
+    }
+
+    let outcome = db::story_status::RunOutcome::from_run_status(final_status);
+    match db::story_status::settle_story(db, story_id, outcome).await {
+        Ok(true) => {
+            info!(
+                story_id = %story_id,
+                "Pipeline story moved to {}",
+                outcome.story_status()
+            );
+            // On the pipeline run's own timeline, so this move is attributable
+            // to the run that caused it exactly as a single run's is.
+            if let Err(e) = db::story_status::record_transition(
+                db,
+                pipeline_run_id,
+                story_id,
+                outcome.story_status(),
+                &format!("the pipeline finished with status '{final_status}'"),
+            )
+            .await
+            {
+                warn!(story_id = %story_id, "Could not record the story transition: {e}");
+            }
+        }
+        // Not an error: somebody moved the card deliberately, and that
+        // outranks this.
+        Ok(false) => debug!(
+            story_id = %story_id,
+            "Pipeline story was not in_progress; leaving it where it is"
+        ),
+        Err(e) => error!(
+            story_id = %story_id,
+            "Failed to move the pipeline story off in_progress: {e}"
+        ),
+    }
 }
 
 /// Read `max_parallel_steps` from the active workspace's settings override.
@@ -287,8 +368,16 @@ pub async fn start_pipeline(
     };
     pipeline.runs.insert(pipeline_run_id.clone(), progress);
 
+    // Claim the card before the executor starts, not after it is spawned. A
+    // pipeline short enough to finish first would otherwise settle a card
+    // still sitting in `ready` — a no-op — and then be handed `in_progress` by
+    // a claim arriving behind it, leaving it stuck exactly as this feature
+    // exists to prevent.
+    claim_pipeline_story(&db, &story_id).await;
+
     // Spawn the async pipeline executor
     let pid = pipeline_run_id.clone();
+    let story_id_for_settle = story_id.clone();
     let pipeline_clone = pipeline.clone();
     let db_clone = db.clone();
     let app_clone = app.clone();
@@ -322,17 +411,13 @@ pub async fn start_pipeline(
             error!(pipeline_run_id = %pid, "Failed to update story_run status: {e}");
         }
 
+        settle_pipeline_story(&db_clone, &pid, &story_id_for_settle, final_status).await;
+
         pipeline_clone.tasks.remove(&pid);
         info!(pipeline_run_id = %pid, status = %final_status, "Pipeline complete");
     });
 
     pipeline.tasks.insert(pipeline_run_id.clone(), handle);
-
-    // Mark the pipeline story as in_progress
-    let _ = sqlx::query("UPDATE stories SET status = 'in_progress' WHERE id = ?")
-        .bind(&story_id)
-        .execute(&db)
-        .await;
 
     Ok(pipeline_run_id)
 }
