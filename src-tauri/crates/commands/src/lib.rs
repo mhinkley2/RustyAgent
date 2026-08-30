@@ -107,7 +107,7 @@ pub async fn start_run(
     // Load the agent profile from the database.
     // ------------------------------------------------------------------
     let row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+        "SELECT provider, model, system_prompt, max_iterations, max_retries, max_output_tokens, persistent_memory, \
                 context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
@@ -122,6 +122,7 @@ pub async fn start_run(
     let model_id: String = row.try_get("model").unwrap_or_default();
     let system_prompt: Option<String> = row.try_get("system_prompt").ok().flatten();
     let max_iterations: i64 = row.try_get("max_iterations").unwrap_or(20);
+    let max_retries: i64 = row.try_get("max_retries").unwrap_or(2);
     let max_tokens_per_run: i64 = row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
     let context_strategy: String = row.try_get("context_strategy").unwrap_or_default();
@@ -276,6 +277,10 @@ pub async fn start_run(
     // Let the run reach the user: notifications for a parked approval or a
     // finished run, and the approval wait the user configured (indefinite by
     // default, so an unattended run parks rather than fail-closing).
+    // A transient provider failure is retried inside the run, so the
+    // conversation and its completed tool work survive the wait.
+    runtime.max_retries = max_retries.max(0) as u32;
+
     runtime.notifier = Some(runtime::AppNotifier::arc(app.clone()));
     runtime.approval_timeout = runtime::notifier::unattended_settings(&app).approval_timeout();
 
@@ -357,7 +362,7 @@ pub async fn start_chat_run(
 
     // Load the agent profile.
     let row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+        "SELECT provider, model, system_prompt, max_iterations, max_retries, max_output_tokens, persistent_memory, \
                 context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
@@ -372,6 +377,7 @@ pub async fn start_chat_run(
     let model_id: String      = row.try_get("model").unwrap_or_default();
     let system_prompt: Option<String> = row.try_get("system_prompt").ok().flatten();
     let max_iterations: i64   = row.try_get("max_iterations").unwrap_or(20);
+    let max_retries: i64      = row.try_get("max_retries").unwrap_or(2);
     let max_tokens: i64       = row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
     let context_strategy: String = row.try_get("context_strategy").unwrap_or_default();
@@ -535,6 +541,10 @@ pub async fn start_chat_run(
     // Let the run reach the user: notifications for a parked approval or a
     // finished run, and the approval wait the user configured (indefinite by
     // default, so an unattended run parks rather than fail-closing).
+    // A transient provider failure is retried inside the run, so the
+    // conversation and its completed tool work survive the wait.
+    runtime.max_retries = max_retries.max(0) as u32;
+
     runtime.notifier = Some(runtime::AppNotifier::arc(app.clone()));
     runtime.approval_timeout = runtime::notifier::unattended_settings(&app).approval_timeout();
 

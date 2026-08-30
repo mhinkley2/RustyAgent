@@ -103,6 +103,101 @@ describe("RunDetailPanel token accounting", () => {
   });
 });
 
+describe("RunDetailPanel retries", () => {
+  function retryEvent(payload: Record<string, unknown>) {
+    return {
+      id: "e1",
+      run_id: "run-1",
+      event_type: "retry",
+      role: null,
+      content: JSON.stringify(payload),
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      sequence_num: 0,
+      created_at: "2026-04-13T00:00:30Z",
+    };
+  }
+
+  function renderWithEvents(events: unknown[]) {
+    tauriMock.handleAll({
+      get_run_events: () => events,
+      get_run_diff: () => ({ run_id: "run-1", before_sha: null, diff_output: null }),
+    });
+    return render(<RunDetailPanel run={makeRun()} onClose={() => {}} />);
+  }
+
+  // The retry is the explanation for a gap in the timeline, so it has to say
+  // how long the run waited and why.
+  it("says which attempt it was, how long it waited, and what failed", async () => {
+    renderWithEvents([
+      retryEvent({
+        attempt: 1,
+        maxRetries: 2,
+        reason: "LLM call failed: Rate limited — retry after 30s",
+        delaySecs: 30,
+        providerRequestedDelay: true,
+      }),
+    ]);
+
+    expect(await screen.findByText(/Attempt 1 of 2/)).toBeInTheDocument();
+    expect(screen.getByText(/waited 30s/)).toBeInTheDocument();
+    expect(screen.getByText(/Rate limited/)).toBeInTheDocument();
+  });
+
+  // Whose number the delay was matters: it is the difference between the
+  // provider telling us to wait and us guessing.
+  it("distinguishes the provider's backoff from ours", async () => {
+    renderWithEvents([
+      retryEvent({
+        attempt: 2,
+        maxRetries: 3,
+        reason: "LLM call failed: Stream ended unexpectedly",
+        delaySecs: 2,
+        providerRequestedDelay: false,
+      }),
+    ]);
+
+    expect(await screen.findByText(/\(backoff\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/provider's own backoff/)).not.toBeInTheDocument();
+  });
+
+  it("renders a sub-second wait in milliseconds", async () => {
+    renderWithEvents([
+      retryEvent({
+        attempt: 1,
+        maxRetries: 1,
+        reason: "LLM call failed",
+        delaySecs: 0.25,
+        providerRequestedDelay: false,
+      }),
+    ]);
+
+    expect(await screen.findByText(/waited 250ms/)).toBeInTheDocument();
+  });
+
+  it("falls back to the generic row rather than blanking on an unreadable payload", async () => {
+    renderWithEvents([
+      {
+        id: "e1",
+        run_id: "run-1",
+        event_type: "retry",
+        role: null,
+        content: "not json",
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        sequence_num: 0,
+        created_at: "2026-04-13T00:00:30Z",
+      },
+    ]);
+
+    expect(await screen.findByText("retry")).toBeInTheDocument();
+  });
+});
+
 describe("RunDetailPanel context compaction", () => {
   function compactionEvent(payload: Record<string, unknown>) {
     return {

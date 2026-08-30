@@ -615,7 +615,7 @@ async fn fire_step_run(
 
     // Load agent profile
     let profile_row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+        "SELECT provider, model, system_prompt, max_iterations, max_retries, max_output_tokens, persistent_memory, \
                 context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
@@ -629,6 +629,7 @@ async fn fire_step_run(
     let model_id: String = profile_row.try_get("model").unwrap_or_default();
     let mut system_prompt: Option<String> = profile_row.try_get("system_prompt").ok().flatten();
     let max_iterations: i64 = profile_row.try_get("max_iterations").unwrap_or(20);
+    let max_retries: i64 = profile_row.try_get("max_retries").unwrap_or(2);
     let max_tokens: i64 = profile_row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = profile_row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
     let context_strategy: String = profile_row.try_get("context_strategy").unwrap_or_default();
@@ -790,6 +791,10 @@ async fn fire_step_run(
     // Let the run reach the user: notifications for a parked approval or a
     // finished run, and the approval wait the user configured (indefinite by
     // default, so an unattended run parks rather than fail-closing).
+    // A transient provider failure is retried inside the step, so the
+    // conversation and its completed tool work survive the wait.
+    rt.max_retries = max_retries.max(0) as u32;
+
     rt.notifier = Some(runtime::AppNotifier::arc(app_for_isolation.clone()));
     rt.approval_timeout = runtime::notifier::unattended_settings(&app_for_isolation).approval_timeout();
 
@@ -879,7 +884,7 @@ async fn run_subtask_impl(
 
     // Load profile
     let profile_row = sqlx::query(
-        "SELECT provider, model, system_prompt, max_iterations, max_output_tokens, persistent_memory, \
+        "SELECT provider, model, system_prompt, max_iterations, max_retries, max_output_tokens, persistent_memory, \
                 context_strategy, max_input_tokens \
          FROM agent_profiles WHERE id = ?",
     )
@@ -893,6 +898,7 @@ async fn run_subtask_impl(
     let model_id: String = profile_row.try_get("model").unwrap_or_default();
     let system_prompt: Option<String> = profile_row.try_get("system_prompt").ok().flatten();
     let max_iterations: i64 = profile_row.try_get("max_iterations").unwrap_or(20);
+    let max_retries: i64 = profile_row.try_get("max_retries").unwrap_or(2);
     let max_tokens: i64 = profile_row.try_get("max_output_tokens").unwrap_or(4096);
     let persistent_memory: bool = profile_row.try_get::<i64, _>("persistent_memory").unwrap_or(0) != 0;
     let context_strategy: String = profile_row.try_get("context_strategy").unwrap_or_default();
@@ -1031,6 +1037,10 @@ async fn run_subtask_impl(
     // Let the run reach the user: notifications for a parked approval or a
     // finished run, and the approval wait the user configured (indefinite by
     // default, so an unattended run parks rather than fail-closing).
+    // A transient provider failure is retried inside the step, so the
+    // conversation and its completed tool work survive the wait.
+    rt.max_retries = max_retries.max(0) as u32;
+
     rt.notifier = Some(runtime::AppNotifier::arc(app_for_notifications.clone()));
     rt.approval_timeout =
         runtime::notifier::unattended_settings(&app_for_notifications).approval_timeout();

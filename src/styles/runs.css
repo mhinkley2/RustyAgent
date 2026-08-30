@@ -753,3 +753,8 @@
 .run-diff__line-text {
   display: block;
 }
+
+/* A retry explains a gap in the timeline — warning-coloured, not error. */
+.run-event--retry .run-event__label--retry {
+  color: var(--color-warning, #f59e0b);
+}

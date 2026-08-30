@@ -15,6 +15,12 @@ export type RunEventType =
   /** History was dropped to keep the request inside the model's input budget. */
   | "context_compacted"
   /**
+   * A provider call failed transiently and is being tried again, after the
+   * delay the provider asked for or a capped backoff. Written before the wait,
+   * so a run that sits still for thirty seconds says why while it happens.
+   */
+  | "retry"
+  /**
    * The run moved its story's card off `in_progress`, and this says where to
    * and why. Written by all three paths that move a card on their own — a run
    * finishing, a pipeline finishing, and the startup sweep — so a card that

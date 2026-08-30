@@ -96,6 +96,42 @@ actually made is written down as one.
 The run detail view follows a run live, so an autonomous run can be watched
 while it works instead of only after it stops.
 
+## When a provider call fails
+
+A rate limit or a dropped connection no longer ends a run. The failed call is
+retried **inside** the run, so the conversation, the tool work already done and
+the run's worktree all survive — a rate limit fifteen iterations in costs the
+wait and nothing else, rather than discarding those fifteen iterations and
+paying for them again.
+
+What gets retried is decided by the error, not by a counter:
+
+| Failure | Retried? |
+|---|---|
+| Rate limited | yes, after the delay the provider asked for |
+| Network error, dropped stream | yes, with capped backoff |
+| HTTP 5xx, 408, 429 | yes, with capped backoff |
+| HTTP 400/401/403/404 and other 4xx | no — a second identical request is refused identically |
+| Serialization, missing API key, opaque provider error | no |
+
+The two other ways a run can fail — exhausting `max_iterations`, and exceeding
+the context budget under `context_strategy = "full"` — are never retried. Both
+are deterministic: a fresh attempt meets the same ceiling with the same prompt.
+
+Backoff is exponential and capped at 30 seconds, scaled by ±25% derived from
+the run id so that an outage does not have every run in flight return at the
+same instant and reproduce it. A retry that is waiting still answers the stop
+button: cancelling interrupts the wait rather than finishing it.
+
+Each retry is written to the run's timeline saying which attempt it was, what
+failed, how long it waited, and whether that delay was the provider's number or
+ours — so a run that appears to sit still for thirty seconds says why while it
+is happening.
+
+The budget is `max_retries` on the agent profile, alongside `max_iterations`.
+It defaults to **2** — three attempts in total. Set it to `0` to switch retries
+off for a profile.
+
 ## The board and the run lifecycle
 
 A story a run picks up moves to `in_progress` when the run starts, and off it

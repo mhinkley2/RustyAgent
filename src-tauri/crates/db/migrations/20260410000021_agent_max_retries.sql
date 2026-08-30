@@ -1,0 +1,15 @@
+-- How many times a run may retry a failed provider call before giving up.
+--
+-- Lives on the profile beside `max_iterations` and the token limits, which is
+-- where per-profile execution knobs already are.
+--
+-- Defaults to 2 — three attempts in total. Zero would ship the feature switched
+-- off, and a run dying on a rate limit that the provider itself told us to wait
+-- out is the case this exists for. Two is enough to cross a brief outage
+-- without turning a sustained one into a long, expensive wait: the retries are
+-- bounded, and every one of them is either the delay the provider asked for or
+-- a capped backoff.
+--
+-- Retries happen *within* a run, around the provider call, so this does not
+-- multiply runs or re-bill completed tool work.
+ALTER TABLE agent_profiles ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2;
