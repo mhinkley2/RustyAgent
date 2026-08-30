@@ -51,10 +51,24 @@ describe("story status vocabulary", () => {
     }
   });
 
-  // A compile-time check that the union and the column list cannot diverge:
-  // if `StoryStatus` gained or lost a member, this assignment stops compiling.
+  // A compile-time check in both directions.
+  //
+  // `Record<StoryStatus, true>` requires a key for every member of the union,
+  // so losing one is a missing-key error and gaining one is an excess-property
+  // error. An earlier version of this asserted
+  // `const x: StoryStatus[] = [...CANONICAL_STATUSES]`, which only proved the
+  // canonical list was a *subset* — a union that grew an extra member would
+  // have compiled happily, which is the exact drift this file exists to catch.
   it("keeps the union and the canonical list in step", () => {
-    const asUnion: StoryStatus[] = [...CANONICAL_STATUSES];
-    expect(asUnion).toHaveLength(KANBAN_COLUMNS.length);
+    const everyMember: Record<StoryStatus, true> = {
+      backlog: true,
+      ready: true,
+      in_progress: true,
+      blocked: true,
+      review: true,
+      done: true,
+    };
+
+    expect(Object.keys(everyMember).sort()).toEqual([...CANONICAL_STATUSES].sort());
   });
 });

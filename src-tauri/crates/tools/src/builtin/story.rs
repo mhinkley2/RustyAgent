@@ -557,7 +557,18 @@ impl Tool for UpdateStoryStatusTool {
     fn name(&self) -> &str { "update_story_status" }
 
     fn description(&self) -> &str {
-        "Update the status of a story. Valid statuses: ready, in_progress, done, failed, blocked."
+        // Derived, not written out. This string is prompt text the model
+        // reasons from: the version it replaces named `failed` — which is now
+        // refused — and omitted `review` and `backlog`, so an agent reading it
+        // would try the one status that cannot work and never learn about the
+        // column every finished run lands in.
+        static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        DESCRIPTION.get_or_init(|| {
+            format!(
+                "Update the status of a story. Valid statuses: {}.",
+                db::story_status::status_list_prose()
+            )
+        })
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -788,6 +799,27 @@ mod tests {
             .await;
 
         assert!(!r.is_error, "{}", r.content);
+    }
+
+    /// A tool description is prompt text the model reasons from, so a stale
+    /// one does not merely mislead a reader — it teaches the agent a
+    /// vocabulary that will be refused. The version this replaced named
+    /// `failed` and omitted `review`, which is the one status every finished
+    /// run lands in.
+    #[test]
+    fn the_status_tools_description_names_the_statuses_that_work() {
+        let description = UpdateStoryStatusTool.description();
+
+        for status in db::story_status::STORY_STATUSES {
+            assert!(
+                description.contains(status),
+                "the description should name {status}: {description}"
+            );
+        }
+        assert!(
+            !description.contains("failed"),
+            "the description must not offer a status that is refused: {description}"
+        );
     }
 
     /// Every tool that names statuses names the same ones.
