@@ -457,16 +457,37 @@ impl Tool for UpdateStoryTool {
             None => current_description,
         };
         let story_type = input.get("story_type").and_then(|v| v.as_str()).map(|value| value.to_string()).unwrap_or(current_story_type);
-        let status = input.get("status").and_then(|v| v.as_str()).map(|value| value.to_string()).unwrap_or(current_status);
-        // Only what the caller supplied is checked in practice: a status
-        // already in the row came from somewhere that has been through this,
-        // or from before the vocabulary was settled, and refusing to update a
-        // title because of a legacy status would be the wrong trade.
-        if input.get("status").is_some() {
-            if let Err(e) = db::story_status::validate_status(&status) {
+        // Validate exactly what the caller supplied, then fall back — rather
+        // than falling back first and validating whatever came out.
+        //
+        // The earlier form gated on `input.get("status").is_some()`, which is
+        // true for `"status": null` as well: `as_str()` then yields `None`,
+        // the fallback substitutes the row's *current* status, and that gets
+        // validated. On a row carrying a value from before the vocabulary was
+        // settled, an update that never mentioned the status would be refused
+        // because of it.
+        //
+        // A status already in the row is not the caller's doing, and refusing
+        // to change a title because of it would be the wrong trade.
+        // Validate exactly what the caller supplied, then fall back — rather
+        // than falling back first and validating whatever came out.
+        //
+        // The earlier form gated on `input.get("status").is_some()`, which is
+        // true for `"status": null` as well: `as_str()` then yields `None`,
+        // the fallback substitutes the row's *current* status, and that gets
+        // validated. On a row carrying a value from before the vocabulary was
+        // settled, an update that never mentioned the status would be refused
+        // because of it.
+        //
+        // A status already in the row is not the caller's doing, and refusing
+        // to change a title because of it would be the wrong trade.
+        let supplied_status = input.get("status").and_then(|v| v.as_str());
+        if let Some(supplied) = supplied_status {
+            if let Err(e) = db::story_status::validate_status(supplied) {
                 return ToolOutput::err(e);
             }
         }
+        let status = supplied_status.map(|value| value.to_string()).unwrap_or(current_status);
         let priority = input.get("priority").and_then(|v| v.as_str()).map(|value| value.to_string()).unwrap_or(current_priority);
         let labels_json = match input.get("labels") {
             Some(value) => {
@@ -781,6 +802,34 @@ mod tests {
 
         assert!(r.is_error, "{}", r.content);
         assert_eq!(status_of(&db, "s1").await, "ready");
+    }
+
+    /// `"status": null` is not the caller supplying a status, and must not be
+    /// treated as one. The earlier guard checked for the *key*, so a null
+    /// fell through to validating the row's own stored value — refusing an
+    /// unrelated edit on a legacy row for a status the caller never sent.
+    #[tokio::test]
+    async fn an_explicit_null_status_is_not_a_supplied_status() {
+        let db = make_test_pool().await;
+        sqlx::query("INSERT INTO stories (id, title, status) VALUES ('s1', 'A story', 'failed')")
+            .execute(&db)
+            .await
+            .expect("seed");
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryTool
+            .execute(
+                json!({"story_id": "s1", "title": "Renamed", "status": serde_json::Value::Null}),
+                &ctx,
+            )
+            .await;
+
+        assert!(!r.is_error, "a null status must not refuse the edit: {}", r.content);
+        assert_eq!(
+            status_of(&db, "s1").await,
+            "failed",
+            "and the stored value is left as it was"
+        );
     }
 
     /// An update that does not mention the status must still work on a row
