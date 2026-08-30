@@ -392,6 +392,16 @@ impl ConversationRuntime {
         .await
         .context("Failed to insert story_run")?;
 
+        // Claim the card, so the board shows the work as in flight while it
+        // actually is. Only pipelines did this before, which left a manually
+        // started run looking untouched for its whole duration — and left the
+        // completion side with nothing in `in_progress` to move.
+        if db::story_status::auto_advance_enabled(&db).await {
+            if let Err(e) = db::story_status::claim_story(&db, &story_id).await {
+                warn!(run_id = %run_id, story_id = %story_id, "Failed to claim the story: {e}");
+            }
+        }
+
         Ok(Self {
             run_id,
             story_id,
@@ -1320,6 +1330,61 @@ impl ConversationRuntime {
     }
 
     // -----------------------------------------------------------------------
+    // Board bookkeeping
+    // -----------------------------------------------------------------------
+
+    /// Move this run's story to the status its outcome implies.
+    ///
+    /// Every run settles its own card, pipeline steps included. A step owns a
+    /// story of its own: `validate_pipeline_config` rejects a step that
+    /// references the pipeline's story, and rejects two steps sharing one, so
+    /// a step can never reach the parent's card. The parent's is moved once,
+    /// by `pipeline::settle_pipeline_story`, when the whole pipeline finishes.
+    ///
+    /// Unlike the rest of `finish_run` this one checks its result. Every other
+    /// statement here is best-effort because losing it costs a number in a
+    /// report; losing this one leaves a card claiming to be in flight forever,
+    /// which is the whole defect.
+    async fn settle_story(&self, status: &str) {
+        if !db::story_status::auto_advance_enabled(&self.db).await {
+            return;
+        }
+
+        let outcome = db::story_status::RunOutcome::from_run_status(status);
+
+        match db::story_status::settle_story(&self.db, &self.story_id, outcome).await {
+            Ok(true) => {
+                let to = outcome.story_status();
+                info!(run_id = %self.run_id, story_id = %self.story_id, "Story moved to {to}");
+                // On the run's own timeline, so a user can see why the card
+                // moved instead of inferring it from a timestamp.
+                self.persist_event(
+                    "story_status",
+                    &serde_json::json!({
+                        "storyId": self.story_id,
+                        "from": "in_progress",
+                        "to": to,
+                        "reason": format!("the run finished with status '{status}'"),
+                    }),
+                )
+                .await;
+            }
+            // Not an error: the card was somewhere else, which means somebody
+            // decided that on purpose and this had nothing to correct.
+            Ok(false) => debug!(
+                run_id = %self.run_id,
+                story_id = %self.story_id,
+                "Story was not in_progress; leaving it where it is"
+            ),
+            Err(e) => error!(
+                run_id = %self.run_id,
+                story_id = %self.story_id,
+                "Failed to move the story off in_progress: {e}"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Notifications
     // -----------------------------------------------------------------------
 
@@ -1363,6 +1428,10 @@ impl ConversationRuntime {
             event_type,
             "error" | "approval_request" | "approval_response"
                 | "complete" | "cancelled" | "failed" | "context_compacted"
+                // Why a card moved on the board is not a detail of the
+                // conversation, and it is the only record of an automatic
+                // transition.
+                | "story_status"
                 // Whether a run was isolated decides whether its changes can be
                 // reverted at all. That must survive `track_history = false`.
                 | "isolation"
@@ -1548,6 +1617,12 @@ impl ConversationRuntime {
         if self.event_retention_runs > 0 {
             self.prune_old_run_events().await;
         }
+
+        // Move the story's card off `in_progress` to say how this ended.
+        //
+        // Placed after the run row is written so the two agree: a card in
+        // `review` is always backed by a `story_runs` row that says `done`.
+        self.settle_story(status).await;
 
         // Tell the user the run is over. Not on `cancelled`: the user stopped
         // it themselves, so they are at the desk and already know.

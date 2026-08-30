@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tauri::Manager;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{debug, error, info};
+
+#[cfg(test)]
+mod story_tests;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -145,6 +148,40 @@ pub fn resolve_parallel_limit(workspace: Option<u32>, global: Option<u32>) -> us
         .or(global)
         .map(|n| n.max(1) as usize)
         .unwrap_or(DEFAULT_MAX_PARALLEL_STEPS)
+}
+
+/// Move a finished pipeline's own story card.
+///
+/// Each step owns a separate story and settles its own card through
+/// `finish_run`; this is the *parent's*, and it moves once — here, on the
+/// whole pipeline's outcome — rather than on whichever step happened to finish
+/// last.
+///
+/// Split out of the spawned completion task so it can be tested: the task
+/// around it needs a concrete `tauri::AppHandle`, and this does not.
+pub(crate) async fn settle_pipeline_story(db: &DbPool, story_id: &str, final_status: &str) {
+    if !db::story_status::auto_advance_enabled(db).await {
+        return;
+    }
+
+    let outcome = db::story_status::RunOutcome::from_run_status(final_status);
+    match db::story_status::settle_story(db, story_id, outcome).await {
+        Ok(true) => info!(
+            story_id = %story_id,
+            "Pipeline story moved to {}",
+            outcome.story_status()
+        ),
+        // Not an error: somebody moved the card deliberately, and that
+        // outranks this.
+        Ok(false) => debug!(
+            story_id = %story_id,
+            "Pipeline story was not in_progress; leaving it where it is"
+        ),
+        Err(e) => error!(
+            story_id = %story_id,
+            "Failed to move the pipeline story off in_progress: {e}"
+        ),
+    }
 }
 
 /// Read `max_parallel_steps` from the active workspace's settings override.
@@ -289,6 +326,7 @@ pub async fn start_pipeline(
 
     // Spawn the async pipeline executor
     let pid = pipeline_run_id.clone();
+    let story_id_for_settle = story_id.clone();
     let pipeline_clone = pipeline.clone();
     let db_clone = db.clone();
     let app_clone = app.clone();
@@ -321,6 +359,8 @@ pub async fn start_pipeline(
         {
             error!(pipeline_run_id = %pid, "Failed to update story_run status: {e}");
         }
+
+        settle_pipeline_story(&db_clone, &story_id_for_settle, final_status).await;
 
         pipeline_clone.tasks.remove(&pid);
         info!(pipeline_run_id = %pid, status = %final_status, "Pipeline complete");

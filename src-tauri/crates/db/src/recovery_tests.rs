@@ -32,6 +32,14 @@ async fn pool() -> DbPool {
     db
 }
 
+async fn story_status(db: &DbPool, id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM stories WHERE id = ?")
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .expect("read story status")
+}
+
 async fn seed_approval(db: &DbPool, id: &str, run_id: &str) {
     sqlx::query(
         "INSERT INTO approval_requests (id, run_id, tool_name, tool_input)
@@ -124,6 +132,85 @@ async fn a_run_left_running_by_a_previous_session_is_moved_to_a_terminal_status(
 
     assert_eq!(report.runs, vec!["run-1".to_string()]);
     assert_eq!(run_status(&db, "run-1").await, INTERRUPTED_RUN_STATUS);
+}
+
+/// The sweep already settles the run, its pipeline steps and its approvals.
+/// Without the card, everything about an interrupted run is cleaned up except
+/// the one part the user actually looks at.
+#[tokio::test]
+async fn a_story_left_in_progress_by_a_crash_is_moved_off_it() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+
+    let report = reconcile_orphaned_runs(&db, THIS_INSTANCE)
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.stories, 1);
+    assert_eq!(story_status(&db, STORY).await, "blocked");
+}
+
+/// `blocked`, not `ready`. A crash is not a reason to hand the story back to a
+/// continuous-mode profile, which would re-pick it the moment the app came up.
+#[tokio::test]
+async fn a_crashed_run_does_not_return_its_story_to_the_schedulers_queue() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+
+    reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("sweep");
+
+    assert_ne!(story_status(&db, STORY).await, "ready");
+}
+
+/// The sweep never touches a run this process owns, and so must never touch
+/// its card either — the run is still working on it.
+#[tokio::test]
+async fn the_sweep_leaves_the_card_of_a_live_run_alone() {
+    let db = pool().await;
+    seed_run_owned(&db, "run-1", STORY, PROFILE, THIS_INSTANCE).await;
+
+    let report = reconcile_orphaned_runs(&db, THIS_INSTANCE)
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.stories, 0);
+    assert_eq!(story_status(&db, STORY).await, "in_progress");
+}
+
+/// A card someone moved deliberately before the restart is theirs, not the
+/// sweep's.
+#[tokio::test]
+async fn the_sweep_does_not_overwrite_a_status_someone_chose() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+    sqlx::query("UPDATE stories SET status = 'review' WHERE id = ?")
+        .bind(STORY)
+        .execute(&db)
+        .await
+        .expect("set status");
+
+    let report = reconcile_orphaned_runs(&db, THIS_INSTANCE)
+        .await
+        .expect("sweep");
+
+    assert_eq!(report.stories, 0);
+    assert_eq!(story_status(&db, STORY).await, "review");
+}
+
+/// The sweep is run more than once in an app's life; the second pass must find
+/// nothing to do.
+#[tokio::test]
+async fn settling_a_card_is_idempotent() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+
+    reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("first");
+    let second = reconcile_orphaned_runs(&db, THIS_INSTANCE)
+        .await
+        .expect("second");
+
+    assert!(second.is_empty(), "{second:?}");
+    assert_eq!(story_status(&db, STORY).await, "blocked");
 }
 
 #[tokio::test]

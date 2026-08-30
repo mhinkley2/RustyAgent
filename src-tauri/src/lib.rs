@@ -956,10 +956,12 @@ pub fn run() {
                     Ok(report) if report.is_empty() => {}
                     Ok(report) => tracing::info!(
                         "Startup reconciliation: {} run(s) interrupted by a restart, \
-                         {} pipeline step(s) and {} pending approval(s) closed out",
+                         {} pipeline step(s), {} pending approval(s) and {} story card(s) \
+                         closed out",
                         report.runs.len(),
                         report.pipeline_steps,
                         report.approvals,
+                        report.stories,
                     ),
                     Err(e) => tracing::warn!("Run reconciliation failed: {e}"),
                 }

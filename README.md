@@ -96,6 +96,45 @@ actually made is written down as one.
 The run detail view follows a run live, so an autonomous run can be watched
 while it works instead of only after it stops.
 
+## The board and the run lifecycle
+
+A story a run picks up moves to `in_progress` when the run starts, and off it
+when the run ends:
+
+| The run | The card |
+|---|---|
+| finished | `review` |
+| failed | `blocked` |
+| was cancelled | `blocked` |
+| was interrupted by a restart | `blocked` |
+
+Two of those are deliberate choices rather than obvious ones.
+
+**Success lands in `review`, not `done`.** Agent output nobody has looked at
+should not claim to be finished work. `review` clears the in-progress queue and
+leaves `done` a human verb.
+
+**Failure lands in `blocked`, never back in `ready`.** A failed story returned
+to `ready` while a continuous-mode profile is polling gets re-picked
+immediately, and the two loop without bound against work that just failed —
+spending API budget with nobody watching.
+
+An automatic transition only ever moves a card that is still `in_progress`. If
+you moved it yourself, or the agent called `update_story_status`, that is a
+decision and it stands. Chat sessions are rows in the same table but are never
+moved, so conversations stay off the board. Every move is recorded on the run's
+own timeline as a `story_status` event, so a card that moves says why.
+
+To switch the whole behaviour off, set `auto_advance_story_status` to `false`
+in the active workspace's settings:
+
+```json
+{ "auto_advance_story_status": false }
+```
+
+It defaults to on — a board that tells the truth about what is in flight is
+the behaviour that should need no configuration.
+
 ## MCP Server
 
 RustyAgent exposes its board, run history, agent configuration, and workspace

@@ -267,7 +267,12 @@ async fn each_streamed_token_is_persisted_as_its_own_run_event() {
         .into_iter()
         .map(|(t, _)| t)
         .collect();
-    assert_eq!(types, vec!["token", "token", "token", "complete"]);
+    // `story_status` trails every finished run: the card moved off
+    // `in_progress`, and the run's timeline is where that is recorded.
+    assert_eq!(
+        types,
+        vec!["token", "token", "token", "complete", "story_status"]
+    );
 }
 
 #[tokio::test]
@@ -739,6 +744,188 @@ async fn running_out_of_scripted_responses_fails_rather_than_hanging() {
 }
 
 // ---------------------------------------------------------------------------
+// The story's card
+// ---------------------------------------------------------------------------
+
+async fn story_status(db: &DbPool, story_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM stories WHERE id = ?")
+        .bind(story_id)
+        .fetch_one(db)
+        .await
+        .expect("read story status")
+}
+
+async fn set_story_status(db: &DbPool, story_id: &str, status: &str) {
+    sqlx::query("UPDATE stories SET status = ? WHERE id = ?")
+        .bind(status)
+        .bind(story_id)
+        .execute(db)
+        .await
+        .expect("set story status");
+}
+
+/// Switch the behaviour off for the workspace the run will look at.
+async fn disable_auto_advance(db: &DbPool) {
+    sqlx::query("INSERT INTO workspaces (id, name, path) VALUES ('w1', 'W', '/tmp/w')")
+        .execute(db)
+        .await
+        .expect("seed workspace");
+    sqlx::query(
+        "INSERT INTO workspace_settings (workspace_id, settings_json) \
+         VALUES ('w1', '{\"auto_advance_story_status\": false}')",
+    )
+    .execute(db)
+    .await
+    .expect("seed workspace settings");
+}
+
+/// The whole arc for a manually started run: the card is claimed when the run
+/// starts and released when it ends. Before this, only pipelines claimed, and
+/// nothing at all released — the board filled with work that looked
+/// permanently in flight.
+#[tokio::test]
+async fn a_run_claims_its_story_on_start_and_sends_it_to_review_on_success() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+    assert_eq!(story_status(&h.db, STORY_ID).await, "ready");
+
+    let rt = h.build().await;
+    assert_eq!(
+        story_status(&h.db, STORY_ID).await,
+        "in_progress",
+        "the card should show the work as in flight while it is"
+    );
+
+    rt.run().await.expect("run");
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "review");
+}
+
+/// `review`, not `done`: agent output nobody has looked at should not claim to
+/// be finished work.
+#[tokio::test]
+async fn a_successful_run_does_not_declare_its_own_work_done() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    h.run().await;
+
+    assert_ne!(story_status(&h.db, STORY_ID).await, "done");
+}
+
+/// The load-bearing case. A failed story returned to `ready` is one a
+/// continuous-mode profile picks straight back up, and the two loop without
+/// bound against work that just failed.
+#[tokio::test]
+async fn a_failed_run_blocks_its_story_so_the_scheduler_cannot_re_pick_it() {
+    let h = Harness::new(vec![MockResponse::ProviderError("down".into())]).await;
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let _ = rt.run().await;
+
+    assert_eq!(h.status(&run_id).await, "failed");
+    let status = story_status(&h.db, STORY_ID).await;
+    assert_eq!(status, "blocked");
+    assert_ne!(status, "ready", "the scheduler would pick this straight back up");
+}
+
+#[tokio::test]
+async fn a_cancelled_run_blocks_its_story() {
+    let h = Harness::new(vec![MockResponse::text("never reached")]).await;
+    h.cancel.cancel();
+
+    h.run().await;
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "blocked");
+}
+
+/// An agent that moved its own story is making a decision. This feature is
+/// bookkeeping, and bookkeeping does not overrule a decision.
+#[tokio::test]
+async fn a_status_the_agent_set_during_the_run_survives_the_run_ending() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    let rt = h.build().await;
+    // Stand in for `update_story_status` being called mid-run.
+    set_story_status(&h.db, STORY_ID, "done").await;
+    rt.run().await.expect("run");
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "done");
+}
+
+/// A run started against a card sitting in `backlog` should leave it there —
+/// and, having never claimed it, should not move it at the end either.
+#[tokio::test]
+async fn a_run_on_a_backlog_story_leaves_the_card_alone_at_both_ends() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+    set_story_status(&h.db, STORY_ID, "backlog").await;
+
+    let rt = h.build().await;
+    assert_eq!(story_status(&h.db, STORY_ID).await, "backlog");
+    rt.run().await.expect("run");
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "backlog");
+}
+
+#[tokio::test]
+async fn the_workspace_setting_switches_the_whole_behaviour_off() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+    disable_auto_advance(&h.db).await;
+
+    let rt = h.build().await;
+    assert_eq!(
+        story_status(&h.db, STORY_ID).await,
+        "ready",
+        "the card should not be claimed either"
+    );
+    rt.run().await.expect("run");
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "ready");
+}
+
+/// A card that moves on its own has to say why, or a user is left inferring it
+/// from a timestamp.
+#[tokio::test]
+async fn the_transition_is_recorded_against_the_run_that_caused_it() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    let run_id = h.run().await;
+
+    let event = h
+        .events(&run_id)
+        .await
+        .into_iter()
+        .find(|(t, _)| t == "story_status")
+        .expect("the move should be on the run's timeline");
+    let payload: Value = serde_json::from_str(&event.1).expect("payload is json");
+    assert_eq!(payload["storyId"], STORY_ID);
+    assert_eq!(payload["from"], "in_progress");
+    assert_eq!(payload["to"], "review");
+    assert!(
+        payload["reason"].as_str().unwrap_or_default().contains("done"),
+        "the reason should name the run's outcome: {payload}"
+    );
+}
+
+/// A pipeline step settles its own card like any other run.
+///
+/// A step owns a story of its own — `validate_pipeline_config` rejects a step
+/// that references the pipeline's story, and rejects two steps sharing one —
+/// so this cannot reach the pipeline's card. Exempting steps would be worse
+/// than doing nothing: the run start claims the card either way, so a step
+/// that never settled would leave it stuck at `in_progress` forever, which is
+/// the exact defect this feature exists to fix.
+#[tokio::test]
+async fn a_pipeline_step_settles_its_own_card() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    let mut rt = h.build().await;
+    rt.pipeline_run_id = Some("pipeline-1".to_string());
+    rt.run().await.expect("run");
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "review");
+}
+
+// ---------------------------------------------------------------------------
 // History tracking and retention
 // ---------------------------------------------------------------------------
 
@@ -750,7 +937,11 @@ async fn track_history_false_skips_token_events_but_keeps_the_terminal_one() {
     let run_id = h.run().await;
 
     let types: Vec<_> = h.events(&run_id).await.into_iter().map(|(t, _)| t).collect();
-    assert_eq!(types, vec!["complete"], "only critical events persist");
+    assert_eq!(
+        types,
+        vec!["complete", "story_status"],
+        "only critical events persist"
+    );
     // The live event stream is unaffected — only persistence is suppressed.
     assert_eq!(h.sink.kinds(), vec!["token", "token", "complete"]);
 }
@@ -765,7 +956,18 @@ async fn track_history_false_still_persists_tool_free_terminal_events_on_failure
     let _ = rt.run().await;
 
     let types: Vec<_> = h.events(&run_id).await.into_iter().map(|(t, _)| t).collect();
-    assert!(types.is_empty() || types == vec!["failed"], "got {types:?}");
+    // Whatever terminal record this path writes survives `track_history =
+    // false`, and the card's move is now part of that record — it is the only
+    // trace of why a story left `in_progress`, so suppressing it with the
+    // conversation would lose it entirely.
+    assert!(
+        types.contains(&"story_status".to_string()),
+        "the story transition must outlive history tracking: got {types:?}"
+    );
+    assert!(
+        types.iter().all(|t| t == "failed" || t == "error" || t == "story_status"),
+        "no conversation events should persist: got {types:?}"
+    );
 }
 
 #[tokio::test]
