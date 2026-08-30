@@ -62,6 +62,22 @@ pub enum RunEvent {
     Cancelled { run_id: String },
     /// The run failed with an error.
     Failed { run_id: String, message: String },
+    /// A transient provider failure is about to be retried.
+    ///
+    /// Emitted before the wait, not after, so a run that appears to hang for
+    /// thirty seconds says why while it is happening rather than afterwards.
+    Retrying {
+        run_id: String,
+        /// Which retry this is, counting from one.
+        attempt: u32,
+        /// The budget it is counting against.
+        max_retries: u32,
+        /// The classified failure being retried.
+        reason: String,
+        delay_secs: f64,
+        /// Whether the delay is the provider's own instruction or our backoff.
+        provider_requested_delay: bool,
+    },
     /// A gated tool call is parked, waiting for the user to decide.
     ///
     /// The run is not making progress and will not resume on its own. Emitted
@@ -103,6 +119,71 @@ pub enum RunEvent {
         /// summarisation call failed and it degraded to plain eviction.
         summarized: bool,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Why a run ended
+// ---------------------------------------------------------------------------
+
+/// A run that ended on a provider failure, with the classification intact.
+///
+/// `run()` returns this inside its `anyhow::Error`, so a caller that only logs
+/// `{e}` is unaffected while one deciding whether to try again can
+/// `downcast_ref` and ask. The alternative — formatting the `ApiError` into a
+/// string at the failure site — is what this story exists to undo: the
+/// evidence needed to tell a rate limit from a bad API key was being destroyed
+/// one line before it would have been useful.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct RunFailure {
+    /// What the timeline and the logs say.
+    pub message: String,
+    /// Whether another attempt is worth making, and how long to wait first.
+    pub kind: api::FailureKind,
+}
+
+impl RunFailure {
+    /// A failure with no provider error behind it — a ceiling the run hit
+    /// rather than a call that went wrong. Never retryable: a fresh attempt
+    /// meets the same ceiling with the same prompt.
+    pub fn deterministic(message: impl Into<String>) -> Self {
+        Self { message: message.into(), kind: api::FailureKind::Permanent }
+    }
+}
+
+/// Longest a backoff will ever wait, however many attempts have failed.
+pub(crate) const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait before retry number `attempt` (counting from one) when the
+/// provider did not state a delay of its own.
+///
+/// Exponential and capped, scaled by a factor in `[0.75, 1.25]` derived from
+/// the run id. The spread exists so a provider outage does not have every run
+/// in flight return at the same instant and reproduce it; deriving it from the
+/// run id rather than a random source spreads runs against each other while
+/// keeping any single run's schedule reproducible in a test.
+///
+/// The scaling is one positive multiplication rather than a signed offset
+/// added to the base, because `Duration::mul_f64` panics outright on a
+/// negative factor — which is not a hypothetical: an earlier form of this
+/// computed `±25%` as an offset and panicked for every run whose id happened
+/// to hash into the lower half of the range.
+pub(crate) fn backoff_delay(run_id: &str, attempt: u32) -> std::time::Duration {
+    const BASE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    // The `min` exists only to keep the shift in range; the growth is bounded
+    // by BACKOFF_CAP below, not by the exponent. Ceilinged too low, the cap
+    // becomes unreachable and the constant is a lie.
+    let exponential = BASE.saturating_mul(1u32 << attempt.min(8).saturating_sub(1));
+
+    // A cheap stable hash of the run id, in [0, 1000).
+    let spread = run_id
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(u32::from(b)))
+        % 1000;
+
+    let factor = 0.75 + 0.5 * (f64::from(spread) / 1000.0);
+    exponential.mul_f64(factor).min(BACKOFF_CAP)
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +367,15 @@ pub struct ConversationRuntime {
     /// call the user back.
     pub notifier: Option<Arc<dyn tools::Notifier>>,
 
+    /// How many times a failed provider call may be retried before the run
+    /// gives up.
+    ///
+    /// Retries happen *within* the run: the conversation, its completed tool
+    /// work and its worktree all survive, so a rate limit costs the wait and
+    /// nothing else. Zero — the default — is the behaviour every caller had
+    /// before retries existed.
+    pub max_retries: u32,
+
     /// How long a gated tool call waits for the user before giving up.
     ///
     /// `None` — the default — waits indefinitely, which is the whole point of
@@ -429,6 +519,7 @@ impl ConversationRuntime {
             usage_total: Usage::default(),
             last_usage: None,
             notifier: None,
+            max_retries: 0,
             approval_timeout: None,
             context_policy: ContextPolicy::default(),
             last_raw_estimate: None,
@@ -634,18 +725,20 @@ impl ConversationRuntime {
             // ---------------------------------------------------------------
             // Call the LLM and stream events.
             // ---------------------------------------------------------------
-            let stream_result = self.provider
-                .stream_completion(self.messages.clone(), tool_defs, self.config.clone())
-                .await;
-
-            let mut stream = match stream_result {
+            let mut stream = match self.stream_with_retries(tool_defs).await {
                 Ok(s) => s,
-                Err(e) => {
-                    let msg = format!("LLM call failed: {e}");
-                    error!(run_id = %self.run_id, "{msg}");
-                    self.emit(RunEvent::Failed { run_id: self.run_id.clone(), message: msg.clone() });
+                Err(failure) => {
+                    error!(
+                        run_id = %self.run_id,
+                        retryable = failure.kind.is_transient(),
+                        "{}", failure.message
+                    );
+                    self.emit(RunEvent::Failed {
+                        run_id: self.run_id.clone(),
+                        message: failure.message.clone(),
+                    });
                     self.finish_run("failed", iterations).await;
-                    return Err(anyhow::anyhow!(msg));
+                    return Err(anyhow::Error::new(failure));
                 }
             };
 
@@ -1330,6 +1423,127 @@ impl ConversationRuntime {
     }
 
     // -----------------------------------------------------------------------
+    // Retrying a failed provider call
+    // -----------------------------------------------------------------------
+
+    /// Ask the provider for a completion, trying again if the failure looks
+    /// transient.
+    ///
+    /// The retry happens here, around the one call that can fail transiently,
+    /// rather than around the whole run. The conversation so far, the tool
+    /// work already done and the run's worktree all survive a retry, so a rate
+    /// limit fifteen iterations in costs the wait and nothing else. Retrying
+    /// the whole run would discard that worktree and pay for those fifteen
+    /// iterations a second time to reach the same place.
+    ///
+    /// The other two ways a run can fail — exhausting `max_iterations`, and
+    /// exceeding the context budget under `context_strategy = "full"` — are
+    /// not reached from here at all. Both are deterministic: a fresh attempt
+    /// meets the same ceiling with the same prompt.
+    async fn stream_with_retries(
+        &self,
+        tool_defs: Vec<api::ToolDefinition>,
+    ) -> std::result::Result<api::provider::EventStream, RunFailure> {
+        let mut retries_used = 0u32;
+
+        loop {
+            let attempt = self
+                .provider
+                .stream_completion(self.messages.clone(), tool_defs.clone(), self.config.clone())
+                .await;
+
+            let error = match attempt {
+                Ok(stream) => return Ok(stream),
+                Err(e) => e,
+            };
+
+            // Classify before formatting: `error` is a typed `ApiError` here
+            // and a string everywhere after. Discarding it at this line is the
+            // defect this story exists to undo.
+            let kind = api::retry::classify(&error);
+            let message = format!("LLM call failed: {error}");
+
+            if !kind.is_transient() {
+                return Err(RunFailure { message, kind });
+            }
+            if retries_used >= self.max_retries {
+                return Err(RunFailure {
+                    message: format!(
+                        "{message} (gave up after {} attempt{})",
+                        retries_used + 1,
+                        if retries_used == 0 { "" } else { "s" }
+                    ),
+                    kind,
+                });
+            }
+
+            retries_used += 1;
+            let delay = kind.wait().unwrap_or_else(|| self.backoff_delay(retries_used));
+
+            warn!(
+                run_id = %self.run_id,
+                attempt = retries_used,
+                delay_secs = delay.as_secs_f64(),
+                "Retrying after a transient provider failure: {message}"
+            );
+            self.emit(RunEvent::Retrying {
+                run_id: self.run_id.clone(),
+                attempt: retries_used,
+                max_retries: self.max_retries,
+                reason: message.clone(),
+                delay_secs: delay.as_secs_f64(),
+                provider_requested_delay: kind.wait().is_some(),
+            });
+            self.persist_event(
+                "retry",
+                &serde_json::json!({
+                    "attempt": retries_used,
+                    "maxRetries": self.max_retries,
+                    "reason": message,
+                    "delaySecs": delay.as_secs_f64(),
+                    "providerRequestedDelay": kind.wait().is_some(),
+                }),
+            )
+            .await;
+
+            if self.sleep_unless_cancelled(delay).await {
+                // Stopping is the user's decision and outranks the retry.
+                return Err(RunFailure {
+                    message: format!("{message} (cancelled while waiting to retry)"),
+                    kind: api::FailureKind::Permanent,
+                });
+            }
+        }
+    }
+
+    /// How long to wait before retry number `attempt` when the provider did
+    /// not say.
+    fn backoff_delay(&self, attempt: u32) -> std::time::Duration {
+        backoff_delay(&self.run_id, attempt)
+    }
+
+    /// Wait `total`, giving up early if the run is cancelled.
+    ///
+    /// Returns whether the run was cancelled. `CancelFlag` is a polled bool
+    /// rather than something awaitable, so the wait is taken in slices — a run
+    /// sleeping out a sixty-second `retry-after` has to notice a stop button,
+    /// not finish its nap first.
+    async fn sleep_unless_cancelled(&self, total: std::time::Duration) -> bool {
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let mut remaining = total;
+        while !remaining.is_zero() {
+            if self.cancel.is_cancelled() {
+                return true;
+            }
+            let step = remaining.min(SLICE);
+            tokio::time::sleep(step).await;
+            remaining -= step;
+        }
+        self.cancel.is_cancelled()
+    }
+
+    // -----------------------------------------------------------------------
     // Board bookkeeping
     // -----------------------------------------------------------------------
 
@@ -1346,6 +1560,10 @@ impl ConversationRuntime {
     /// report; losing this one leaves a card claiming to be in flight forever,
     /// which is the whole defect.
     async fn settle_story(&self, status: &str) {
+        // Retries happen inside the run, so by the time this is reached the
+        // chain is over either way. The card was claimed once at the start and
+        // is settled once here — it never returns to `ready` between attempts,
+        // and a continuous-mode profile never sees it mid-chain.
         if !db::story_status::auto_advance_enabled(&self.db).await {
             return;
         }
@@ -1434,6 +1652,9 @@ impl ConversationRuntime {
                 // Whether a run was isolated decides whether its changes can be
                 // reverted at all. That must survive `track_history = false`.
                 | "isolation"
+                // Why a run sat still for thirty seconds. Without it the pause
+                // is indistinguishable from a hang.
+                | "retry"
         );
         if !critical && !self.track_history {
             return;

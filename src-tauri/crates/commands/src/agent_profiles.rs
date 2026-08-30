@@ -25,6 +25,8 @@ pub struct AgentProfile {
     pub cron_expression: Option<String>,
     pub continuous_poll_interval_secs: i64,
     pub max_iterations: i64,
+    /// How many times a failed provider call may be retried inside a run.
+    pub max_retries: i64,
     /// "global" or "workspace"
     pub scope: String,
     /// Absolute path to the source TOML file, if any.
@@ -48,6 +50,7 @@ pub struct CreateProfileInput {
     pub cron_expression: Option<String>,
     pub continuous_poll_interval_secs: Option<i64>,
     pub max_iterations: Option<i64>,
+    pub max_retries: Option<i64>,
     /// "global" or "workspace"
     pub scope: Option<String>,
 }
@@ -67,6 +70,7 @@ pub struct UpdateProfileInput {
     pub cron_expression: Option<String>,
     pub continuous_poll_interval_secs: Option<i64>,
     pub max_iterations: Option<i64>,
+    pub max_retries: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +94,7 @@ fn row_to_profile(row: &sqlx::sqlite::SqliteRow) -> AgentProfile {
         cron_expression:              row.try_get("cron_expression").ok().flatten(),
         continuous_poll_interval_secs: row.try_get("continuous_poll_interval_secs").unwrap_or(30),
         max_iterations:               row.try_get("max_iterations").unwrap_or(20),
+        max_retries:                  row.try_get("max_retries").unwrap_or(2),
         scope:                        row.try_get("scope").unwrap_or_else(|_| "global".into()),
         toml_path:                    row.try_get("toml_path").ok().flatten(),
         created_at:                   row.try_get("created_at").unwrap_or_default(),
@@ -111,7 +116,7 @@ pub async fn get_profiles(
                 "SELECT id, name, description, system_prompt, provider, model, context_strategy,
                         persistent_memory, max_input_tokens, max_output_tokens, run_mode,
                         cron_expression, continuous_poll_interval_secs, max_iterations,
-                        scope, toml_path, created_at, updated_at
+                        max_retries, scope, toml_path, created_at, updated_at
                  FROM agent_profiles
                  WHERE scope = 'global' OR (scope = 'workspace' AND workspace_id = ?)
                  ORDER BY created_at ASC",
@@ -126,7 +131,7 @@ pub async fn get_profiles(
                 "SELECT id, name, description, system_prompt, provider, model, context_strategy,
                         persistent_memory, max_input_tokens, max_output_tokens, run_mode,
                         cron_expression, continuous_poll_interval_secs, max_iterations,
-                        scope, toml_path, created_at, updated_at
+                        max_retries, scope, toml_path, created_at, updated_at
                  FROM agent_profiles
                  ORDER BY created_at ASC",
             )
@@ -144,7 +149,7 @@ pub async fn get_profile(id: String, db: &DbPool) -> Result<AgentProfile, String
         "SELECT id, name, description, system_prompt, provider, model, context_strategy,
                 persistent_memory, max_input_tokens, max_output_tokens, run_mode,
                 cron_expression, continuous_poll_interval_secs, max_iterations,
-                scope, toml_path, created_at, updated_at
+                max_retries, scope, toml_path, created_at, updated_at
          FROM agent_profiles WHERE id = ?",
     )
     .bind(&id)
@@ -168,6 +173,10 @@ pub async fn create_profile(
     let run_mode = input.run_mode.unwrap_or_else(|| "manual".into());
     let poll = input.continuous_poll_interval_secs.unwrap_or(30);
     let max_iter = input.max_iterations.unwrap_or(20);
+    // Matches the column default in `20260410000021_agent_max_retries.sql`:
+    // three attempts in total. A profile created through this API gets the
+    // same budget as one created before the column existed.
+    let max_retries = input.max_retries.unwrap_or(2);
     let scope = input.scope.unwrap_or_else(|| "global".into());
     // Only stamp workspace_id when creating a workspace-scoped profile.
     let effective_ws_id = if scope == "workspace" { workspace_id } else { None };
@@ -176,8 +185,9 @@ pub async fn create_profile(
         "INSERT INTO agent_profiles
              (id, name, description, system_prompt, provider, model, context_strategy,
               persistent_memory, max_input_tokens, max_output_tokens, run_mode,
-              cron_expression, continuous_poll_interval_secs, max_iterations, scope, workspace_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              cron_expression, continuous_poll_interval_secs, max_iterations, max_retries,
+              scope, workspace_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&input.name)
@@ -193,6 +203,7 @@ pub async fn create_profile(
     .bind(&input.cron_expression)
     .bind(poll)
     .bind(max_iter)
+    .bind(max_retries)
     .bind(&scope)
     .bind(&effective_ws_id)
     .execute(db)
@@ -223,13 +234,14 @@ pub async fn update_profile(
     let cron_expression    = input.cron_expression.or(current.cron_expression);
     let poll               = input.continuous_poll_interval_secs.unwrap_or(current.continuous_poll_interval_secs);
     let max_iter           = input.max_iterations.unwrap_or(current.max_iterations);
+    let max_retries        = input.max_retries.unwrap_or(current.max_retries);
 
     sqlx::query(
         "UPDATE agent_profiles
          SET name = ?, description = ?, system_prompt = ?, provider = ?, model = ?,
              context_strategy = ?, persistent_memory = ?, max_input_tokens = ?,
              max_output_tokens = ?, run_mode = ?, cron_expression = ?,
-             continuous_poll_interval_secs = ?, max_iterations = ?,
+             continuous_poll_interval_secs = ?, max_iterations = ?, max_retries = ?,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ?",
     )
@@ -246,6 +258,7 @@ pub async fn update_profile(
     .bind(&cron_expression)
     .bind(poll)
     .bind(max_iter)
+    .bind(max_retries)
     .bind(&id)
     .execute(db)
     .await

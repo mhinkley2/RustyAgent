@@ -178,6 +178,66 @@ function ContextCompactedEvent({ event }: { event: RunEvent }) {
   );
 }
 
+interface RetryDetail {
+  attempt: number;
+  maxRetries: number;
+  reason: string;
+  delaySecs: number;
+  providerRequestedDelay: boolean;
+}
+
+/**
+ * Whether a parsed payload really is a retry detail.
+ *
+ * `JSON.parse` succeeding says nothing about the shape. `delaySecs` arriving
+ * as a string would sail past a cast and then throw inside `toFixed`, and a
+ * throw in a render function blanks the whole panel — a malformed row would
+ * take out the timeline around it rather than just itself.
+ */
+function isRetryDetail(value: unknown): value is RetryDetail {
+  if (typeof value !== "object" || value === null) return false;
+  const d = value as Record<string, unknown>;
+  return (
+    typeof d.attempt === "number" &&
+    typeof d.maxRetries === "number" &&
+    typeof d.delaySecs === "number" &&
+    Number.isFinite(d.delaySecs) &&
+    typeof d.reason === "string" &&
+    typeof d.providerRequestedDelay === "boolean"
+  );
+}
+
+/**
+ * A retry is the explanation for a gap in the timeline, so it says how long
+ * the run waited and whether the provider chose that number or we did.
+ */
+function RetryEvent({ event }: { event: RunEvent }) {
+  let detail: RetryDetail | null = null;
+  try {
+    const parsed: unknown = JSON.parse(event.content ?? "");
+    detail = isRetryDetail(parsed) ? parsed : null;
+  } catch {
+    detail = null;
+  }
+  if (!detail) return <GenericEvent event={event} />;
+
+  const waited =
+    detail.delaySecs >= 1
+      ? `${detail.delaySecs.toFixed(detail.delaySecs % 1 === 0 ? 0 : 1)}s`
+      : `${Math.round(detail.delaySecs * 1000)}ms`;
+
+  return (
+    <div className="run-event run-event--retry">
+      <span className="run-event__label run-event__label--retry">↻ retry</span>
+      <p className="run-event__content">
+        Attempt {detail.attempt} of {detail.maxRetries} · waited {waited}{" "}
+        {detail.providerRequestedDelay ? "(provider's own backoff)" : "(backoff)"}
+      </p>
+      <pre className="run-event__reason">{detail.reason}</pre>
+    </div>
+  );
+}
+
 function GenericEvent({ event }: { event: RunEvent }) {
   return (
     <div className="run-event run-event--generic">
@@ -194,6 +254,7 @@ function EventRow({ event }: { event: RunEvent }) {
     case "tool_result":     return <ToolResultEvent event={event} />;
     case "error":           return <ErrorEvent event={event} />;
     case "context_compacted": return <ContextCompactedEvent event={event} />;
+    case "retry":           return <RetryEvent event={event} />;
     default:                return <GenericEvent event={event} />;
   }
 }

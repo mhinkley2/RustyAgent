@@ -37,7 +37,15 @@ pub enum MockResponse {
     /// ends normally — this is not a transport failure.
     Error(String),
     /// Fail the `stream_completion` call itself, before any event is produced.
+    ///
+    /// `ApiError::Provider` — opaque, and so never retried.
     ProviderError(String),
+    /// Fail the call with a rate limit carrying the provider's own backoff.
+    RateLimited { retry_after_secs: u64 },
+    /// Fail the call with an HTTP status, for exercising the 5xx / 4xx split.
+    HttpFailure { status: u16 },
+    /// Fail the call as if the connection died before the stream opened.
+    StreamEnded,
 }
 
 impl MockResponse {
@@ -167,8 +175,19 @@ impl LlmProvider for MockLlmProvider {
             queue.remove(0)
         };
 
-        if let MockResponse::ProviderError(msg) = response {
-            return Err(ApiError::Provider(msg));
+        // Failures of the call itself, before any event is produced. Each maps
+        // to the `ApiError` variant a real provider would raise, so a consumer
+        // testing against these is testing against the same classification.
+        match response {
+            MockResponse::ProviderError(msg) => return Err(ApiError::Provider(msg)),
+            MockResponse::RateLimited { retry_after_secs } => {
+                return Err(ApiError::RateLimited { retry_after_secs })
+            }
+            MockResponse::HttpFailure { status } => {
+                return Err(ApiError::Http { status, body: format!("mock HTTP {status}") })
+            }
+            MockResponse::StreamEnded => return Err(ApiError::StreamEnded),
+            _ => {}
         }
 
         let usage = self.usage;
@@ -199,7 +218,12 @@ impl LlmProvider for MockLlmProvider {
                     yield StreamEvent::Done { stop_reason: "error".to_string(), usage };
                 }
                 // Handled above, before the stream is built.
-                MockResponse::ProviderError(_) => unreachable!(),
+                // Every call-failure variant returned above, before the
+                // stream was built.
+                MockResponse::ProviderError(_)
+                | MockResponse::RateLimited { .. }
+                | MockResponse::HttpFailure { .. }
+                | MockResponse::StreamEnded => unreachable!(),
             }
         };
 

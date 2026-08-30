@@ -214,6 +214,24 @@ pub async fn touch_workspace(db: &DbPool, path: &std::path::Path) -> Result<Work
 
 #[cfg(test)]
 mod tests {
+    /// The retry budget ships enabled. A column added with a default of zero
+    /// would be a setting that exists and does nothing, which is the failure
+    /// mode this repo has hit before with `context_strategy` and
+    /// `allow_network_hosts`.
+    #[tokio::test]
+    async fn an_agent_profile_gets_a_retry_budget_by_default() {
+        let db = crate::testing::make_test_pool().await;
+        crate::testing::seed_profile(&db, "p1", "An agent").await;
+
+        let max_retries: i64 = sqlx::query_scalar("SELECT max_retries FROM agent_profiles WHERE id = ?")
+            .bind("p1")
+            .fetch_one(&db)
+            .await
+            .expect("read max_retries");
+
+        assert_eq!(max_retries, 2, "three attempts in total");
+    }
+
     use super::*;
     use sqlx::Row;
     use std::env;

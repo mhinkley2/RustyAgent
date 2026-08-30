@@ -5,6 +5,7 @@ pub mod error;
 pub mod keychain;
 pub mod types;
 pub mod pricing;
+pub mod retry;
 pub mod tokens;
 pub mod provider;
 pub mod anthropic;
@@ -18,6 +19,7 @@ pub mod mock;
 mod contract_tests;
 
 pub use error::ApiError;
+pub use retry::{classify, FailureKind};
 pub use keychain::ApiKeyStore;
 pub use types::{
     ChatMessage, MessageRole, ToolDefinition, ToolCall, ToolResult,

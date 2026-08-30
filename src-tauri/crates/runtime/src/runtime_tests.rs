@@ -125,6 +125,9 @@ struct Harness {
     /// long as it takes.
     approval_timeout: Option<std::time::Duration>,
     notifier: RecordingNotifier,
+    /// How many times a failed provider call may be retried. Zero is the
+    /// behaviour every caller had before retries existed.
+    max_retries: u32,
 }
 
 impl Harness {
@@ -155,6 +158,7 @@ impl Harness {
             workspace_root: None,
             approval_timeout: None,
             notifier: RecordingNotifier::new(),
+            max_retries: 0,
         }
     }
 
@@ -187,6 +191,7 @@ impl Harness {
         .expect("build runtime");
         rt.context_policy = self.context_policy;
         rt.approval_timeout = self.approval_timeout;
+        rt.max_retries = self.max_retries;
         rt.notifier = Some(self.notifier.handle());
         rt
     }
@@ -744,6 +749,342 @@ async fn running_out_of_scripted_responses_fails_rather_than_hanging() {
 }
 
 // ---------------------------------------------------------------------------
+// Retrying a transient provider failure
+// ---------------------------------------------------------------------------
+
+/// `Duration::mul_f64` panics on a negative factor. An earlier form of the
+/// backoff expressed its jitter as a signed offset, which meant every run
+/// whose id hashed into the lower half of the range panicked on its first
+/// retry — roughly half of them. The suite caught it; this keeps it caught.
+#[test]
+fn the_backoff_never_panics_whatever_the_run_id_hashes_to() {
+    use crate::runtime::{backoff_delay, BACKOFF_CAP};
+
+    for i in 0..1000 {
+        let run_id = format!("{}-{i}", uuid::Uuid::new_v4());
+        for attempt in 1..=8 {
+            let delay = backoff_delay(&run_id, attempt);
+            assert!(delay <= BACKOFF_CAP, "{run_id} attempt {attempt} exceeded the cap");
+            assert!(!delay.is_zero(), "a backoff of zero is a busy loop");
+        }
+    }
+}
+
+#[test]
+fn the_backoff_grows_with_the_attempt_and_stops_at_the_cap() {
+    use crate::runtime::{backoff_delay, BACKOFF_CAP};
+
+    let run_id = "a-fixed-run-id";
+    let first = backoff_delay(run_id, 1);
+    let second = backoff_delay(run_id, 2);
+    let far = backoff_delay(run_id, 12);
+
+    assert!(second > first, "a second failure should wait longer than the first");
+    assert_eq!(far, BACKOFF_CAP, "growth stops rather than running away");
+}
+
+/// Two runs failing at the same instant must not return together, or the
+/// retry itself reproduces the outage that caused it.
+#[test]
+fn two_runs_do_not_come_back_at_the_same_moment() {
+    use crate::runtime::backoff_delay;
+
+    let a = backoff_delay("run-aaaaaaaa", 1);
+    let b = backoff_delay("run-bbbbbbbb", 1);
+
+    assert_ne!(a, b);
+}
+
+/// The case the story opens with: a run dies on a rate limit and stays dead
+/// until a human notices, even though the provider said exactly how long to
+/// wait.
+#[tokio::test]
+async fn a_rate_limited_call_is_retried_and_the_run_carries_on() {
+    let mut h = Harness::new(vec![
+        MockResponse::RateLimited { retry_after_secs: 1 },
+        MockResponse::text("recovered"),
+    ])
+    .await;
+    h.max_retries = 2;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert_eq!(h.sink.text(), "recovered");
+    assert_eq!(h.calls().len(), 2, "the failed call should have been made again");
+}
+
+#[tokio::test]
+async fn a_dropped_connection_is_retried() {
+    let mut h = Harness::new(vec![
+        MockResponse::StreamEnded,
+        MockResponse::text("recovered"),
+    ])
+    .await;
+    h.max_retries = 1;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+}
+
+#[tokio::test]
+async fn a_server_error_is_retried() {
+    let mut h = Harness::new(vec![
+        MockResponse::HttpFailure { status: 503 },
+        MockResponse::text("recovered"),
+    ])
+    .await;
+    h.max_retries = 1;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+}
+
+/// A 401 is a configuration error. Retrying it burns the budget to be refused
+/// in exactly the same way.
+#[tokio::test]
+async fn an_unauthorized_call_is_not_retried() {
+    let mut h = Harness::new(vec![
+        MockResponse::HttpFailure { status: 401 },
+        MockResponse::text("never reached"),
+    ])
+    .await;
+    h.max_retries = 5;
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let result = rt.run().await;
+
+    assert!(result.is_err());
+    assert_eq!(h.status(&run_id).await, "failed");
+    assert_eq!(h.calls().len(), 1, "a client error must be asked exactly once");
+}
+
+#[tokio::test]
+async fn an_opaque_provider_error_is_not_retried() {
+    let mut h = Harness::new(vec![
+        MockResponse::ProviderError("something went wrong".into()),
+        MockResponse::text("never reached"),
+    ])
+    .await;
+    h.max_retries = 5;
+
+    let rt = h.build().await;
+    let _ = rt.run().await;
+
+    assert_eq!(h.calls().len(), 1);
+}
+
+/// The bound has to be read, not just stored — this repo has shipped inert
+/// settings before.
+#[tokio::test]
+async fn the_budget_bounds_the_number_of_attempts() {
+    for budget in [0u32, 1, 3] {
+        // A provider-stated delay of zero: the retry path is the same, and the
+        // suite does not spend eight seconds asleep proving arithmetic that
+        // `backoff_delay`'s own tests already cover.
+        let mut h = Harness::new(vec![
+            MockResponse::RateLimited { retry_after_secs: 0 },
+            MockResponse::RateLimited { retry_after_secs: 0 },
+            MockResponse::RateLimited { retry_after_secs: 0 },
+            MockResponse::RateLimited { retry_after_secs: 0 },
+            MockResponse::RateLimited { retry_after_secs: 0 },
+        ])
+        .await;
+        h.max_retries = budget;
+
+        let rt = h.build().await;
+        let run_id = rt.run_id.clone();
+        let _ = rt.run().await;
+
+        assert_eq!(
+            h.calls().len(),
+            (budget + 1) as usize,
+            "a budget of {budget} should make {} attempts",
+            budget + 1
+        );
+        assert_eq!(h.status(&run_id).await, "failed");
+    }
+}
+
+/// The failure that ends the chain keeps its classification, so a caller can
+/// tell "the network was down for three attempts" from "the key is wrong".
+#[tokio::test]
+async fn an_exhausted_budget_still_reports_what_kind_of_failure_it_was() {
+    let mut h = Harness::new(vec![MockResponse::StreamEnded, MockResponse::StreamEnded]).await;
+    h.max_retries = 1;
+
+    let rt = h.build().await;
+    let err = rt.run().await.expect_err("the run should fail");
+
+    let failure = err
+        .downcast_ref::<crate::runtime::RunFailure>()
+        .expect("the classification should survive to the caller");
+    assert!(failure.kind.is_transient(), "it failed transiently, repeatedly");
+    assert!(failure.message.contains("gave up after 2 attempts"), "{}", failure.message);
+}
+
+/// A run that appears to sit still for thirty seconds has to say why while it
+/// is happening.
+#[tokio::test]
+async fn each_retry_is_announced_before_the_wait() {
+    let mut h = Harness::new(vec![
+        MockResponse::RateLimited { retry_after_secs: 2 },
+        MockResponse::text("recovered"),
+    ])
+    .await;
+    h.max_retries = 1;
+
+    let run_id = h.run().await;
+
+    let retries: Vec<_> = h
+        .sink
+        .run_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Retrying { attempt, max_retries, delay_secs, provider_requested_delay, .. } => {
+                Some((attempt, max_retries, delay_secs, provider_requested_delay))
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].0, 1, "attempt number");
+    assert_eq!(retries[0].1, 1, "out of the budget");
+    assert_eq!(retries[0].2, 2.0, "the provider asked for two seconds");
+    assert!(retries[0].3, "and it was the provider's number, not our backoff");
+
+    let types: Vec<_> = h.events(&run_id).await.into_iter().map(|(t, _)| t).collect();
+    assert!(types.contains(&"retry".to_string()), "{types:?}");
+}
+
+/// Waiting is only correct while the user still wants the run. A sixty-second
+/// `retry-after` must not outlive a stop button.
+#[tokio::test]
+async fn cancelling_during_a_backoff_stops_the_run_rather_than_finishing_the_nap() {
+    let mut h = Harness::new(vec![
+        MockResponse::RateLimited { retry_after_secs: 600 },
+        MockResponse::text("never reached"),
+    ])
+    .await;
+    h.max_retries = 3;
+
+    let rt = h.build().await;
+    let run_id = rt.run_id.clone();
+    let cancel = h.cancel.clone();
+    let runner = tokio::spawn(async move { rt.run().await });
+
+    // Let the first call fail and the wait begin.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("the run must not wait out its backoff after being cancelled")
+        .expect("join");
+
+    assert!(result.is_err());
+    assert_eq!(h.calls().len(), 1, "no attempt after the cancel");
+    assert_eq!(h.status(&run_id).await, "failed");
+}
+
+/// Retrying inside the run is what makes this cheap: the messages, the
+/// completed tool work and the worktree all survive, so nothing is redone.
+#[tokio::test]
+async fn a_retry_does_not_repeat_tool_work_already_done() {
+    let tool = StubTool::new("file_write", "written");
+    let calls = tool.calls();
+    let h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_write", json!({ "path": "a.txt" })),
+        MockResponse::StreamEnded,
+        MockResponse::text("finished"),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    let mut h = h;
+    h.max_retries = 1;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "done");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the tool ran before the failure and must not run again"
+    );
+}
+
+/// Deterministic failures are not retried however much budget is left. A fresh
+/// attempt meets the same ceiling with the same prompt, so retrying doubles the
+/// spend to arrive in the same place.
+#[tokio::test]
+async fn a_run_that_hits_its_iteration_ceiling_is_not_retried() {
+    let tool = StubTool::new("file_write", "written");
+    let mut h = Harness::new(vec![
+        MockResponse::tool_call("c1", "file_write", json!({ "path": "a.txt" })),
+        MockResponse::tool_call("c2", "file_write", json!({ "path": "b.txt" })),
+        MockResponse::tool_call("c3", "file_write", json!({ "path": "c.txt" })),
+    ])
+    .await
+    .with_tool(Box::new(tool))
+    .await;
+    h.max_iterations = 2;
+    h.max_retries = 5;
+
+    let run_id = h.run().await;
+
+    assert_eq!(h.status(&run_id).await, "failed");
+    assert_eq!(
+        h.calls().len(),
+        2,
+        "the ceiling stops the run; the retry budget must not reopen it"
+    );
+}
+
+/// A run that exhausts its retries is a failed run like any other, and its
+/// card follows the same rule — `blocked`, never back to `ready`.
+#[tokio::test]
+async fn a_run_that_exhausts_its_retries_blocks_its_story() {
+    let mut h = Harness::new(vec![MockResponse::StreamEnded, MockResponse::StreamEnded]).await;
+    h.max_retries = 1;
+
+    let rt = h.build().await;
+    let _ = rt.run().await;
+
+    assert_eq!(story_status(&h.db, STORY_ID).await, "blocked");
+}
+
+/// And it stays `in_progress` while the chain is still running, so a
+/// continuous-mode profile cannot pick it up between attempts.
+#[tokio::test]
+async fn the_card_stays_in_progress_for_the_whole_chain() {
+    let mut h = Harness::new(vec![
+        MockResponse::RateLimited { retry_after_secs: 600 },
+        MockResponse::text("recovered"),
+    ])
+    .await;
+    h.max_retries = 1;
+
+    let rt = h.build().await;
+    let cancel = h.cancel.clone();
+    let runner = tokio::spawn(async move { rt.run().await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        story_status(&h.db, STORY_ID).await,
+        "in_progress",
+        "the card must not flicker to blocked between attempts"
+    );
+
+    cancel.cancel();
+    let _ = runner.await;
+}
+
+// ---------------------------------------------------------------------------
 // The story's card
 // ---------------------------------------------------------------------------
 
@@ -1198,14 +1539,17 @@ async fn a_configured_approval_timeout_expires_without_recording_a_user_decision
     .with_tool(Box::new(tool))
     .await;
     h.policy = approval_policy();
-    h.approval_timeout = Some(std::time::Duration::from_secs(60));
+    // A real, short limit rather than a long one driven by a paused clock:
+    // advancing time depended on the run task having armed its timer first,
+    // which a loaded suite does not guarantee. What matters here is the
+    // recorded outcome, not the duration.
+    h.approval_timeout = Some(std::time::Duration::from_millis(100));
 
     let rt = h.build().await;
     let run_id = rt.run_id.clone();
     let runner = tokio::spawn(async move { rt.run().await });
 
     let approval_id = await_approval_id(&h.db).await;
-    advance(std::time::Duration::from_secs(61)).await;
     runner.await.expect("join").expect("run");
 
     let (status, reason) = approval_row(&h.db, &approval_id).await;
