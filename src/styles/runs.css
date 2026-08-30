@@ -754,7 +754,18 @@
   display: block;
 }
 
-/* A retry explains a gap in the timeline — warning-coloured, not error. */
-.run-event--retry .run-event__label--retry {
-  color: var(--color-warning, #f59e0b);
+/* A retry explains a gap in the timeline. It is not a failure — the run
+   carried on — so it must not borrow the red that `run-event__error-content`
+   paints everywhere else, or a recovered rate limit reads like a dead run. */
+.run-event--retry .run-event__label--retry,
+.run-event--retry .run-event__reason {
+  color: var(--warning, #f59e0b);
+}
+
+.run-event__reason {
+  margin: 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
 }

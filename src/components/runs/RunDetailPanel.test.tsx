@@ -177,6 +177,50 @@ describe("RunDetailPanel retries", () => {
     expect(await screen.findByText(/waited 250ms/)).toBeInTheDocument();
   });
 
+  // `JSON.parse` succeeding says nothing about the shape. A `delaySecs` that
+  // arrives as a string sails past the cast and throws inside `toFixed`, and a
+  // throw in a render function blanks the timeline around it, not just the row.
+  it("falls back rather than throwing when a field has the wrong type", async () => {
+    renderWithEvents([
+      retryEvent({
+        attempt: 1,
+        maxRetries: 2,
+        reason: "LLM call failed",
+        delaySecs: "30",
+        providerRequestedDelay: true,
+      }),
+    ]);
+
+    expect(await screen.findByText("retry")).toBeInTheDocument();
+    expect(screen.queryByText(/Attempt 1 of 2/)).not.toBeInTheDocument();
+  });
+
+  it("falls back when a field is missing entirely", async () => {
+    renderWithEvents([retryEvent({ attempt: 1, reason: "LLM call failed" })]);
+
+    expect(await screen.findByText("retry")).toBeInTheDocument();
+  });
+
+  it("falls back on a payload that is valid JSON but not an object", async () => {
+    renderWithEvents([
+      {
+        id: "e1",
+        run_id: "run-1",
+        event_type: "retry",
+        role: null,
+        content: "42",
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        sequence_num: 0,
+        created_at: "2026-04-13T00:00:30Z",
+      },
+    ]);
+
+    expect(await screen.findByText("retry")).toBeInTheDocument();
+  });
+
   it("falls back to the generic row rather than blanking on an unreadable payload", async () => {
     renderWithEvents([
       {

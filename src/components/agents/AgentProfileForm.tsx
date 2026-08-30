@@ -43,6 +43,7 @@ interface FormState {
   cron_expression: string;
   continuous_poll_interval_secs: number | "";
   max_iterations: number | "";
+  max_retries: number | "";
   scope: "global" | "workspace";
 }
 
@@ -62,6 +63,7 @@ const DEFAULT_FORM: FormState = {
   cron_expression: "",
   continuous_poll_interval_secs: 30,
   max_iterations: 20,
+  max_retries: 2,
   scope: "global",
 };
 
@@ -80,6 +82,7 @@ function profileToForm(p: AgentProfile): FormState {
     cron_expression:              p.cron_expression ?? "",
     continuous_poll_interval_secs: p.continuous_poll_interval_secs,
     max_iterations:               p.max_iterations,
+    max_retries:                  p.max_retries,
     scope:                        p.scope ?? "global",
   };
 }
@@ -109,6 +112,7 @@ function formToInput(form: FormState): CreateProfileInput {
     cron_expression:              form.cron_expression.trim() || null,
     continuous_poll_interval_secs: form.continuous_poll_interval_secs === "" ? 30 : form.continuous_poll_interval_secs,
     max_iterations:               form.max_iterations === "" ? 20 : form.max_iterations,
+    max_retries:                  form.max_retries === "" ? 2 : form.max_retries,
     scope:                        form.scope,
   };
 }
@@ -448,6 +452,21 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
                 onChange={v => set("max_iterations", v)}
                 min={1}
                 max={200}
+              />
+            )}
+          </FormField>
+
+          <FormField
+            label="Max retries"
+            helperText="Retries of a failed provider call, within the run — a rate limit costs the wait, not the work already done. 0 disables retrying."
+          >
+            {(id) => (
+              <NumberInput
+                id={id}
+                value={form.max_retries}
+                onChange={v => set("max_retries", v)}
+                min={0}
+                max={10}
               />
             )}
           </FormField>

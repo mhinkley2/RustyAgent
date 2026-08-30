@@ -187,13 +187,35 @@ interface RetryDetail {
 }
 
 /**
+ * Whether a parsed payload really is a retry detail.
+ *
+ * `JSON.parse` succeeding says nothing about the shape. `delaySecs` arriving
+ * as a string would sail past a cast and then throw inside `toFixed`, and a
+ * throw in a render function blanks the whole panel — a malformed row would
+ * take out the timeline around it rather than just itself.
+ */
+function isRetryDetail(value: unknown): value is RetryDetail {
+  if (typeof value !== "object" || value === null) return false;
+  const d = value as Record<string, unknown>;
+  return (
+    typeof d.attempt === "number" &&
+    typeof d.maxRetries === "number" &&
+    typeof d.delaySecs === "number" &&
+    Number.isFinite(d.delaySecs) &&
+    typeof d.reason === "string" &&
+    typeof d.providerRequestedDelay === "boolean"
+  );
+}
+
+/**
  * A retry is the explanation for a gap in the timeline, so it says how long
  * the run waited and whether the provider chose that number or we did.
  */
 function RetryEvent({ event }: { event: RunEvent }) {
   let detail: RetryDetail | null = null;
   try {
-    detail = JSON.parse(event.content ?? "") as RetryDetail;
+    const parsed: unknown = JSON.parse(event.content ?? "");
+    detail = isRetryDetail(parsed) ? parsed : null;
   } catch {
     detail = null;
   }
@@ -211,7 +233,7 @@ function RetryEvent({ event }: { event: RunEvent }) {
         Attempt {detail.attempt} of {detail.maxRetries} · waited {waited}{" "}
         {detail.providerRequestedDelay ? "(provider's own backoff)" : "(backoff)"}
       </p>
-      <pre className="run-event__error-content">{detail.reason}</pre>
+      <pre className="run-event__reason">{detail.reason}</pre>
     </div>
   );
 }

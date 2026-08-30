@@ -19,6 +19,8 @@ export interface AgentProfile {
   cron_expression: string | null;
   continuous_poll_interval_secs: number;
   max_iterations: number;
+  /** How many times a failed provider call may be retried inside a run. */
+  max_retries: number;
   scope: "global" | "workspace";
   toml_path: string | null;
   created_at: string;
@@ -39,6 +41,7 @@ export interface CreateProfileInput {
   cron_expression?: string | null;
   continuous_poll_interval_secs?: number;
   max_iterations?: number;
+  max_retries?: number;
   scope?: "global" | "workspace";
 }
 
