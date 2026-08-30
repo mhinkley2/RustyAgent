@@ -119,15 +119,19 @@ to `ready` while a continuous-mode profile is polling gets re-picked
 immediately, and the two loop without bound against work that just failed —
 spending API budget with nobody watching.
 
-An automatic transition only ever moves a card that is still `in_progress`. If
-you moved it yourself, or the agent called `update_story_status`, that is a
-decision and it stands. Chat sessions are rows in the same table but are never
+An automatic transition only ever moves a card it can see nobody has decided
+about: `ready` to claim it, `in_progress` to settle it. If you moved it
+yourself, or the agent called `update_story_status`, that is a decision and it
+stands — a run started against a card sitting in `blocked` leaves it there, at
+both ends. Chat sessions are rows in the same table but are never
 moved, so conversations stay off the board.
 
-Every automatic move is recorded as a `story_status` event on the timeline of
-the run that caused it — a run finishing, a pipeline finishing, or the startup
-sweep — so a card that moves says where to and why. A card left alone writes
-nothing, because nothing happened to it.
+Every move *off* `in_progress` is recorded as a `story_status` event on the
+timeline of the run that caused it — a run finishing, a pipeline finishing, or
+the startup sweep — so a card that moves says where to and why. A card left
+alone writes nothing, because nothing happened to it. The move *onto*
+`in_progress` needs no event of its own: a card in progress with a run
+attached to it is already the record of what claimed it, and when.
 
 To switch the whole behaviour off, set `auto_advance_story_status` to `false`
 in the active workspace's settings:

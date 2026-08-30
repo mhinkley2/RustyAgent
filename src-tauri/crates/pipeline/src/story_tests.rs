@@ -9,7 +9,7 @@
 use db::testing::make_test_pool;
 use db::DbPool;
 
-use crate::settle_pipeline_story;
+use crate::{claim_pipeline_story, settle_pipeline_story};
 
 const PIPELINE_STORY: &str = "pipeline-story";
 const STEP_STORY: &str = "step-story";
@@ -25,6 +25,20 @@ async fn seed_story(db: &DbPool, id: &str, status: &str) {
         .expect("seed story");
 }
 
+async fn disable_auto_advance(db: &DbPool) {
+    sqlx::query("INSERT INTO workspaces (id, name, path) VALUES ('w1', 'W', '/tmp/w')")
+        .execute(db)
+        .await
+        .expect("seed workspace");
+    sqlx::query(
+        "INSERT INTO workspace_settings (workspace_id, settings_json) \
+         VALUES ('w1', '{\"auto_advance_story_status\": false}')",
+    )
+    .execute(db)
+    .await
+    .expect("seed workspace settings");
+}
+
 async fn status_of(db: &DbPool, id: &str) -> String {
     sqlx::query_scalar("SELECT status FROM stories WHERE id = ?")
         .bind(id)
@@ -32,6 +46,64 @@ async fn status_of(db: &DbPool, id: &str) -> String {
         .await
         .expect("read status")
 }
+
+// ---------------------------------------------------------------------------
+// Claiming, at the start
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_starting_pipeline_claims_a_ready_card() {
+    let db = make_test_pool().await;
+    seed_story(&db, PIPELINE_STORY, "ready").await;
+
+    claim_pipeline_story(&db, PIPELINE_STORY).await;
+
+    assert_eq!(status_of(&db, PIPELINE_STORY).await, "in_progress");
+}
+
+/// The bare `UPDATE stories SET status = 'in_progress'` this replaced answered
+/// to nothing: a pipeline started against a card a human had moved to
+/// `blocked` dragged it straight back into the in-progress column.
+#[tokio::test]
+async fn a_starting_pipeline_does_not_drag_back_a_card_someone_moved() {
+    let db = make_test_pool().await;
+    seed_story(&db, PIPELINE_STORY, "blocked").await;
+
+    claim_pipeline_story(&db, PIPELINE_STORY).await;
+
+    assert_eq!(status_of(&db, PIPELINE_STORY).await, "blocked");
+}
+
+#[tokio::test]
+async fn the_workspace_setting_switches_pipeline_claiming_off_too() {
+    let db = make_test_pool().await;
+    seed_story(&db, PIPELINE_STORY, "ready").await;
+    disable_auto_advance(&db).await;
+
+    claim_pipeline_story(&db, PIPELINE_STORY).await;
+
+    assert_eq!(status_of(&db, PIPELINE_STORY).await, "ready");
+}
+
+/// Both ends of a pipeline, in the order `start_pipeline` runs them: the claim
+/// lands before the executor is spawned, so a pipeline short enough to finish
+/// immediately still finds a card in `in_progress` to settle. Reversed, the
+/// settle would no-op against a `ready` card and the claim behind it would
+/// leave the card stuck in progress forever.
+#[tokio::test]
+async fn a_pipeline_that_finishes_instantly_still_leaves_its_card_settled() {
+    let db = make_test_pool().await;
+    seed_story(&db, PIPELINE_STORY, "ready").await;
+
+    claim_pipeline_story(&db, PIPELINE_STORY).await;
+    settle_pipeline_story(&db, PIPELINE_RUN, PIPELINE_STORY, "done").await;
+
+    assert_eq!(status_of(&db, PIPELINE_STORY).await, "review");
+}
+
+// ---------------------------------------------------------------------------
+// Settling, at the end
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_completed_pipeline_sends_its_card_to_review() {
@@ -148,17 +220,7 @@ async fn a_card_someone_moved_during_the_pipeline_is_left_alone() {
 async fn the_workspace_setting_switches_the_pipeline_side_off_too() {
     let db = make_test_pool().await;
     seed_story(&db, PIPELINE_STORY, "in_progress").await;
-    sqlx::query("INSERT INTO workspaces (id, name, path) VALUES ('w1', 'W', '/tmp/w')")
-        .execute(&db)
-        .await
-        .expect("seed workspace");
-    sqlx::query(
-        "INSERT INTO workspace_settings (workspace_id, settings_json) \
-         VALUES ('w1', '{\"auto_advance_story_status\": false}')",
-    )
-    .execute(&db)
-    .await
-    .expect("seed workspace settings");
+    disable_auto_advance(&db).await;
 
     settle_pipeline_story(&db, PIPELINE_RUN, PIPELINE_STORY, "done").await;
 

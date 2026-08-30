@@ -150,6 +150,30 @@ pub fn resolve_parallel_limit(workspace: Option<u32>, global: Option<u32>) -> us
         .unwrap_or(DEFAULT_MAX_PARALLEL_STEPS)
 }
 
+/// Claim a pipeline's own story card as the pipeline starts.
+///
+/// This used to be a bare `UPDATE stories SET status = 'in_progress'`, which
+/// answered to nothing: not the workspace toggle, and not the rule that an
+/// automatic transition may not overwrite a status somebody chose. A pipeline
+/// started against a card a human had moved to `blocked` dragged it back into
+/// the in-progress column.
+///
+/// Split out for the same reason as [`settle_pipeline_story`]: the function
+/// around it needs a concrete `tauri::AppHandle` and this does not.
+pub(crate) async fn claim_pipeline_story(db: &DbPool, story_id: &str) {
+    if !db::story_status::auto_advance_enabled(db).await {
+        return;
+    }
+    match db::story_status::claim_story(db, story_id).await {
+        Ok(true) => debug!(story_id = %story_id, "Pipeline story claimed"),
+        Ok(false) => debug!(
+            story_id = %story_id,
+            "Pipeline story was not ready; leaving it where it is"
+        ),
+        Err(e) => error!(story_id = %story_id, "Failed to claim the pipeline story: {e}"),
+    }
+}
+
 /// Move a finished pipeline's own story card.
 ///
 /// Each step owns a separate story and settles its own card through
@@ -344,6 +368,13 @@ pub async fn start_pipeline(
     };
     pipeline.runs.insert(pipeline_run_id.clone(), progress);
 
+    // Claim the card before the executor starts, not after it is spawned. A
+    // pipeline short enough to finish first would otherwise settle a card
+    // still sitting in `ready` — a no-op — and then be handed `in_progress` by
+    // a claim arriving behind it, leaving it stuck exactly as this feature
+    // exists to prevent.
+    claim_pipeline_story(&db, &story_id).await;
+
     // Spawn the async pipeline executor
     let pid = pipeline_run_id.clone();
     let story_id_for_settle = story_id.clone();
@@ -387,12 +418,6 @@ pub async fn start_pipeline(
     });
 
     pipeline.tasks.insert(pipeline_run_id.clone(), handle);
-
-    // Mark the pipeline story as in_progress
-    let _ = sqlx::query("UPDATE stories SET status = 'in_progress' WHERE id = ?")
-        .bind(&story_id)
-        .execute(&db)
-        .await;
 
     Ok(pipeline_run_id)
 }
