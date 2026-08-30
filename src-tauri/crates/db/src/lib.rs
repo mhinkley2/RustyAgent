@@ -23,6 +23,9 @@ pub mod testing;
 mod paths_tests;
 
 #[cfg(test)]
+mod migration_lock_tests;
+
+#[cfg(test)]
 mod recovery_tests;
 
 pub struct WorkspaceRecord {
