@@ -57,7 +57,11 @@ impl Tool for SendNotificationTool {
                 // copy, in a log file that outlives the toast, of text the
                 // user saw once and the model chose freely.
                 info!(body_len = body.len(), "Notification delivered [{title}]");
-                ToolOutput::ok(format!("Notification delivered: {title} — {body}"))
+                // The body is not echoed back. The model supplied it one turn
+                // ago and `run_events.tool_input` already holds it verbatim,
+                // so repeating it in the result buys no information and costs
+                // context on every notification an agent sends.
+                ToolOutput::ok(format!("Notification delivered: {title}"))
             }
             Err(reason) => {
                 warn!("Notification delivery failed [{title}]: {reason}");

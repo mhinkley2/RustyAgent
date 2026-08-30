@@ -331,13 +331,20 @@ export function useRunEvents(runId: string | null): UseRunEventsReturn {
     };
   }, [runId]);
 
-  const events = useMemo(
-    () => [
+  const events = useMemo(() => {
+    // Continue the fetched rows' own numbering rather than counting them.
+    // `get_run_events` returns a whole run ordered by `sequence_num`, and
+    // pruning drops whole runs rather than rows within one, so today the count
+    // and the last number agree. Deriving it from the row means they cannot
+    // disagree later either — if that query ever grows a limit, counting would
+    // silently hand two rows the same number.
+    const last = fetched[fetched.length - 1];
+    const base = last ? last.sequenceNum + 1 : 0;
+    return [
       ...fetched,
-      ...live.map((row, i) => ({ ...row, sequenceNum: fetched.length + i })),
-    ],
-    [fetched, live],
-  );
+      ...live.map((row, i) => ({ ...row, sequenceNum: base + i })),
+    ];
+  }, [fetched, live]);
 
   return { events, loading, error };
 }

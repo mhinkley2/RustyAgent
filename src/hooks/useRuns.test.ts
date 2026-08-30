@@ -380,6 +380,30 @@ describe("useRunEvents", () => {
     expect(result.current.events.map((e) => e.sequenceNum)).toEqual([0, 1]);
   });
 
+  // Live rows continue the fetched rows' numbering rather than counting them.
+  // The two agree today — a whole run is fetched, and pruning drops whole runs
+  // rather than rows within one — but counting would collide the moment that
+  // query returned anything but the first page.
+  it("numbers live events after the last fetched one, not after the count", async () => {
+    tauriMock.handle("get_run_events", () => [
+      rawEvent({ id: "e1", sequence_num: 40 }),
+      rawEvent({ id: "e2", sequence_num: 41 }),
+    ]);
+
+    const { result } = renderHook(() => useRunEvents("run-1"));
+    await waitFor(() => expect(result.current.events).toHaveLength(2));
+
+    await tauriMock.emit("run-event", {
+      type: "tool_call",
+      run_id: "run-1",
+      tool_name: "file_write",
+      input: {},
+    });
+
+    await waitFor(() => expect(result.current.events).toHaveLength(3));
+    expect(result.current.events.map((e) => e.sequenceNum)).toEqual([40, 41, 42]);
+  });
+
   it("stops listening when the panel closes", async () => {
     tauriMock.handle("get_run_events", () => []);
 
