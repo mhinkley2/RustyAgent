@@ -132,6 +132,23 @@ The budget is `max_retries` on the agent profile, alongside `max_iterations`.
 It defaults to **2** — three attempts in total. Set it to `0` to switch retries
 off for a profile.
 
+## Story statuses
+
+A story is in exactly one of six states, which are the six columns the board
+draws:
+
+`backlog` → `ready` → `in_progress` → `blocked` / `review` → `done`
+
+The list lives in `db::story_status::STORY_STATUSES` and every other surface
+derives from it: the agent tools build their JSON-schema enums from it, every
+write path validates against it, and tests on both the Rust and TypeScript
+sides assert it matches the board's columns, so the two cannot drift apart
+again.
+
+Note that a **run** has its own, different vocabulary — `running`, `done`,
+`failed`, `cancelled` — and a run failing moves its *story* to `blocked`. The
+two are not the same list and `failed` is not a story status.
+
 ## The board and the run lifecycle
 
 A story a run picks up moves to `in_progress` when the run starts, and off it

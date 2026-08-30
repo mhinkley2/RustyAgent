@@ -143,8 +143,11 @@ impl Tool for ListStoriesTool {
             "properties": {
                 "status": {
                     "type": "string",
-                    "description": "Optional filter by status (backlog, ready, in_progress, blocked, review, done, failed). Omit for all.",
-                    "enum": ["backlog", "ready", "in_progress", "blocked", "review", "done", "failed"]
+                    "description": format!(
+                        "Optional filter by status ({}). Omit for all.",
+                        db::story_status::status_list_prose()
+                    ),
+                    "enum": db::story_status::status_enum_json()
                 }
             }
         })
@@ -264,7 +267,7 @@ impl Tool for CreateStoryTool {
                 "status": {
                     "type": "string",
                     "description": "Initial status. Defaults to 'backlog'.",
-                    "enum": ["backlog", "ready", "in_progress", "blocked", "review", "done"]
+                    "enum": db::story_status::status_enum_json()
                 },
                 "priority": {
                     "type": "string",
@@ -301,6 +304,9 @@ impl Tool for CreateStoryTool {
         let description = input.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
         let story_type = input.get("story_type").and_then(|v| v.as_str()).unwrap_or("task").to_string();
         let status   = input.get("status").and_then(|v| v.as_str()).unwrap_or("backlog").to_string();
+        if let Err(e) = db::story_status::validate_status(&status) {
+            return ToolOutput::err(e);
+        }
         let priority = input.get("priority").and_then(|v| v.as_str()).unwrap_or("medium").to_string();
         let labels: Vec<String> = input.get("labels")
             .and_then(|v| v.as_array())
@@ -390,7 +396,7 @@ impl Tool for UpdateStoryTool {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["backlog", "ready", "in_progress", "blocked", "review", "done", "failed"]
+                    "enum": db::story_status::status_enum_json()
                 },
                 "priority": {
                     "type": "string",
@@ -452,6 +458,15 @@ impl Tool for UpdateStoryTool {
         };
         let story_type = input.get("story_type").and_then(|v| v.as_str()).map(|value| value.to_string()).unwrap_or(current_story_type);
         let status = input.get("status").and_then(|v| v.as_str()).map(|value| value.to_string()).unwrap_or(current_status);
+        // Only what the caller supplied is checked in practice: a status
+        // already in the row came from somewhere that has been through this,
+        // or from before the vocabulary was settled, and refusing to update a
+        // title because of a legacy status would be the wrong trade.
+        if input.get("status").is_some() {
+            if let Err(e) = db::story_status::validate_status(&status) {
+                return ToolOutput::err(e);
+            }
+        }
         let priority = input.get("priority").and_then(|v| v.as_str()).map(|value| value.to_string()).unwrap_or(current_priority);
         let labels_json = match input.get("labels") {
             Some(value) => {
@@ -552,7 +567,7 @@ impl Tool for UpdateStoryStatusTool {
                 "story_id": { "type": "string", "description": "UUID of the story" },
                 "status": {
                     "type": "string",
-                    "enum": ["ready", "in_progress", "done", "failed", "blocked"]
+                    "enum": db::story_status::status_enum_json()
                 }
             },
             "required": ["story_id", "status"]
@@ -568,6 +583,11 @@ impl Tool for UpdateStoryStatusTool {
             Some(s) => s.to_string(),
             None => return ToolOutput::err("Missing required field: status"),
         };
+        // The schema's `enum` is advisory — nothing validates a tool call
+        // against it — so the check that actually holds is this one.
+        if let Err(e) = db::story_status::validate_status(&status) {
+            return ToolOutput::err(e);
+        }
         let workspace_id = resolve_workspace_id(ctx).await;
 
         let result = sqlx::query(
@@ -636,6 +656,157 @@ impl Tool for DeleteStoryTool {
 mod tests {
     use super::*;
     use crate::test_support::{make_ctx, make_test_pool};
+
+    // -----------------------------------------------------------------------
+    // The status vocabulary
+    // -----------------------------------------------------------------------
+
+    async fn seed_story(db: &db::DbPool, id: &str) {
+        sqlx::query("INSERT INTO stories (id, title, status) VALUES (?, 'A story', 'ready')")
+            .bind(id)
+            .execute(db)
+            .await
+            .expect("seed story");
+    }
+
+    async fn status_of(db: &db::DbPool, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM stories WHERE id = ?")
+            .bind(id)
+            .fetch_one(db)
+            .await
+            .expect("read status")
+    }
+
+    /// The defect this story exists for: every finished run lands its card in
+    /// `review`, and no agent could move one out of there — or into it —
+    /// because the tool's vocabulary did not have the word.
+    #[tokio::test]
+    async fn an_agent_can_move_a_story_to_review() {
+        let db = make_test_pool().await;
+        seed_story(&db, "s1").await;
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryStatusTool
+            .execute(json!({"story_id": "s1", "status": "review"}), &ctx)
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(status_of(&db, "s1").await, "review");
+    }
+
+    #[tokio::test]
+    async fn an_agent_can_send_a_story_back_to_the_backlog() {
+        let db = make_test_pool().await;
+        seed_story(&db, "s1").await;
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryStatusTool
+            .execute(json!({"story_id": "s1", "status": "backlog"}), &ctx)
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(status_of(&db, "s1").await, "backlog");
+    }
+
+    /// `failed` was accepted here and rendered by no column, so a card set to
+    /// it left the board entirely.
+    #[tokio::test]
+    async fn a_status_the_board_cannot_draw_is_refused() {
+        let db = make_test_pool().await;
+        seed_story(&db, "s1").await;
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryStatusTool
+            .execute(json!({"story_id": "s1", "status": "failed"}), &ctx)
+            .await;
+
+        assert!(r.is_error, "a card in no column is worse than a refused call");
+        assert!(r.content.contains("blocked"), "the error should name the alternatives: {}", r.content);
+        assert_eq!(status_of(&db, "s1").await, "ready", "and nothing was written");
+    }
+
+    /// A JSON-schema `enum` is advisory. Nothing validates a call against it,
+    /// so the refusal has to happen in the tool.
+    #[tokio::test]
+    async fn a_nonsense_status_is_refused_rather_than_stored() {
+        let db = make_test_pool().await;
+        seed_story(&db, "s1").await;
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryStatusTool
+            .execute(json!({"story_id": "s1", "status": "whatever"}), &ctx)
+            .await;
+
+        assert!(r.is_error);
+        assert_eq!(status_of(&db, "s1").await, "ready");
+    }
+
+    #[tokio::test]
+    async fn creating_a_story_with_an_unknown_status_is_refused() {
+        let db = make_test_pool().await;
+        let ctx = make_ctx(db.clone());
+
+        let r = CreateStoryTool
+            .execute(json!({"title": "New", "status": "failed"}), &ctx)
+            .await;
+
+        assert!(r.is_error, "{}", r.content);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stories")
+            .fetch_one(&db)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "nothing should have been created");
+    }
+
+    #[tokio::test]
+    async fn updating_a_story_with_an_unknown_status_is_refused() {
+        let db = make_test_pool().await;
+        seed_story(&db, "s1").await;
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryTool
+            .execute(json!({"story_id": "s1", "status": "failed"}), &ctx)
+            .await;
+
+        assert!(r.is_error, "{}", r.content);
+        assert_eq!(status_of(&db, "s1").await, "ready");
+    }
+
+    /// An update that does not mention the status must still work on a row
+    /// whose stored status predates the vocabulary being settled.
+    #[tokio::test]
+    async fn a_legacy_status_does_not_block_an_unrelated_update() {
+        let db = make_test_pool().await;
+        sqlx::query("INSERT INTO stories (id, title, status) VALUES ('s1', 'A story', 'failed')")
+            .execute(&db)
+            .await
+            .expect("seed");
+        let ctx = make_ctx(db.clone());
+
+        let r = UpdateStoryTool
+            .execute(json!({"story_id": "s1", "title": "Renamed"}), &ctx)
+            .await;
+
+        assert!(!r.is_error, "{}", r.content);
+    }
+
+    /// Every tool that names statuses names the same ones.
+    #[test]
+    fn every_story_tool_advertises_one_vocabulary() {
+        let expected = db::story_status::status_enum_json();
+
+        for (name, schema) in [
+            ("create_story", CreateStoryTool.input_schema()),
+            ("update_story", UpdateStoryTool.input_schema()),
+            ("update_story_status", UpdateStoryStatusTool.input_schema()),
+            ("list_stories", ListStoriesTool.input_schema()),
+        ] {
+            assert_eq!(
+                schema["properties"]["status"]["enum"], expected,
+                "{name} advertises a different set of statuses"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // GetStoryTool
