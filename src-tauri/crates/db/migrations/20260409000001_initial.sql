@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS stories (
     title TEXT NOT NULL,
     description TEXT,
     story_type TEXT NOT NULL DEFAULT 'task', -- 'task' | 'human' | 'pipeline'
-    status TEXT NOT NULL DEFAULT 'ready',    -- 'ready' | 'in_progress' | 'done' | 'failed' | 'blocked'
+    status TEXT NOT NULL DEFAULT 'ready',    -- see db::story_status::STORY_STATUSES
     priority TEXT NOT NULL DEFAULT 'medium', -- 'low' | 'medium' | 'high' | 'critical'
     assigned_agent_id TEXT REFERENCES agent_profiles(id) ON DELETE SET NULL,
     requires_approval INTEGER NOT NULL DEFAULT 0,  -- bool

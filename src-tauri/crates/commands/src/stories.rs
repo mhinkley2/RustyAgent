@@ -15,7 +15,7 @@ pub struct Story {
     pub title: String,
     pub description: Option<String>,
     pub story_type: String,            // 'task' | 'human' | 'pipeline'
-    pub status: String,                // 'backlog' | 'ready' | 'in_progress' | 'blocked' | 'review' | 'done' | 'failed'
+    pub status: String,                // see db::story_status::STORY_STATUSES
     pub priority: String,              // 'low' | 'medium' | 'high' | 'critical'
     pub assigned_agent_id: Option<String>,
     pub assigned_agent_name: Option<String>, // from LEFT JOIN agent_profiles
@@ -151,6 +151,11 @@ pub async fn create_story(
     let id = Uuid::new_v4().to_string();
     let story_type = input.story_type.unwrap_or_else(|| "task".to_string());
     let status     = input.status.unwrap_or_else(|| "backlog".to_string());
+    // The UI sends a value from a typed union, so this cannot fire from the
+    // board today. It is here because "the frontend would never" is exactly
+    // the reasoning that let five vocabularies grow: this is a write path, and
+    // a write path either enforces the vocabulary or it does not have one.
+    db::story_status::validate_status(&status)?;
     let priority   = input.priority.unwrap_or_else(|| "medium".to_string());
     let requires_approval = input.requires_approval.unwrap_or(false);
     let track_history = input.track_history.unwrap_or(true);
@@ -202,11 +207,17 @@ pub async fn update_story(
     workspace_id: Option<String>,
 ) -> Result<Story, String> {
     let current = get_story(id.clone(), db).await?;
+    let input_status_supplied = input.status.is_some();
 
     let title             = input.title.unwrap_or(current.title);
     let description       = input.description.or(current.description);
     let story_type        = input.story_type.unwrap_or(current.story_type);
     let status            = input.status.unwrap_or(current.status);
+    // Only when the caller asked to change it — a row carrying a status from
+    // before the vocabulary was settled must still accept a title edit.
+    if input_status_supplied {
+        db::story_status::validate_status(&status)?;
+    }
     let priority          = input.priority.unwrap_or(current.priority);
     let requires_approval = input.requires_approval.unwrap_or(current.requires_approval);
     let track_history = input.track_history.unwrap_or(current.track_history);

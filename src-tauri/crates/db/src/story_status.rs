@@ -146,6 +146,75 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// Every status a story may hold.
+///
+/// One list, because there were five and no two agreed: the board drew six
+/// columns, `update_story_status` accepted five of them plus a `failed` the
+/// board could not draw, `create_story` accepted the right six, `update_story`
+/// and the `list_stories` filter each accepted seven, and two doc comments
+/// disagreed with all of the above. `stories.status` has no CHECK constraint,
+/// so nothing caught any of it.
+///
+/// The order is the order the board draws its columns, left to right, so a
+/// reader of this list can see the flow of work through it.
+///
+/// **`failed` is deliberately not here.** It was accepted by two write paths
+/// and rendered by none — a card set to it left every column and could only be
+/// found through search. Migration `20260410000022_story_status_vocabulary.sql`
+/// maps the rows that carry it to `blocked`, which is what a failed run's card
+/// is moved to anyway (see [`RunOutcome::story_status`]) and which the board
+/// does draw.
+pub const STORY_STATUSES: [&str; 6] = [
+    "backlog",
+    "ready",
+    "in_progress",
+    "blocked",
+    "review",
+    "done",
+];
+
+/// Whether `status` is one the board can hold and draw.
+pub fn is_valid_status(status: &str) -> bool {
+    STORY_STATUSES.contains(&status)
+}
+
+/// Check a status a client supplied, with a message naming the valid set.
+///
+/// A JSON-schema `enum` is advisory: nothing in this app validates a tool's
+/// input against its own schema, so before this every write path would happily
+/// store whatever string it was handed. That is how a card could end up in a
+/// column the board does not draw.
+pub fn validate_status(status: &str) -> Result<(), String> {
+    if is_valid_status(status) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Unknown story status '{status}'. Valid statuses: {}.",
+            status_list_prose()
+        ))
+    }
+}
+
+/// [`STORY_STATUSES`] as a JSON array, for a tool's `input_schema` enum.
+///
+/// Built rather than written out, so a tool schema cannot drift from the set
+/// the database and the board agree on — which is precisely how the five
+/// vocabularies came about.
+pub fn status_enum_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        STORY_STATUSES
+            .iter()
+            .map(|s| serde_json::Value::String((*s).to_string()))
+            .collect(),
+    )
+}
+
+/// The statuses joined for a human-readable description, e.g. in a tool's
+/// prose. Kept beside the list so the two cannot disagree either.
+pub fn status_list_prose() -> String {
+    STORY_STATUSES.join(", ")
+}
+
 /// The Tauri event announcing that the board has changed underneath whoever is
 /// looking at it.
 ///
@@ -268,6 +337,79 @@ mod tests {
     /// never produce this value, or a continuous-mode profile re-picks the
     /// story it just failed, without bound.
     const SCHEDULER_PICKS: &str = "ready";
+
+    /// The board draws these six columns, in this order
+    /// (`src/types/board.ts` — `StoryStatus` and `KANBAN_COLUMNS`). A status
+    /// outside the set lands a card in a column that does not exist; a status
+    /// missing from the set is a column no writer can reach.
+    ///
+    /// `src/types/board.test.ts` asserts the same list from the other side, so
+    /// a change to either without the other fails a build.
+    const BOARD_COLUMNS: [&str; 6] = [
+        "backlog",
+        "ready",
+        "in_progress",
+        "blocked",
+        "review",
+        "done",
+    ];
+
+    #[test]
+    fn the_vocabulary_matches_the_columns_the_board_draws() {
+        assert_eq!(
+            STORY_STATUSES, BOARD_COLUMNS,
+            "a write path and the board must not disagree about what a status is"
+        );
+    }
+
+    /// The value that made this story necessary: accepted by two write paths,
+    /// rendered by none.
+    #[test]
+    fn failed_is_not_a_story_status() {
+        assert!(!is_valid_status("failed"));
+        assert!(validate_status("failed").is_err());
+    }
+
+    #[test]
+    fn review_is_reachable_now_that_every_finished_run_lands_there() {
+        assert!(is_valid_status("review"));
+        assert!(validate_status("review").is_ok());
+    }
+
+    #[test]
+    fn every_status_an_outcome_writes_is_one_a_client_may_write_back() {
+        for outcome in [
+            RunOutcome::Succeeded,
+            RunOutcome::Failed,
+            RunOutcome::Cancelled,
+            RunOutcome::Interrupted,
+        ] {
+            assert!(
+                is_valid_status(outcome.story_status()),
+                "{outcome:?} moves a card somewhere a client could not move it back from"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_status_names_the_ones_that_would_work() {
+        let message = validate_status("nonsense").expect_err("should be refused");
+        for status in STORY_STATUSES {
+            assert!(message.contains(status), "{message} should mention {status}");
+        }
+    }
+
+    #[test]
+    fn the_schema_enum_is_built_from_the_list_rather_than_restated() {
+        let json = status_enum_json();
+        let values: Vec<&str> = json
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|v| v.as_str().expect("a string"))
+            .collect();
+        assert_eq!(values, STORY_STATUSES);
+    }
 
     #[test]
     fn a_terminal_run_status_maps_to_the_outcome_it_describes() {
