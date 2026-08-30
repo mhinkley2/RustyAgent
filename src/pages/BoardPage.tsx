@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from "react";
-import { LayoutGrid, List, MessageSquare, ShieldAlert } from "lucide-react";
+import { LayoutGrid, List, MessageSquare, RefreshCw, ShieldAlert } from "lucide-react";
 
 import { KanbanView } from "../components/board/KanbanView";
 import { ListView } from "../components/board/ListView";
@@ -19,7 +19,17 @@ import { useHumanRequests, requestDesktopNotification } from "../hooks/useHumanR
 type View = "kanban" | "list";
 
 export default function BoardPage() {
-  const { stories, createStory, updateStory, deleteStory, reorderStories } = useStories();
+  const {
+    stories,
+    refresh,
+    lastFetchedAt,
+    pauseAutoRefresh,
+    resumeAutoRefresh,
+    createStory,
+    updateStory,
+    deleteStory,
+    reorderStories,
+  } = useStories();
   const { profiles: agents } = useAgents();
   const {
     humanRequests,
@@ -30,7 +40,14 @@ export default function BoardPage() {
   } = useHumanRequests();
 
   const [view, setView] = useState<View>("kanban");
-  const [selectedStory, setSelectedStory] = useState<Story | null>(null);
+  /**
+   * The open detail panel is keyed by id, not by a story object.
+   *
+   * Holding the object meant the panel showed the snapshot it opened with and
+   * had to be patched by hand on every change — which stops working entirely
+   * once the board refreshes itself underneath it.
+   */
+  const [selectedStoryId, setSelectedStoryId] = useState<string | null>(null);
   const [filters, setFilters] = useState<BoardFilters>(DEFAULT_FILTERS);
   const [formOpen, setFormOpen] = useState(false);
   const [editStory, setEditStory] = useState<Story | null>(null);
@@ -74,20 +91,51 @@ export default function BoardPage() {
     });
   }, [stories, filters]);
 
+  /**
+   * The story the open panel is showing, derived rather than stored.
+   *
+   * A story that disappears from the board — deleted, or filtered out by a
+   * workspace switch — closes the panel by becoming `null` here, with nothing
+   * to remember to do.
+   */
+  const selectedStory = useMemo(
+    () => stories.find(s => s.id === selectedStoryId) ?? null,
+    [stories, selectedStoryId],
+  );
+
   const handleMove = async (storyId: string, newStatus: Story["status"]) => {
     await updateStory(storyId, { status: newStatus });
-    // Keep detail panel in sync
-    setSelectedStory(prev =>
-      prev?.id === storyId ? { ...prev, status: newStatus } : prev
-    );
   };
+
+  /**
+   * How long ago the board was read, as a label.
+   *
+   * Re-derived on a five-second tick rather than every second: the number is
+   * there to say "this is a live view and here is its age", and a board that
+   * re-rendered once a second to move a digit would cost more than it tells.
+   */
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const staleness = useMemo(() => {
+    if (!lastFetchedAt) return "Refresh";
+    const seconds = Math.max(0, Math.round((now - lastFetchedAt.getTime()) / 1000));
+    if (seconds < 10) return "Updated just now";
+    if (seconds < 60) return `Updated ${seconds}s ago`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `Updated ${minutes}m ago`;
+    return `Updated ${Math.round(minutes / 60)}h ago`;
+  }, [lastFetchedAt, now]);
 
   const handleReorder = async (updates: { id: string; sortOrder: number }[]) => {
     await reorderStories(updates);
   };
 
-  const handleSelect = (story: Story) => setSelectedStory(story);
-  const handleClosePanel = () => setSelectedStory(null);
+  const handleSelect = (story: Story) => setSelectedStoryId(story.id);
+  const handleClosePanel = () => setSelectedStoryId(null);
 
   const openCreate = () => {
     setEditStory(null);
@@ -102,13 +150,32 @@ export default function BoardPage() {
   const handleDeleteConfirm = async () => {
     if (!deleteTarget) return;
     await deleteStory(deleteTarget.id);
-    if (selectedStory?.id === deleteTarget.id) setSelectedStory(null);
+    if (selectedStoryId === deleteTarget.id) setSelectedStoryId(null);
     setDeleteTarget(null);
   };
 
   return (
     <div className="board-page">
-      <PageHeader title="Board" ctaLabel="New Story" onCta={openCreate}>
+      <PageHeader
+        title="Board"
+        cta={
+          // `cta` replaces `ctaLabel`/`onCta` rather than sitting beside them,
+          // so New Story lives here too.
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              className="btn btn--ghost btn--sm"
+              onClick={() => void refresh()}
+              title="Refetch the board"
+            >
+              <RefreshCw size={14} />
+              {staleness}
+            </button>
+            <button className="btn btn--primary btn--sm" onClick={openCreate}>
+              New Story
+            </button>
+          </div>
+        }
+      >
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <FilterBar
             filters={filters}
@@ -175,6 +242,9 @@ export default function BoardPage() {
             onSelect={handleSelect}
             onMove={handleMove}
             onReorder={handleReorder}
+            onDragActiveChange={(dragging) =>
+              dragging ? pauseAutoRefresh() : resumeAutoRefresh()
+            }
           />
         ) : (
           <ListView
@@ -182,7 +252,7 @@ export default function BoardPage() {
             onSelect={handleSelect}
             onDeleteStories={async (ids) => {
               for (const id of ids) await deleteStory(id);
-              if (selectedStory && ids.includes(selectedStory.id)) setSelectedStory(null);
+              if (selectedStoryId && ids.includes(selectedStoryId)) setSelectedStoryId(null);
             }}
           />
         )}

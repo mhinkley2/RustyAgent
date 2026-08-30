@@ -146,6 +146,18 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// The Tauri event announcing that the board has changed underneath whoever is
+/// looking at it.
+///
+/// Named here rather than in the frontend or in `commands` because the writers
+/// are spread across four crates and one of them — the crash sweep — lives in
+/// this one. The string is the contract; `useStories` listens for it.
+///
+/// It carries no payload on purpose. A board refetch is one cheap query, and a
+/// payload would be a second representation of a story to keep in step with
+/// the first.
+pub const STORIES_CHANGED_EVENT: &str = "stories-changed";
+
 /// The `run_events.event_type` written when a card moves on its own.
 pub const TRANSITION_EVENT_TYPE: &str = "story_status";
 

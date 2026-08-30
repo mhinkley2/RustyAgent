@@ -107,6 +107,108 @@ describe("useStories — loading and mapping", () => {
   });
 });
 
+describe("useStories — following the board", () => {
+  // The defect this exists for: #16 made every successful run move its story
+  // in SQL, with no event and no refetch, so the routine end of a run was a
+  // change the open board would never show.
+  it("refetches when another writer announces a change", async () => {
+    const backend = createStoryBackend([rawStory({ id: "s1", status: "in_progress" })]);
+    const view = await renderLoaded();
+    expect(view.result.current.stories[0].status).toBe("in_progress");
+
+    backend.setStories([rawStory({ id: "s1", status: "review" })]);
+    await tauriMock.emit("stories-changed", null);
+
+    await waitFor(() => expect(view.result.current.stories[0].status).toBe("review"));
+  });
+
+  // A pipeline settling six stories is one board change, not six.
+  it("coalesces a burst of changes into a single refetch", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+    await renderLoaded();
+    const before = tauriMock.callCount("get_stories");
+
+    for (let i = 0; i < 6; i++) await tauriMock.emit("stories-changed", null);
+
+    await waitFor(() =>
+      expect(tauriMock.callCount("get_stories")).toBe(before + 1),
+    );
+    // And it stays at one: no trailing fetch arrives late.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(tauriMock.callCount("get_stories")).toBe(before + 1);
+  });
+
+  // A background refetch must not blink the board into its loading state.
+  it("does not enter the loading state for an announced change", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+    const view = await renderLoaded();
+
+    await tauriMock.emit("stories-changed", null);
+
+    expect(view.result.current.loading).toBe(false);
+  });
+
+  it("records when the board was last read", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+    const view = await renderLoaded();
+
+    expect(view.result.current.lastFetchedAt).toBeInstanceOf(Date);
+  });
+
+  // A refetch landing between a drop and the write that persists it would
+  // replace the optimistic order with the pre-drop one.
+  it("holds an announced change while a card is being dragged", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+    const view = await renderLoaded();
+    const before = tauriMock.callCount("get_stories");
+
+    act(() => view.result.current.pauseAutoRefresh());
+    await tauriMock.emit("stories-changed", null);
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(tauriMock.callCount("get_stories")).toBe(before);
+  });
+
+  // Held, not dropped — otherwise a change arriving mid-drag would wait for
+  // whatever happens to come next.
+  it("applies the held change once the drag ends", async () => {
+    const backend = createStoryBackend([rawStory({ id: "s1", status: "ready" })]);
+    const view = await renderLoaded();
+
+    act(() => view.result.current.pauseAutoRefresh());
+    backend.setStories([rawStory({ id: "s1", status: "review" })]);
+    await tauriMock.emit("stories-changed", null);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(view.result.current.stories[0].status).toBe("ready");
+
+    act(() => view.result.current.resumeAutoRefresh());
+
+    await waitFor(() => expect(view.result.current.stories[0].status).toBe("review"));
+  });
+
+  it("does not refetch on resume when nothing was announced", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+    const view = await renderLoaded();
+    const before = tauriMock.callCount("get_stories");
+
+    act(() => view.result.current.pauseAutoRefresh());
+    act(() => view.result.current.resumeAutoRefresh());
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(tauriMock.callCount("get_stories")).toBe(before);
+  });
+
+  it("stops listening when the board unmounts", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+    const view = await renderLoaded();
+    await waitFor(() => expect(tauriMock.listenerCount("stories-changed")).toBe(1));
+
+    view.unmount();
+
+    await waitFor(() => expect(tauriMock.listenerCount("stories-changed")).toBe(0));
+  });
+});
+
 describe("useStories — mutations", () => {
   it("appends the created story to local state", async () => {
     createStoryBackend([]);

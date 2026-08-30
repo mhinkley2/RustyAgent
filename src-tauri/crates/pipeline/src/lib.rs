@@ -150,6 +150,14 @@ pub fn resolve_parallel_limit(workspace: Option<u32>, global: Option<u32>) -> us
         .unwrap_or(DEFAULT_MAX_PARALLEL_STEPS)
 }
 
+/// Tell the open board that a card moved underneath it.
+fn emit_stories_changed(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    if let Err(e) = app.emit(db::story_status::STORIES_CHANGED_EVENT, ()) {
+        warn!("Failed to announce a board change: {e}");
+    }
+}
+
 /// Claim a pipeline's own story card as the pipeline starts.
 ///
 /// This used to be a bare `UPDATE stories SET status = 'in_progress'`, which
@@ -160,17 +168,29 @@ pub fn resolve_parallel_limit(workspace: Option<u32>, global: Option<u32>) -> us
 ///
 /// Split out for the same reason as [`settle_pipeline_story`]: the function
 /// around it needs a concrete `tauri::AppHandle` and this does not.
-pub(crate) async fn claim_pipeline_story(db: &DbPool, story_id: &str) {
+/// Returns whether the card actually moved, so the caller can announce it.
+/// The announcement is the caller's because it needs an `AppHandle`, and
+/// taking one here would put this function back out of reach of a test.
+pub(crate) async fn claim_pipeline_story(db: &DbPool, story_id: &str) -> bool {
     if !db::story_status::auto_advance_enabled(db).await {
-        return;
+        return false;
     }
     match db::story_status::claim_story(db, story_id).await {
-        Ok(true) => debug!(story_id = %story_id, "Pipeline story claimed"),
-        Ok(false) => debug!(
-            story_id = %story_id,
-            "Pipeline story was not ready; leaving it where it is"
-        ),
-        Err(e) => error!(story_id = %story_id, "Failed to claim the pipeline story: {e}"),
+        Ok(true) => {
+            debug!(story_id = %story_id, "Pipeline story claimed");
+            true
+        }
+        Ok(false) => {
+            debug!(
+                story_id = %story_id,
+                "Pipeline story was not ready; leaving it where it is"
+            );
+            false
+        }
+        Err(e) => {
+            error!(story_id = %story_id, "Failed to claim the pipeline story: {e}");
+            false
+        }
     }
 }
 
@@ -183,14 +203,16 @@ pub(crate) async fn claim_pipeline_story(db: &DbPool, story_id: &str) {
 ///
 /// Split out of the spawned completion task so it can be tested: the task
 /// around it needs a concrete `tauri::AppHandle`, and this does not.
+/// Returns whether the card actually moved — see [`claim_pipeline_story`] for
+/// why the announcement belongs to the caller.
 pub(crate) async fn settle_pipeline_story(
     db: &DbPool,
     pipeline_run_id: &str,
     story_id: &str,
     final_status: &str,
-) {
+) -> bool {
     if !db::story_status::auto_advance_enabled(db).await {
-        return;
+        return false;
     }
 
     let outcome = db::story_status::RunOutcome::from_run_status(final_status);
@@ -214,17 +236,24 @@ pub(crate) async fn settle_pipeline_story(
             {
                 warn!(story_id = %story_id, "Could not record the story transition: {e}");
             }
+            true
         }
         // Not an error: somebody moved the card deliberately, and that
         // outranks this.
-        Ok(false) => debug!(
-            story_id = %story_id,
-            "Pipeline story was not in_progress; leaving it where it is"
-        ),
-        Err(e) => error!(
-            story_id = %story_id,
-            "Failed to move the pipeline story off in_progress: {e}"
-        ),
+        Ok(false) => {
+            debug!(
+                story_id = %story_id,
+                "Pipeline story was not in_progress; leaving it where it is"
+            );
+            false
+        }
+        Err(e) => {
+            error!(
+                story_id = %story_id,
+                "Failed to move the pipeline story off in_progress: {e}"
+            );
+            false
+        }
     }
 }
 
@@ -373,7 +402,9 @@ pub async fn start_pipeline(
     // still sitting in `ready` — a no-op — and then be handed `in_progress` by
     // a claim arriving behind it, leaving it stuck exactly as this feature
     // exists to prevent.
-    claim_pipeline_story(&db, &story_id).await;
+    if claim_pipeline_story(&db, &story_id).await {
+        emit_stories_changed(&app);
+    }
 
     // Spawn the async pipeline executor
     let pid = pipeline_run_id.clone();
@@ -381,6 +412,9 @@ pub async fn start_pipeline(
     let pipeline_clone = pipeline.clone();
     let db_clone = db.clone();
     let app_clone = app.clone();
+    // Kept past the executor, which consumes `app_clone`, so the completion
+    // block can still announce the card's move.
+    let app_for_board = app.clone();
 
     let handle = tokio::spawn(async move {
         let result = match config.mode.as_str() {
@@ -411,7 +445,9 @@ pub async fn start_pipeline(
             error!(pipeline_run_id = %pid, "Failed to update story_run status: {e}");
         }
 
-        settle_pipeline_story(&db_clone, &pid, &story_id_for_settle, final_status).await;
+        if settle_pipeline_story(&db_clone, &pid, &story_id_for_settle, final_status).await {
+            emit_stories_changed(&app_for_board);
+        }
 
         pipeline_clone.tasks.remove(&pid);
         info!(pipeline_run_id = %pid, status = %final_status, "Pipeline complete");

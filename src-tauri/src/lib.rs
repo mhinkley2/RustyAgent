@@ -248,41 +248,66 @@ async fn get_story(
     commands::stories::get_story(id, db.inner()).await
 }
 
+/// Tell the open board that a card changed underneath it.
+///
+/// The board is a live view of the database, and the writers are spread across
+/// four crates; this is the announcement side of that for everything with an
+/// `AppHandle`. The out-of-process `rustyagent-board-mcp` binary cannot reach
+/// this at all, which is why `useStories` also polls.
+fn announce_board_change(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    if let Err(e) = app.emit(db::story_status::STORIES_CHANGED_EVENT, ()) {
+        tracing::warn!("Failed to announce a board change: {e}");
+    }
+}
+
 #[tauri::command]
 async fn create_story(
+    app: tauri::AppHandle,
     input: commands::CreateStoryInput,
     db: tauri::State<'_, db::DbPool>,
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<commands::Story, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::stories::create_story(input, db.inner(), workspace_id).await
+    let story = commands::stories::create_story(input, db.inner(), workspace_id).await?;
+    announce_board_change(&app);
+    Ok(story)
 }
 
 #[tauri::command]
 async fn update_story(
+    app: tauri::AppHandle,
     id: String,
     input: commands::UpdateStoryInput,
     db: tauri::State<'_, db::DbPool>,
     active_ws: tauri::State<'_, commands::ActiveWorkspace>,
 ) -> Result<commands::Story, String> {
     let workspace_id = resolve_active_workspace_id(db.inner(), active_ws.inner()).await;
-    commands::stories::update_story(id, input, db.inner(), workspace_id).await
+    let story = commands::stories::update_story(id, input, db.inner(), workspace_id).await?;
+    announce_board_change(&app);
+    Ok(story)
 }
 
 #[tauri::command]
 async fn delete_story(
+    app: tauri::AppHandle,
     id: String,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::stories::delete_story(id, db.inner()).await
+    commands::stories::delete_story(id, db.inner()).await?;
+    announce_board_change(&app);
+    Ok(())
 }
 
 #[tauri::command]
 async fn batch_update_story_order(
+    app: tauri::AppHandle,
     updates: Vec<commands::StoryOrderUpdate>,
     db: tauri::State<'_, db::DbPool>,
 ) -> Result<(), String> {
-    commands::stories::batch_update_story_order(updates, db.inner()).await
+    commands::stories::batch_update_story_order(updates, db.inner()).await?;
+    announce_board_change(&app);
+    Ok(())
 }
 
 // ── Run history ─────────────────────────────────────────────────────────────
@@ -954,7 +979,11 @@ pub fn run() {
                 .await
                 {
                     Ok(report) if report.is_empty() => {}
-                    Ok(report) => tracing::info!(
+                    Ok(report) => {
+                        if report.stories > 0 {
+                            announce_board_change(&app_handle);
+                        }
+                        tracing::info!(
                         "Startup reconciliation: {} run(s) interrupted by a restart, \
                          {} pipeline step(s), {} pending approval(s) and {} story card(s) \
                          closed out",
@@ -962,7 +991,8 @@ pub fn run() {
                         report.pipeline_steps,
                         report.approvals,
                         report.stories,
-                    ),
+                        );
+                    }
                     Err(e) => tracing::warn!("Run reconciliation failed: {e}"),
                 }
 
