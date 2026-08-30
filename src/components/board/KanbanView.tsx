@@ -295,6 +295,23 @@ export function KanbanView({ stories, onSelect, onMove, onReorder, onDragActiveC
     });
   }
 
+  /**
+   * A drag abandoned rather than dropped — Escape, or dnd-kit cancelling it.
+   *
+   * `onDragEnd` does not fire in that case, so without this the board would be
+   * left with auto-refresh paused for good: one cancelled drag and the card
+   * stops following the database, silently, with nothing to un-stick it.
+   */
+  function handleDragCancel() {
+    onDragActiveChange?.(false);
+    activeIdRef.current = null;
+    setActiveId(null);
+    setOverColId(null);
+    originalColRef.current = null;
+    // The columns were rearranged live as the pointer moved; put them back.
+    setColMap(buildColMap(stories));
+  }
+
   async function handleDragEnd({ active, over }: DragEndEvent) {
     // Released before the awaits below: the drop is decided here, and the
     // persist that follows is what a deferred refresh should land after.
@@ -358,6 +375,7 @@ export function KanbanView({ stories, onSelect, onMove, onReorder, onDragActiveC
       onDragStart={handleDragStart}
       onDragOver={handleDragOver}
       onDragEnd={handleDragEnd}
+      onDragCancel={handleDragCancel}
     >
       <div className="kb">
         {/* Main columns */}

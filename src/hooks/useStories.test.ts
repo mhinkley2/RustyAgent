@@ -198,6 +198,43 @@ describe("useStories — following the board", () => {
     expect(tauriMock.callCount("get_stories")).toBe(before);
   });
 
+  // Creating a story announces a board change, so a refetch can land the new
+  // card *between* the row being written and the optimistic append running. An
+  // append that did not check would then show it twice.
+  //
+  // The interleaving is forced rather than hoped for: `create_story` is held
+  // open, the refetch is driven to completion, and only then is the create
+  // released.
+  it("does not double a story the refetch already brought in", async () => {
+    const backend = createStoryBackend([]);
+    let releaseCreate: (row: unknown) => void = () => {};
+    tauriMock.handle(
+      "create_story",
+      () => new Promise((resolve) => { releaseCreate = resolve; }),
+    );
+
+    const view = await renderLoaded();
+
+    // The create is in flight, and its row already exists server-side.
+    let created: Promise<unknown> = Promise.resolve();
+    act(() => {
+      created = view.result.current.createStory({ title: "New" });
+    });
+    backend.setStories([rawStory({ id: "new-1", title: "New" })]);
+
+    // The refetch lands first, bringing the new card with it.
+    await tauriMock.emit("stories-changed", null);
+    await waitFor(() => expect(view.result.current.stories).toHaveLength(1));
+
+    // Only now does the create resolve and run its append.
+    await act(async () => {
+      releaseCreate(rawStory({ id: "new-1", title: "New" }));
+      await created;
+    });
+
+    expect(view.result.current.stories.filter(s => s.id === "new-1")).toHaveLength(1);
+  });
+
   it("stops listening when the board unmounts", async () => {
     createStoryBackend([rawStory({ id: "s1" })]);
     const view = await renderLoaded();

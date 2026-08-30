@@ -131,9 +131,9 @@ export function useStories(): UseStoriesReturn {
   const [error, setError] = useState<string | null>(null);
 
   const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null);
-  /// While a card is being dragged, a refetch would fight the optimistic order.
+  // While a card is being dragged, a refetch would fight the optimistic order.
   const pausedRef = useRef(false);
-  /// A refresh that arrived while paused, to be honoured on resume.
+  // A refresh that arrived while paused, to be honoured on resume.
   const missedRef = useRef(false);
 
   /**
@@ -254,7 +254,21 @@ export function useStories(): UseStoriesReturn {
     try {
       const raw = await invoke<RawStory>("create_story", { input });
       const story = mapStory(raw);
-      setStories(prev => [...prev, story]);
+      // Append only if a refetch has not already brought it in. Creating a
+      // story announces a board change, and a poll may also be in flight, so
+      // the list can already contain what this is about to add — an append
+      // that did not check would show the new card twice.
+      // Append only if a refetch has not already brought it in. Creating a
+      // story announces a board change, and a poll may also be in flight, so
+      // the list can already contain what this is about to add — an append
+      // that did not check would show the new card twice.
+      // Append only if a refetch has not already brought it in. Creating a
+      // story announces a board change, and a poll may also be in flight, so
+      // the list can already contain what this is about to add — an append
+      // that did not check would show the new card twice.
+      setStories(prev =>
+        prev.some(s => s.id === story.id) ? prev : [...prev, story],
+      );
       return story;
     } catch (e) {
       notifyError("Failed to create story", errorMessage(e), { duration: 7000 });
