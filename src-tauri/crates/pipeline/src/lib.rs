@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tauri::Manager;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[cfg(test)]
 mod story_tests;
@@ -159,18 +159,38 @@ pub fn resolve_parallel_limit(workspace: Option<u32>, global: Option<u32>) -> us
 ///
 /// Split out of the spawned completion task so it can be tested: the task
 /// around it needs a concrete `tauri::AppHandle`, and this does not.
-pub(crate) async fn settle_pipeline_story(db: &DbPool, story_id: &str, final_status: &str) {
+pub(crate) async fn settle_pipeline_story(
+    db: &DbPool,
+    pipeline_run_id: &str,
+    story_id: &str,
+    final_status: &str,
+) {
     if !db::story_status::auto_advance_enabled(db).await {
         return;
     }
 
     let outcome = db::story_status::RunOutcome::from_run_status(final_status);
     match db::story_status::settle_story(db, story_id, outcome).await {
-        Ok(true) => info!(
-            story_id = %story_id,
-            "Pipeline story moved to {}",
-            outcome.story_status()
-        ),
+        Ok(true) => {
+            info!(
+                story_id = %story_id,
+                "Pipeline story moved to {}",
+                outcome.story_status()
+            );
+            // On the pipeline run's own timeline, so this move is attributable
+            // to the run that caused it exactly as a single run's is.
+            if let Err(e) = db::story_status::record_transition(
+                db,
+                pipeline_run_id,
+                story_id,
+                outcome.story_status(),
+                &format!("the pipeline finished with status '{final_status}'"),
+            )
+            .await
+            {
+                warn!(story_id = %story_id, "Could not record the story transition: {e}");
+            }
+        }
         // Not an error: somebody moved the card deliberately, and that
         // outranks this.
         Ok(false) => debug!(
@@ -360,7 +380,7 @@ pub async fn start_pipeline(
             error!(pipeline_run_id = %pid, "Failed to update story_run status: {e}");
         }
 
-        settle_pipeline_story(&db_clone, &story_id_for_settle, final_status).await;
+        settle_pipeline_story(&db_clone, &pid, &story_id_for_settle, final_status).await;
 
         pipeline_clone.tasks.remove(&pid);
         info!(pipeline_run_id = %pid, status = %final_status, "Pipeline complete");

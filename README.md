@@ -122,8 +122,12 @@ spending API budget with nobody watching.
 An automatic transition only ever moves a card that is still `in_progress`. If
 you moved it yourself, or the agent called `update_story_status`, that is a
 decision and it stands. Chat sessions are rows in the same table but are never
-moved, so conversations stay off the board. Every move is recorded on the run's
-own timeline as a `story_status` event, so a card that moves says why.
+moved, so conversations stay off the board.
+
+Every automatic move is recorded as a `story_status` event on the timeline of
+the run that caused it — a run finishing, a pipeline finishing, or the startup
+sweep — so a card that moves says where to and why. A card left alone writes
+nothing, because nothing happened to it.
 
 To switch the whole behaviour off, set `auto_advance_story_status` to `false`
 in the active workspace's settings:

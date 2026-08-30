@@ -1359,13 +1359,12 @@ impl ConversationRuntime {
                 // On the run's own timeline, so a user can see why the card
                 // moved instead of inferring it from a timestamp.
                 self.persist_event(
-                    "story_status",
-                    &serde_json::json!({
-                        "storyId": self.story_id,
-                        "from": "in_progress",
-                        "to": to,
-                        "reason": format!("the run finished with status '{status}'"),
-                    }),
+                    db::story_status::TRANSITION_EVENT_TYPE,
+                    &db::story_status::transition_payload(
+                        &self.story_id,
+                        to,
+                        &format!("the run finished with status '{status}'"),
+                    ),
                 )
                 .await;
             }

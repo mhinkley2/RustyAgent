@@ -146,6 +146,60 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// The `run_events.event_type` written when a card moves on its own.
+pub const TRANSITION_EVENT_TYPE: &str = "story_status";
+
+/// The body of a [`TRANSITION_EVENT_TYPE`] event.
+///
+/// Built here rather than at each of the three call sites so a reader of the
+/// timeline sees one shape whichever path moved the card.
+pub fn transition_payload(story_id: &str, to: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "storyId": story_id,
+        "from": "in_progress",
+        "to": to,
+        "reason": reason,
+    })
+}
+
+/// Record a card's move on the timeline of the run that caused it.
+///
+/// For callers with no in-memory sequence counter — the pipeline engine and
+/// the crash sweep. `sequence_num` continues the run's own numbering with a
+/// `MAX(...) + 1` subquery, the same shape `recovery` uses for its
+/// `interrupted` event, so the entry sorts after whatever the run wrote before
+/// it. `MAX` over an empty set still yields one row, so a run that recorded
+/// nothing gets sequence 0.
+///
+/// `ConversationRuntime` does not use this: it holds an `AtomicU32` counter
+/// for the run it is executing, and a `MAX`-based insert would collide with
+/// it. It writes the same event type and the same [`transition_payload`].
+pub async fn record_transition<'e, E>(
+    executor: E,
+    run_id: &str,
+    story_id: &str,
+    to: &str,
+    reason: &str,
+) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO run_events (id, run_id, event_type, content, sequence_num) \
+         SELECT ?, ?, ?, ?, COALESCE(MAX(sequence_num), -1) + 1 \
+         FROM run_events WHERE run_id = ?",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(TRANSITION_EVENT_TYPE)
+    .bind(transition_payload(story_id, to, reason).to_string())
+    .bind(run_id)
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
 /// Whether automatic story transitions are switched on for the active
 /// workspace.
 ///

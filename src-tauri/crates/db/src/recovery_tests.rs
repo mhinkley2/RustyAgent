@@ -150,6 +150,76 @@ async fn a_story_left_in_progress_by_a_crash_is_moved_off_it() {
     assert_eq!(story_status(&db, STORY).await, "blocked");
 }
 
+/// The sweep's card move is attributable like any other. The `interrupted`
+/// event says the run ended; this says what became of the card, which is the
+/// question someone looking at the board is actually asking.
+#[tokio::test]
+async fn a_swept_card_says_on_the_runs_timeline_why_it_moved() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+
+    reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("sweep");
+
+    let content: String = sqlx::query_scalar(
+        "SELECT content FROM run_events WHERE run_id = ? AND event_type = 'story_status'",
+    )
+    .bind("run-1")
+    .fetch_one(&db)
+    .await
+    .expect("the move should be on the run's timeline");
+
+    let payload: serde_json::Value = serde_json::from_str(&content).expect("json");
+    assert_eq!(payload["storyId"], STORY);
+    assert_eq!(payload["to"], "blocked");
+    assert!(
+        payload["reason"].as_str().unwrap_or_default().contains("exited"),
+        "{payload}"
+    );
+}
+
+/// The card's move and the run's own interruption are two separate facts, and
+/// the timeline carries both.
+#[tokio::test]
+async fn a_swept_run_records_both_its_interruption_and_its_cards_move() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+
+    reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("sweep");
+
+    let types: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM run_events WHERE run_id = ? ORDER BY sequence_num",
+    )
+    .bind("run-1")
+    .fetch_all(&db)
+    .await
+    .expect("read events");
+
+    assert_eq!(types, vec![INTERRUPTED_EVENT_TYPE.to_string(), "story_status".to_string()]);
+}
+
+/// A card the sweep left alone has nothing to explain.
+#[tokio::test]
+async fn a_card_the_sweep_did_not_move_records_nothing() {
+    let db = pool().await;
+    seed_run(&db, "run-1", STORY, PROFILE).await;
+    sqlx::query("UPDATE stories SET status = 'review' WHERE id = ?")
+        .bind(STORY)
+        .execute(&db)
+        .await
+        .expect("set status");
+
+    reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("sweep");
+
+    let moves: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM run_events WHERE run_id = ? AND event_type = 'story_status'",
+    )
+    .bind("run-1")
+    .fetch_one(&db)
+    .await
+    .expect("count");
+    assert_eq!(moves, 0);
+}
+
 /// `blocked`, not `ready`. A crash is not a reason to hand the story back to a
 /// continuous-mode profile, which would re-pick it the moment the app came up.
 #[tokio::test]
@@ -249,8 +319,10 @@ async fn each_reconciled_run_gains_an_event_saying_a_restart_ended_it() {
     reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("sweep");
 
     let events = run_events(&db, "run-1").await;
-    let (kind, content) = events.last().expect("an event was appended");
-    assert_eq!(kind, INTERRUPTED_EVENT_TYPE);
+    let (_, content) = events
+        .iter()
+        .find(|(kind, _)| kind == INTERRUPTED_EVENT_TYPE)
+        .expect("an event was appended");
     assert!(
         content.contains("exited") && content.contains("failed"),
         "the timeline must say why the run ended: {content}"
@@ -279,18 +351,34 @@ async fn the_interruption_event_sorts_after_what_the_run_managed_to_write() {
     // `run_events` orders by sequence_num, not by timestamp — the ordering the
     // data actually expresses.
     let kinds: Vec<String> = run_events(&db, "run-1").await.into_iter().map(|(k, _)| k).collect();
-    assert_eq!(kinds, vec!["token", "tool_call", INTERRUPTED_EVENT_TYPE]);
+    // The card's move follows the interruption that caused it, both after
+    // whatever the run itself managed to write.
+    assert_eq!(
+        kinds,
+        vec!["token", "tool_call", INTERRUPTED_EVENT_TYPE, "story_status"]
+    );
 }
 
 #[tokio::test]
 async fn a_run_that_recorded_nothing_still_gets_its_interruption_event() {
     // The `MAX(sequence_num)` over an empty timeline must not swallow the row.
+    // Both appended rows use that subquery, so both are at risk.
     let db = pool().await;
     seed_run(&db, "run-1", STORY, PROFILE).await;
 
     reconcile_orphaned_runs(&db, THIS_INSTANCE).await.expect("sweep");
 
-    assert_eq!(run_events(&db, "run-1").await.len(), 1);
+    let kinds: Vec<String> = run_events(&db, "run-1").await.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(kinds, vec![INTERRUPTED_EVENT_TYPE.to_string(), "story_status".to_string()]);
+
+    let sequences: Vec<i64> = sqlx::query_scalar(
+        "SELECT sequence_num FROM run_events WHERE run_id = ? ORDER BY sequence_num",
+    )
+    .bind("run-1")
+    .fetch_all(&db)
+    .await
+    .expect("read sequences");
+    assert_eq!(sequences, vec![0, 1], "an empty timeline starts at zero");
 }
 
 #[tokio::test]

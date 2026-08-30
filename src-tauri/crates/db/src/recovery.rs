@@ -61,6 +61,11 @@ pub const INTERRUPTED_APPROVAL_REASON: &str =
     "Denied automatically: RustyAgent restarted while this request was pending. The run \
      waiting on the decision is gone, so approving it would have executed nothing.";
 
+/// What a swept run's `story_status` event gives as its reason.
+pub const INTERRUPTED_TRANSITION_REASON: &str =
+    "RustyAgent exited while this run was still executing, so its story was moved out of \
+     in_progress on the next startup rather than left claiming to be in flight";
+
 /// The status a `pipeline_step_runs` row is moved to alongside its run.
 const INTERRUPTED_STEP_STATUS: &str = "failed";
 
@@ -209,6 +214,19 @@ pub async fn reconcile_orphaned_runs(db: &DbPool, instance_id: &str) -> Result<R
             .await
             .with_context(|| format!("Failed to settle the story of run '{run_id}'"))?
         {
+            // Attributed like any other automatic move. The `interrupted`
+            // event above says the run ended; this says what became of the
+            // card, which is a different fact and the one a user looking at
+            // the board is asking about.
+            crate::story_status::record_transition(
+                &mut *tx,
+                run_id,
+                story_id,
+                crate::story_status::RunOutcome::Interrupted.story_status(),
+                INTERRUPTED_TRANSITION_REASON,
+            )
+            .await
+            .with_context(|| format!("Failed to record the story move of run '{run_id}'"))?;
             stories += 1;
         }
 
