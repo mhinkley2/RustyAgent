@@ -213,6 +213,15 @@ interface KanbanViewProps {
   onSelect: (story: Story) => void;
   onMove: (storyId: string, newStatus: StoryStatus) => Promise<void>;
   onReorder: (updates: { id: string; sortOrder: number }[]) => Promise<void>;
+  /**
+   * Called as a drag begins and ends.
+   *
+   * The board refetches itself on a timer and whenever another writer changes
+   * a story. A refetch landing between a drop and the write that persists it
+   * would replace the optimistic order with the pre-drop one, so the board
+   * holds automatic refreshes for the duration of a drag.
+   */
+  onDragActiveChange?: (dragging: boolean) => void;
 }
 
 const EMPTY_MESSAGES: Record<StoryStatus, string> = {
@@ -224,7 +233,7 @@ const EMPTY_MESSAGES: Record<StoryStatus, string> = {
   done:        "No completed stories",
 };
 
-export function KanbanView({ stories, onSelect, onMove, onReorder }: KanbanViewProps) {
+export function KanbanView({ stories, onSelect, onMove, onReorder, onDragActiveChange }: KanbanViewProps) {
   // Local column map — drives rendering during and after drags
   const [colMap, setColMap] = useState<ColMap>(() => buildColMap(stories));
   const activeIdRef = useRef<string | null>(null);
@@ -253,6 +262,7 @@ export function KanbanView({ stories, onSelect, onMove, onReorder }: KanbanViewP
   }, []);
 
   function handleDragStart({ active }: DragStartEvent) {
+    onDragActiveChange?.(true);
     const col = findColOf(active.id, colMap);
     activeIdRef.current = active.id as string;
     originalColRef.current = col;
@@ -285,7 +295,27 @@ export function KanbanView({ stories, onSelect, onMove, onReorder }: KanbanViewP
     });
   }
 
+  /**
+   * A drag abandoned rather than dropped — Escape, or dnd-kit cancelling it.
+   *
+   * `onDragEnd` does not fire in that case, so without this the board would be
+   * left with auto-refresh paused for good: one cancelled drag and the card
+   * stops following the database, silently, with nothing to un-stick it.
+   */
+  function handleDragCancel() {
+    onDragActiveChange?.(false);
+    activeIdRef.current = null;
+    setActiveId(null);
+    setOverColId(null);
+    originalColRef.current = null;
+    // The columns were rearranged live as the pointer moved; put them back.
+    setColMap(buildColMap(stories));
+  }
+
   async function handleDragEnd({ active, over }: DragEndEvent) {
+    // Released before the awaits below: the drop is decided here, and the
+    // persist that follows is what a deferred refresh should land after.
+    onDragActiveChange?.(false);
     activeIdRef.current = null;
     setActiveId(null);
     setOverColId(null);
@@ -345,6 +375,7 @@ export function KanbanView({ stories, onSelect, onMove, onReorder }: KanbanViewP
       onDragStart={handleDragStart}
       onDragOver={handleDragOver}
       onDragEnd={handleDragEnd}
+      onDragCancel={handleDragCancel}
     >
       <div className="kb">
         {/* Main columns */}

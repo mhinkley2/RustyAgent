@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { notifyError } from "../components/ui/Toast";
 import type { Story, StoryStatus, StoryPriority, StoryType } from "../types/board";
 
@@ -87,47 +87,180 @@ interface UseStoriesReturn {
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
+  /** When the list on screen was last read from the database. */
+  lastFetchedAt: Date | null;
+  /**
+   * Hold automatic refreshes while a card is being dragged.
+   *
+   * A refetch landing between a drop and the write that persists it would
+   * stomp the optimistic order. The change that arrived is remembered and
+   * applied on resume.
+   */
+  pauseAutoRefresh: () => void;
+  resumeAutoRefresh: () => void;
   createStory: (input: CreateStoryInput) => Promise<Story>;
   updateStory: (id: string, input: UpdateStoryInput) => Promise<Story>;
   deleteStory: (id: string) => Promise<void>;
   reorderStories: (updates: { id: string; sortOrder: number }[]) => Promise<void>;
 }
 
+/**
+ * Emitted by every in-process writer that changes a story. Mirrors
+ * `db::story_status::STORIES_CHANGED_EVENT`.
+ */
+export const STORIES_CHANGED_EVENT = "stories-changed";
+
+/**
+ * How long to wait after a change before refetching.
+ *
+ * A pipeline settling several stories emits several times in quick succession;
+ * the board only needs one fetch out of it.
+ */
+const CHANGE_DEBOUNCE_MS = 250;
+
+/**
+ * The polling floor, for writers that cannot emit — chiefly the out-of-process
+ * MCP binary. Stories change on run boundaries rather than per token, so this
+ * is deliberately slow.
+ */
+const POLL_INTERVAL_MS = 15_000;
+
 export function useStories(): UseStoriesReturn {
   const [stories, setStories] = useState<Story[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null);
+  // While a card is being dragged, a refetch would fight the optimistic order.
+  const pausedRef = useRef(false);
+  // A refresh that arrived while paused, to be honoured on resume.
+  const missedRef = useRef(false);
+
+  /**
+   * Fetch the board.
+   *
+   * `background` is for the poll and the event listener: they must not put the
+   * board into its loading state, or a card would blink out every fifteen
+   * seconds. Only an explicit refresh — mount, workspace change, or the user
+   * pressing the button — says it is loading.
+   */
+  const fetchStories = useCallback(async (background: boolean) => {
+    if (!background) setLoading(true);
     setError(null);
     try {
       const raw = await invoke<RawStory[]>("get_stories");
       setStories(raw.map(mapStory));
+      setLastFetchedAt(new Date());
     } catch (e) {
       const message = errorMessage(e);
       setError(message);
-      notifyError("Failed to load stories", message, { duration: 7000 });
+      // A failing poll must not shout every fifteen seconds; the staleness
+      // indicator in the header is how a background failure shows.
+      if (!background) {
+        notifyError("Failed to load stories", message, { duration: 7000 });
+      }
     } finally {
-      setLoading(false);
+      if (!background) setLoading(false);
     }
   }, []);
 
+  const refresh = useCallback(async () => {
+    await fetchStories(false);
+  }, [fetchStories]);
+
+  /**
+   * Refetch in the background, unless a drag is in flight.
+   *
+   * A refetch landing between a drop and the write that persists it stomps the
+   * optimistic order, so an automatic refresh defers instead — and the deferred
+   * one is remembered rather than dropped, or a change arriving mid-drag would
+   * wait for the *next* one.
+   */
+  const backgroundRefresh = useCallback(() => {
+    if (pausedRef.current) {
+      missedRef.current = true;
+      return;
+    }
+    void fetchStories(true);
+  }, [fetchStories]);
+
+  const pauseAutoRefresh = useCallback(() => {
+    pausedRef.current = true;
+  }, []);
+
+  const resumeAutoRefresh = useCallback(() => {
+    pausedRef.current = false;
+    if (missedRef.current) {
+      missedRef.current = false;
+      void fetchStories(true);
+    }
+  }, [fetchStories]);
+
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    void fetchStories(false);
+  }, [fetchStories]);
 
   // Refresh whenever the active workspace changes.
   useEffect(() => {
-    const unlisten = listen("workspace-changed", () => { refresh(); });
+    const unlisten = listen("workspace-changed", () => { void fetchStories(false); });
     return () => { unlisten.then(fn => fn()); };
-  }, [refresh]);
+  }, [fetchStories]);
+
+  /**
+   * Follow the board as other writers change it.
+   *
+   * Runs, pipelines, the crash sweep and the UI's own commands all write
+   * stories, and until this existed only a restart or a workspace switch made
+   * any of it visible — so the routine end of a run moved a card in SQL that
+   * the open board never showed.
+   *
+   * Debounced, because one pipeline settling six stories is one board change,
+   * not six.
+   */
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    void listen(STORIES_CHANGED_EVENT, () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => backgroundRefresh(), CHANGE_DEBOUNCE_MS);
+    }).then(fn => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
+  }, [backgroundRefresh]);
+
+  /**
+   * The floor under the events.
+   *
+   * `rustyagent-board-mcp` runs as a separate process against the same SQLite
+   * file and cannot emit a Tauri event at all, so an external client's writes
+   * are only ever visible through this. It also covers any future writer that
+   * forgets to announce itself.
+   */
+  useEffect(() => {
+    const timer = setInterval(backgroundRefresh, POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [backgroundRefresh]);
 
   const createStory = useCallback(async (input: CreateStoryInput): Promise<Story> => {
     try {
       const raw = await invoke<RawStory>("create_story", { input });
       const story = mapStory(raw);
-      setStories(prev => [...prev, story]);
+      // Append only if a refetch has not already brought it in. Creating a
+      // story announces a board change, and a poll may also be in flight, so
+      // the list can already contain what this is about to add — an append
+      // that did not check would show the new card twice.
+      setStories(prev =>
+        prev.some(s => s.id === story.id) ? prev : [...prev, story],
+      );
       return story;
     } catch (e) {
       notifyError("Failed to create story", errorMessage(e), { duration: 7000 });
@@ -177,5 +310,17 @@ export function useStories(): UseStoriesReturn {
     }
   }, []);
 
-  return { stories, loading, error, refresh, createStory, updateStory, deleteStory, reorderStories };
+  return {
+    stories,
+    loading,
+    error,
+    refresh,
+    lastFetchedAt,
+    pauseAutoRefresh,
+    resumeAutoRefresh,
+    createStory,
+    updateStory,
+    deleteStory,
+    reorderStories,
+  };
 }

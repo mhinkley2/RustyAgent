@@ -487,8 +487,14 @@ impl ConversationRuntime {
         // started run looking untouched for its whole duration — and left the
         // completion side with nothing in `in_progress` to move.
         if db::story_status::auto_advance_enabled(&db).await {
-            if let Err(e) = db::story_status::claim_story(&db, &story_id).await {
-                warn!(run_id = %run_id, story_id = %story_id, "Failed to claim the story: {e}");
+            match db::story_status::claim_story(&db, &story_id).await {
+                Ok(true) => {
+                    app.emit_event(db::story_status::STORIES_CHANGED_EVENT, serde_json::Value::Null)
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(run_id = %run_id, story_id = %story_id, "Failed to claim the story: {e}")
+                }
             }
         }
 
@@ -1574,6 +1580,11 @@ impl ConversationRuntime {
             Ok(true) => {
                 let to = outcome.story_status();
                 info!(run_id = %self.run_id, story_id = %self.story_id, "Story moved to {to}");
+                // The card moved in SQL. Without this the open board goes on
+                // showing the run as in progress until the app restarts — the
+                // routine end of every successful run, invisible.
+                self.app
+                    .emit_event(db::story_status::STORIES_CHANGED_EVENT, serde_json::Value::Null);
                 // On the run's own timeline, so a user can see why the card
                 // moved instead of inferring it from a timestamp.
                 self.persist_event(

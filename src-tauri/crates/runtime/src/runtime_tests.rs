@@ -1141,6 +1141,45 @@ async fn a_run_claims_its_story_on_start_and_sends_it_to_review_on_success() {
     assert_eq!(story_status(&h.db, STORY_ID).await, "review");
 }
 
+/// The move happens in SQL, where no amount of watching the event bus would
+/// see it. Without this announcement the open board goes on showing the run as
+/// in progress until the app restarts — the routine end of every successful
+/// run, invisible.
+#[tokio::test]
+async fn moving_the_card_tells_the_board_it_moved() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+
+    h.run().await;
+
+    assert_eq!(
+        h.sink.count(db::story_status::STORIES_CHANGED_EVENT),
+        2,
+        "once when the run claimed the card, once when it settled it"
+    );
+}
+
+/// A card that did not move has nothing to announce; a board that refetched
+/// anyway would be doing it for no reason.
+#[tokio::test]
+async fn a_run_that_moves_no_card_says_nothing_to_the_board() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+    set_story_status(&h.db, STORY_ID, "blocked").await;
+
+    h.run().await;
+
+    assert_eq!(h.sink.count(db::story_status::STORIES_CHANGED_EVENT), 0);
+}
+
+#[tokio::test]
+async fn the_board_is_not_told_when_the_behaviour_is_switched_off() {
+    let h = Harness::new(vec![MockResponse::text("done")]).await;
+    disable_auto_advance(&h.db).await;
+
+    h.run().await;
+
+    assert_eq!(h.sink.count(db::story_status::STORIES_CHANGED_EVENT), 0);
+}
+
 /// `review`, not `done`: agent output nobody has looked at should not claim to
 /// be finished work.
 #[tokio::test]

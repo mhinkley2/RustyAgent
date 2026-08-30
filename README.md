@@ -155,6 +155,13 @@ to `ready` while a continuous-mode profile is polling gets re-picked
 immediately, and the two loop without bound against work that just failed —
 spending API budget with nobody watching.
 
+The board follows these moves as they happen: every in-process writer
+announces a change and the open board refetches, debounced so a pipeline
+settling several cards causes one fetch. The `rustyagent-board-mcp` binary runs
+as a separate process and cannot emit an event at all, so the board also polls
+every 15 seconds as a floor, and the header says how stale the view is with a
+button to refetch now.
+
 An automatic transition only ever moves a card it can see nobody has decided
 about: `ready` to claim it, `in_progress` to settle it. If you moved it
 yourself, or the agent called `update_story_status`, that is a decision and it
