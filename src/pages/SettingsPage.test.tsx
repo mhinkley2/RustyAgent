@@ -20,7 +20,11 @@ function renderPage(settings: Partial<AppSettings> = {}) {
       saved.push(args.settings as AppSettings);
       return null;
     },
-    get_app_version: () => "0.2.0",
+    // Deliberately not the real version. This test is "the page shows what
+    // the backend reports", not "the page shows 0.2.0" — a fixture that
+    // happens to match the shipped number invites the reader to think
+    // otherwise, and `version_drift_tests` is what actually guards the number.
+    get_app_version: () => "9.9.9",
   });
   render(<SettingsPage />);
   return saved;
@@ -37,7 +41,7 @@ describe("SettingsPage version", () => {
   it("shows the version this build was stamped with", async () => {
     renderPage();
 
-    expect(await screen.findByText("0.2.0")).toBeInTheDocument();
+    expect(await screen.findByText("9.9.9")).toBeInTheDocument();
   });
 
   // The version is a nicety; failing to read it must not take the settings

@@ -52,21 +52,44 @@ fn json_version(source: &str) -> Option<String> {
     Some(rest[start..end].to_string())
 }
 
-/// The `version` under `[workspace.package]` in the workspace manifest.
-fn workspace_package_version(source: &str) -> Option<String> {
-    let section = source.find("[workspace.package]")?;
-    let rest = &source[section..];
-    // Stop at the next section header so a later `version = …` cannot be
-    // mistaken for this one.
+/// The body of one TOML section, up to the next section header.
+///
+/// Scoping matters: a manifest can carry `version = "…"` in a
+/// `[dependencies.foo]` table as legitimately as in `[package]`, and a check
+/// that searched the whole file would call the first one a drifting version.
+fn section<'a>(source: &'a str, header: &str) -> Option<&'a str> {
+    let start = source.find(header)?;
+    let rest = &source[start..];
     let end = rest[1..].find("\n[").map(|i| i + 1).unwrap_or(rest.len());
-    for line in rest[..end].lines() {
+    Some(&rest[..end])
+}
+
+/// A literal `version = "…"` declared directly in `body`.
+///
+/// `None` for `version.workspace = true`, which is inheritance rather than a
+/// copy — that is the whole distinction this file is drawing.
+fn literal_version(body: &str) -> Option<String> {
+    for line in body.lines() {
         let line = line.trim();
-        if let Some(value) = line.strip_prefix("version") {
-            let value = value.trim_start().strip_prefix('=')?.trim();
+        let Some(rest) = line.strip_prefix("version") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(value) = rest.strip_prefix('=') else {
+            // `version.workspace = true` — inherited, not declared.
+            continue;
+        };
+        let value = value.trim();
+        if value.starts_with('"') {
             return Some(value.trim_matches('"').to_string());
         }
     }
     None
+}
+
+/// The `version` under `[workspace.package]` in the workspace manifest.
+fn workspace_package_version(source: &str) -> Option<String> {
+    literal_version(section(source, "[workspace.package]")?)
 }
 
 struct Declared {
@@ -169,6 +192,44 @@ fn the_compiled_in_version_matches_the_bundled_one() {
     );
 }
 
+/// A dependency's version is not the crate's own, and a check that searched
+/// the whole manifest would have said otherwise the first time somebody wrote
+/// a dependency in table form.
+#[test]
+fn a_dependency_table_is_not_mistaken_for_the_crates_own_version() {
+    let manifest = r#"
+[package]
+name = "example"
+version.workspace = true
+edition = "2021"
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+"#;
+
+    assert_eq!(
+        section(manifest, "[package]").and_then(literal_version),
+        None,
+        "the package inherits its version; only the dependency declares one"
+    );
+    assert_eq!(
+        section(manifest, "[dependencies.serde]").and_then(literal_version),
+        Some("1.0".to_string()),
+        "and the dependency's version is still readable, so the scoping works"
+    );
+}
+
+#[test]
+fn a_crate_declaring_its_own_version_is_caught() {
+    let manifest = "[package]\nname = \"example\"\nversion = \"0.1.0\"\n";
+
+    assert_eq!(
+        section(manifest, "[package]").and_then(literal_version),
+        Some("0.1.0".to_string())
+    );
+}
+
 #[test]
 fn no_member_crate_pins_its_own_version() {
     let crates_dir = crate_dir().join("crates");
@@ -180,9 +241,13 @@ fn no_member_crate_pins_its_own_version() {
             continue;
         }
         let source = read(&manifest);
-        // `version.workspace = true` is inheritance; a literal `version = "…"`
-        // in `[package]` is a copy that can drift.
-        if source.contains("\nversion = \"") || source.starts_with("version = \"") {
+        // Only `[package]`, and only a literal. `version.workspace = true` is
+        // inheritance, and a `version = "…"` inside a `[dependencies.foo]`
+        // table is somebody else's version — neither is a copy that can drift.
+        let declares_its_own = section(&source, "[package]")
+            .and_then(literal_version)
+            .is_some();
+        if declares_its_own {
             pinned.push(manifest.display().to_string());
         }
     }
