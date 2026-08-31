@@ -4,7 +4,7 @@ use tools::ToolOutput;
 
 use crate::{
     mcp_tool,
-    paging::{paged_rows, page_request},
+    paging::{paged_rows, page_request, NO_FULLER_FORM},
     registry::{json_ok, json_result, opt_str_arg, str_arg},
 };
 
@@ -120,6 +120,7 @@ mcp_tool! {
             "events",
             &format!("run '{run_id}'"),
             EVENT_TEXT_FIELDS,
+            NO_FULLER_FORM,
         ) {
             Ok(envelope) => json_ok(envelope),
             Err(error) => ToolOutput::err(error),

@@ -2,6 +2,7 @@
 // See RUSTYAGE-5 for implementation details.
 
 pub mod builtin;
+pub mod paging;
 pub mod paths;
 pub mod read_cap;
 pub mod shell;

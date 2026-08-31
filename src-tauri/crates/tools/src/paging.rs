@@ -1,14 +1,18 @@
-//! Bounding the list-shaped responses on the MCP surface.
+//! Bounding list-shaped tool responses.
 //!
-//! The read tools here answer into an *external* agent's context — Claude
-//! Code, an editor, anything that speaks MCP — whose budget this process
-//! cannot see and cannot spend twice. A response that returns "every row" is
-//! therefore not a convenience but a defect: one long autonomous run's event
-//! log, with the full `tool_input` and `tool_output` of every call in it, is
-//! larger than any source file in the repository.
+//! These read tools answer into an agent's context — Claude Code over MCP, an
+//! editor, or one of this app's own runtimes — whose budget the caller cannot
+//! see and cannot spend twice. A response that returns "every row" is therefore
+//! not a convenience but a defect: one long autonomous run's event log, with
+//! the full `tool_input` and `tool_output` of every call in it, is larger than
+//! any source file in the repository.
+//!
+//! Lives beside the tools rather than in `board-mcp` because the bound is not a
+//! property of the wire protocol. An internal agent has the same finite context
+//! an external one does, and `list_stories` is read by both.
 //!
 //! Two independent limits apply, for the same reason they do on the file read
-//! path (see [`tools::read_cap`]):
+//! path (see [`crate::read_cap`]):
 //!
 //! * a **row** limit, so the reply carries a countable number of records; and
 //! * a **byte** budget, because rows are not the same size — a hundred token
@@ -20,7 +24,7 @@
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use tools::read_cap::{floor_char_boundary, optional_positive, MAX_READ_BYTES};
+use crate::read_cap::{floor_char_boundary, optional_positive, MAX_READ_BYTES};
 
 /// Bytes of serialized JSON a single response's payload may carry.
 ///
@@ -38,6 +42,18 @@ use tools::read_cap::{floor_char_boundary, optional_positive, MAX_READ_BYTES};
 /// should expect twice the number, and tool descriptions should not promise
 /// otherwise.
 pub const MAX_PAGE_BYTES: usize = MAX_READ_BYTES;
+
+/// What a reader whose value was cut can do about it.
+///
+/// A truncation marker that stops at "this was cut" tells an agent only that it
+/// is missing something. For most capped fields — a tool result, a chat message
+/// — there is genuinely no fuller form on this surface, and saying so is the
+/// honest end of the sentence.
+///
+/// A story's `description` is the exception: `get_story` returns it whole, so
+/// that marker names the call instead. Hence the parameter.
+pub const NO_FULLER_FORM: &str =
+    "The full value is not available over MCP — view it in the RustyAgent app.";
 
 /// Bytes any single free-text column may carry.
 ///
@@ -88,8 +104,9 @@ pub fn page_request(
 /// Cuts on a UTF-8 character boundary — a row holding a tool result full of
 /// box-drawing characters or CJK text is ordinary, and slicing at a fixed byte
 /// offset would panic on it. The marker names the tool and the field so the
-/// reader can tell a value that was shortened from one that was short.
-pub fn cap_text_fields(row: &mut Value, fields: &[&str], tool_name: &str) {
+/// reader can tell a value that was shortened from one that was short, and ends
+/// with `remedy` so it also says what to do about it — see [`NO_FULLER_FORM`].
+pub fn cap_text_fields(row: &mut Value, fields: &[&str], tool_name: &str, remedy: &str) {
     let Some(object) = row.as_object_mut() else {
         return;
     };
@@ -102,13 +119,14 @@ pub fn cap_text_fields(row: &mut Value, fields: &[&str], tool_name: &str) {
         }
         let full = text.len();
         let cut = floor_char_boundary(text, MAX_FIELD_BYTES);
-        // The marker names the app, not "the run": this helper also caps chat
-        // messages and directory entries, which are not runs, and a marker that
-        // names the wrong thing sends the reader somewhere their value is not.
+        // The remedy is the caller's to supply: this helper caps tool results,
+        // chat messages, directory entries and story descriptions, and only the
+        // last of those has another call that returns it whole. A marker that
+        // named the wrong thing would send the reader somewhere their value is
+        // not.
         let capped = format!(
             "{}\n[{tool_name} FIELD TRUNCATED: '{field}' is {full} bytes; the first {cut} are \
-             shown. The full value is not available over MCP — view it in the RustyAgent \
-             app.]",
+             shown. {remedy}]",
             &text[..cut]
         );
         object.insert((*field).to_string(), Value::String(capped));
@@ -216,6 +234,9 @@ fn page_envelope_of(
 }
 
 /// Serialize, field-cap, and page a list of rows in one step.
+///
+/// `remedy` ends any truncation marker this produces; pass [`NO_FULLER_FORM`]
+/// unless another tool can return the capped field in full.
 pub fn paged_rows<T: Serialize>(
     rows: Vec<T>,
     request: PageRequest,
@@ -223,6 +244,7 @@ pub fn paged_rows<T: Serialize>(
     item_key: &str,
     subject: &str,
     text_fields: &[&str],
+    remedy: &str,
 ) -> Result<Value, String> {
     let total = rows.len();
     // Narrow to the requested window *before* serializing and field-capping.
@@ -257,7 +279,7 @@ pub fn paged_rows<T: Serialize>(
         let mut value =
             serde_json::to_value(row).map_err(|error| format!("Failed to serialize: {error}"))?;
         if !text_fields.is_empty() {
-            cap_text_fields(&mut value, text_fields, tool_name);
+            cap_text_fields(&mut value, text_fields, tool_name, remedy);
         }
         values.push(value);
     }
@@ -301,7 +323,7 @@ mod tests {
             (0..1_000).map(|i| Counted(i, Arc::clone(&seen))).collect();
 
         let envelope =
-            paged_rows(rows, req(1, 10), "t", "items", "the list", &[]).expect("page");
+            paged_rows(rows, req(1, 10), "t", "items", "the list", &[], NO_FULLER_FORM).expect("page");
 
         assert_eq!(envelope["returned"], json!(10));
         assert_eq!(envelope["total"], json!(1_000));
@@ -332,7 +354,7 @@ mod tests {
             (0..500).map(|i| Counted(i, Arc::clone(&seen))).collect();
 
         let envelope =
-            paged_rows(rows, req(401, 50), "t", "items", "the list", &[]).expect("page");
+            paged_rows(rows, req(401, 50), "t", "items", "the list", &[], NO_FULLER_FORM).expect("page");
 
         assert_eq!(envelope["returned"], json!(50));
         assert_eq!(envelope["offset"], json!(401));
@@ -363,7 +385,7 @@ mod tests {
             .map(|_| Counted(Arc::clone(&serialized)))
             .collect();
 
-        let error = paged_rows(rows, req(5_000, 50), "t", "items", "the list", &[])
+        let error = paged_rows(rows, req(5_000, 50), "t", "items", "the list", &[], NO_FULLER_FORM)
             .expect_err("an offset past the end must fail");
 
         assert!(error.contains("offset"), "got {error}");
@@ -376,7 +398,7 @@ mod tests {
     #[test]
     fn the_envelope_reports_the_limit_actually_in_force() {
         let envelope =
-            paged_rows(rows(500), req(1, 200), "t", "items", "the list", &[]).expect("page");
+            paged_rows(rows(500), req(1, 200), "t", "items", "the list", &[], NO_FULLER_FORM).expect("page");
 
         assert_eq!(envelope["limit"], json!(200));
         assert_eq!(envelope["returned"], json!(200));
@@ -492,7 +514,7 @@ mod tests {
     fn a_long_text_field_is_capped_and_says_which_field_was_cut() {
         let mut row = json!({ "content": "y".repeat(MAX_FIELD_BYTES * 2), "role": "user" });
 
-        cap_text_fields(&mut row, &["content", "tool_output"], "get_run_events");
+        cap_text_fields(&mut row, &["content", "tool_output"], "get_run_events", NO_FULLER_FORM);
 
         let content = row["content"].as_str().expect("content");
         assert!(content.starts_with(&"y".repeat(MAX_FIELD_BYTES)));
@@ -506,7 +528,7 @@ mod tests {
         // inside a "€". Slicing there would panic.
         let mut row = json!({ "content": "\u{20AC}".repeat(4000) });
 
-        cap_text_fields(&mut row, &["content"], "t");
+        cap_text_fields(&mut row, &["content"], "t", NO_FULLER_FORM);
 
         let content = row["content"].as_str().expect("content");
         let expected = (MAX_FIELD_BYTES / 3) * 3;
@@ -517,14 +539,14 @@ mod tests {
     #[test]
     fn a_field_at_exactly_the_cap_is_left_alone() {
         let mut row = json!({ "content": "y".repeat(MAX_FIELD_BYTES) });
-        cap_text_fields(&mut row, &["content"], "t");
+        cap_text_fields(&mut row, &["content"], "t", NO_FULLER_FORM);
         assert!(!row["content"].as_str().expect("content").contains("TRUNCATED"));
     }
 
     #[test]
     fn capping_ignores_absent_and_non_string_fields() {
         let mut row = json!({ "content": Value::Null, "is_error": true });
-        cap_text_fields(&mut row, &["content", "tool_output", "is_error"], "t");
+        cap_text_fields(&mut row, &["content", "tool_output", "is_error"], "t", NO_FULLER_FORM);
         assert_eq!(row, json!({ "content": Value::Null, "is_error": true }));
     }
 }
