@@ -5,20 +5,23 @@
 //!
 //! ## Response size
 //!
-//! Every tool here answers into an external agent's context. The four that
+//! Every tool here answers into an external agent's context. The five that
 //! could return unbounded text are bounded: `read_file` by the shared
-//! [`tools::read_cap`] cap, and `get_run_events`, `get_chat_session_messages`
-//! and `list_directory` by [`crate::paging`]. `get_app_logs` returns a bounded
-//! tail by default.
+//! [`tools::read_cap`] cap, and `get_run_events`, `get_chat_session_messages`,
+//! `list_directory` and `list_stories` by [`crate::paging`]. `get_app_logs`
+//! returns a bounded tail by default.
+//!
+//! `list_stories` is bounded in the shared agent tool rather than here. The
+//! earlier note treated "capping it changes the internal agent tool too" as the
+//! cost that blocked the fix; it is the benefit. An agent inside this app has
+//! the same finite context an agent outside it does, and answering "what
+//! stories exist" with every story's full specification floods both.
 //!
 //! Still unbounded, audited and knowingly left alone rather than overlooked:
 //!
 //! * `get_run_diff` — one `diff_output` blob, which `commands::runs` itself
 //!   notes "can be arbitrarily large". The largest remaining hole on this
 //!   surface.
-//! * `list_stories` — the shared agent tool, which returns every story's full
-//!   `description`. Capping it changes the internal agent tool too, so it is
-//!   not a board-mcp-local fix.
 //! * `list_runs`, `list_agent_profiles`, `list_workspaces`,
 //!   `list_pending_approvals`, `list_pending_human_requests`,
 //!   `list_custom_tools`, `get_custom_tool_bindings` — fixed-shape rows with no
@@ -43,6 +46,8 @@ pub fn build_registry() -> McpRegistry {
     let mut registry = McpRegistry::new();
 
     // Board — the six story tools are existing agent tools, adapted unchanged.
+    // `list_stories` pages and truncates descriptions, and does so in the shared
+    // tool, so this surface still adapts it rather than wrapping it.
     registry.register_agent_tool(tools::builtin::story::ListStoriesTool, false);
     registry.register_agent_tool(tools::builtin::story::GetStoryTool, false);
     registry.register_agent_tool(tools::builtin::story::CreateStoryTool, true);

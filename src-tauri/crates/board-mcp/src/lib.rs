@@ -20,7 +20,6 @@
 
 pub mod ctx;
 pub mod jsonrpc;
-pub mod paging;
 pub mod protocol;
 pub mod registry;
 pub mod tools;
@@ -28,6 +27,17 @@ pub mod transport;
 
 #[cfg(feature = "http")]
 pub mod auth;
+
+/// Bounding list-shaped responses.
+///
+/// Lives in `tools` because the agent tools this surface adapts need the same
+/// bound: an internal agent has the same finite context an external one does,
+/// and `list_stories` is read by both. Re-exported here because every tool in
+/// `crate::tools` reaches for it as `crate::paging`.
+///
+/// `::tools` and not `tools`: this crate has a module of that name too, and the
+/// local one wins.
+pub use ::tools::paging;
 
 pub use ctx::{HostBridge, McpCtx};
 pub use protocol::{handle_message, handle_message_refreshed, SUPPORTED_PROTOCOL_VERSIONS};

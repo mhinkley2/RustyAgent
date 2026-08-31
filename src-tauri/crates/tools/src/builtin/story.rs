@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use sqlx::Row;
 use std::path::Path;
+use crate::paging::{cap_text_fields, page_envelope_of, page_request};
 use crate::{Tool, ToolContext, ToolOutput};
 
 async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
@@ -126,15 +127,53 @@ impl Tool for GetStoryTool {
 // list_stories
 // ---------------------------------------------------------------------------
 
+/// Rows a `list_stories` page may carry when the caller does not say.
+///
+/// A discovery call wants "what is on this board", and forty rows of id, title
+/// and status is a board. It is not the binding limit in practice — the byte
+/// budget usually bites first, because this board's stories are written
+/// long-form on purpose — but it is the one a caller can predict.
+const STORY_DEFAULT_LIMIT: usize = 40;
+
+/// The ceiling an over-large `limit` is clamped to rather than rejected for.
+const STORY_MAX_LIMIT: usize = 200;
+
+/// Where a reader whose `description` was cut can find the rest.
+///
+/// Unlike most capped fields, this one has a fuller form the caller can reach
+/// without leaving the tool surface, so the marker names the call.
+const FULL_DESCRIPTION_VIA_GET_STORY: &str =
+    "Call get_story with this story's id for the full description.";
+
 pub struct ListStoriesTool;
+
+impl ListStoriesTool {
+    /// The one column list, so the next column added gets added once.
+    ///
+    /// The filters differ; what is selected does not. This used to be four
+    /// copies of the same `SELECT`, which is four places to forget.
+    fn select(where_clause: &str) -> String {
+        format!(
+            "SELECT s.id, s.title, s.status, s.priority, s.story_type, s.description, \
+                    s.labels, a.name AS agent_name \
+             FROM stories s \
+             LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id \
+             WHERE s.story_type != 'chat' {where_clause} \
+             ORDER BY s.sort_order ASC, s.created_at ASC"
+        )
+    }
+}
 
 #[async_trait]
 impl Tool for ListStoriesTool {
     fn name(&self) -> &str { "list_stories" }
 
     fn description(&self) -> &str {
-        "List all stories on the board. Returns id, title, status, priority, and assigned agent for each story. \
-         Use this to discover story IDs before calling get_story or update_story_status."
+        "List stories on the board. Each row carries id, title, status, priority, story_type, \
+         labels, assigned_agent and a truncated description — call get_story for a story's \
+         full description. Returns one page: check 'complete' and follow 'next_offset' to \
+         read the rest. Use this to discover story IDs before calling get_story or \
+         update_story_status."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -148,6 +187,20 @@ impl Tool for ListStoriesTool {
                         db::story_status::status_list_prose()
                     ),
                     "enum": db::story_status::status_enum_json()
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based index of the first story to return. Defaults to 1."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": format!(
+                        "Maximum stories to return. Defaults to {STORY_DEFAULT_LIMIT}, clamped \
+                         to {STORY_MAX_LIMIT}. A page may still be shorter than this when the \
+                         reply reaches its byte budget."
+                    )
                 }
             }
         })
@@ -157,84 +210,90 @@ impl Tool for ListStoriesTool {
         let status_filter = input.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
         let workspace_id = resolve_workspace_id(ctx).await;
 
-        let result = match (status_filter.as_ref(), workspace_id.as_ref()) {
-            (Some(status), Some(ws_id)) => {
-                sqlx::query(
-                    "SELECT s.id, s.title, s.status, s.priority, s.story_type, s.description, \
-                            s.labels, a.name AS agent_name \
-                     FROM stories s \
-                     LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id \
-                     WHERE s.story_type != 'chat' AND s.status = ? \
-                       AND (s.workspace_id = ? OR s.workspace_id IS NULL) \
-                     ORDER BY s.sort_order ASC, s.created_at ASC",
-                )
-                .bind(status)
-                .bind(ws_id)
-                .fetch_all(&ctx.db)
-                .await
-            }
-            (Some(status), None) => {
-                sqlx::query(
-                    "SELECT s.id, s.title, s.status, s.priority, s.story_type, s.description, \
-                            s.labels, a.name AS agent_name \
-                     FROM stories s \
-                     LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id \
-                     WHERE s.story_type != 'chat' AND s.status = ? \
-                       AND s.workspace_id IS NULL \
-                     ORDER BY s.sort_order ASC, s.created_at ASC",
-                )
-                .bind(status)
-                .fetch_all(&ctx.db)
-                .await
-            }
-            (None, Some(ws_id)) => {
-                sqlx::query(
-                    "SELECT s.id, s.title, s.status, s.priority, s.story_type, s.description, \
-                            s.labels, a.name AS agent_name \
-                     FROM stories s \
-                     LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id \
-                     WHERE s.story_type != 'chat' \
-                       AND (s.workspace_id = ? OR s.workspace_id IS NULL) \
-                     ORDER BY s.sort_order ASC, s.created_at ASC",
-                )
-                .bind(ws_id)
-                .fetch_all(&ctx.db)
-                .await
-            }
-            (None, None) => {
-                sqlx::query(
-                    "SELECT s.id, s.title, s.status, s.priority, s.story_type, s.description, \
-                            s.labels, a.name AS agent_name \
-                     FROM stories s \
-                     LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id \
-                     WHERE s.story_type != 'chat' \
-                       AND s.workspace_id IS NULL \
-                     ORDER BY s.sort_order ASC, s.created_at ASC",
-                )
-                .fetch_all(&ctx.db)
-                .await
-            }
+        let request = match page_request(&input, STORY_DEFAULT_LIMIT, STORY_MAX_LIMIT) {
+            Ok(request) => request,
+            Err(error) => return ToolOutput::err(error),
         };
 
-        match result {
-            Ok(rows) => {
-                let stories: Vec<serde_json::Value> = rows.iter().map(|row| {
-                    let labels_json: String = row.try_get("labels").unwrap_or_else(|_| "[]".to_string());
-                    let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
-                    json!({
-                        "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                        "title": row.try_get::<String, _>("title").unwrap_or_default(),
-                        "status": row.try_get::<String, _>("status").unwrap_or_default(),
-                        "priority": row.try_get::<String, _>("priority").unwrap_or_default(),
-                        "story_type": row.try_get::<String, _>("story_type").unwrap_or_default(),
-                        "description": row.try_get::<Option<String>, _>("description").ok().flatten(),
-                        "labels": labels,
-                        "assigned_agent": row.try_get::<Option<String>, _>("agent_name").ok().flatten(),
-                    })
-                }).collect();
-                ToolOutput::ok(serde_json::to_string(&json!({ "stories": stories, "count": stories.len() })).unwrap_or_default())
-            }
-            Err(e) => ToolOutput::err(format!("DB error: {e}")),
+        // The workspace clause differs between "scoped" and "unscoped" rather
+        // than being an optional bind, because a NULL workspace_id means "not
+        // yet assigned to one" and must be visible either way.
+        let status_clause = if status_filter.is_some() { "AND s.status = ? " } else { "" };
+        let workspace_clause = if workspace_id.is_some() {
+            "AND (s.workspace_id = ? OR s.workspace_id IS NULL)"
+        } else {
+            "AND s.workspace_id IS NULL"
+        };
+        let sql = Self::select(&format!("{status_clause}{workspace_clause}"));
+
+        let mut query = sqlx::query(&sql);
+        if let Some(status) = status_filter.as_ref() {
+            query = query.bind(status);
+        }
+        if let Some(ws_id) = workspace_id.as_ref() {
+            query = query.bind(ws_id);
+        }
+
+        let rows = match query.fetch_all(&ctx.db).await {
+            Ok(rows) => rows,
+            Err(e) => return ToolOutput::err(format!("DB error: {e}")),
+        };
+
+        // Convert only the rows this page will carry.
+        //
+        // The query returns the whole board — pushing LIMIT/OFFSET into SQL is
+        // deliberately deferred, since a separate COUNT to fill in `total` buys
+        // nothing at forty rows. But converting all of them to build a page of
+        // ten means parsing forty `labels` blobs and cloning forty 5 KB
+        // descriptions to throw thirty of them away, which is the opposite of
+        // what capping is for.
+        let total = rows.len();
+        let start = request.offset.saturating_sub(1);
+        let mut stories: Vec<serde_json::Value> = rows
+            .iter()
+            .skip(start)
+            .take(request.limit)
+            .map(|row| {
+                let labels_json: String =
+                    row.try_get("labels").unwrap_or_else(|_| "[]".to_string());
+                let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+                json!({
+                    "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                    "title": row.try_get::<String, _>("title").unwrap_or_default(),
+                    "status": row.try_get::<String, _>("status").unwrap_or_default(),
+                    "priority": row.try_get::<String, _>("priority").unwrap_or_default(),
+                    "story_type": row.try_get::<String, _>("story_type").unwrap_or_default(),
+                    "description": row.try_get::<Option<String>, _>("description").ok().flatten(),
+                    "labels": labels,
+                    "assigned_agent": row.try_get::<Option<String>, _>("agent_name").ok().flatten(),
+                })
+            })
+            .collect();
+
+        // Bounded here rather than only at the MCP boundary. This board's
+        // stories are written long-form on purpose — requirements, acceptance
+        // criteria — so a discovery call was returning tens of thousands of
+        // characters to answer "what stories exist", and an agent inside this
+        // app has the same finite context an agent outside it does.
+        //
+        // Capped after windowing, so one enormous description costs the page it
+        // is on rather than every page.
+        for story in &mut stories {
+            cap_text_fields(
+                story,
+                &["description"],
+                "list_stories",
+                FULL_DESCRIPTION_VIA_GET_STORY,
+            );
+        }
+
+        let subject = match status_filter.as_deref() {
+            Some(status) => format!("the board ({status})"),
+            None => "the board".to_string(),
+        };
+        match page_envelope_of(stories, total, request, "list_stories", "stories", &subject) {
+            Ok(envelope) => ToolOutput::ok(serde_json::to_string(&envelope).unwrap_or_default()),
+            Err(error) => ToolOutput::err(error),
         }
     }
 }
@@ -707,6 +766,303 @@ mod tests {
             .fetch_one(db)
             .await
             .expect("read status")
+    }
+
+    // -----------------------------------------------------------------------
+    // list_stories: the discovery call
+    // -----------------------------------------------------------------------
+    //
+    // Observed, not theoretical: on 2026-08-30 a `list_stories(status:
+    // "backlog")` over MCP — thirteen stories — returned 79,037 characters and
+    // blew the client's token cap. The reply had to be spilled to a file for
+    // the agent to read its own board. These tests are the shape of that not
+    // happening again, on the shared tool so that both surfaces are covered.
+
+    use crate::paging::{MAX_FIELD_BYTES, MAX_PAGE_BYTES};
+
+    /// A story whose description is as long as this board really writes them.
+    async fn seed_long_story(db: &db::DbPool, id: &str, description_bytes: usize) {
+        sqlx::query(
+            "INSERT INTO stories (id, title, status, description, sort_order)
+             VALUES (?, ?, 'backlog', ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("Story {id}"))
+        .bind("x".repeat(description_bytes))
+        .bind(id.len() as i64)
+        .execute(db)
+        .await
+        .expect("seed a long story");
+    }
+
+    async fn list(ctx: &ToolContext, input: serde_json::Value) -> serde_json::Value {
+        let out = ListStoriesTool.execute(input, ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        serde_json::from_str(&out.content).expect("the reply is JSON")
+    }
+
+    #[tokio::test]
+    async fn a_board_of_long_stories_answers_within_the_byte_budget() {
+        let db = make_test_pool().await;
+        // Forty stories at 5 KB each: 200 KB unbounded, which is what the
+        // observed 79 KB reply was on its way to becoming.
+        for i in 0..40 {
+            seed_long_story(&db, &format!("s{i:02}"), 5 * 1024).await;
+        }
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        let bytes = serde_json::to_string(&reply).expect("serialize").len();
+        assert!(
+            bytes <= MAX_PAGE_BYTES + 1024,
+            "the reply overran its budget at {bytes} bytes",
+        );
+        assert_eq!(reply["total"], json!(40));
+        assert_eq!(reply["complete"], json!(false), "a clipped reply must say so");
+    }
+
+    #[tokio::test]
+    async fn the_reply_says_how_much_of_the_board_it_carries() {
+        let db = make_test_pool().await;
+        for i in 0..5 {
+            seed_long_story(&db, &format!("s{i}"), 32).await;
+        }
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        assert_eq!(reply["total"], json!(5));
+        assert_eq!(reply["returned"], json!(5));
+        assert_eq!(reply["complete"], json!(true));
+        assert_eq!(reply["next_offset"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_description_is_truncated_with_a_marker_naming_get_story() {
+        // The marker has to say what to do next. "This was cut" alone tells an
+        // agent only that it is missing something.
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", MAX_FIELD_BYTES * 2).await;
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        let description = reply["stories"][0]["description"].as_str().expect("description");
+        assert!(description.len() < MAX_FIELD_BYTES * 2);
+        assert!(
+            description.contains("[list_stories FIELD TRUNCATED: 'description'"),
+            "got {description}",
+        );
+        assert!(description.contains("Call get_story"), "got {description}");
+    }
+
+    #[tokio::test]
+    async fn a_short_description_is_returned_whole() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 64).await;
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        assert_eq!(reply["stories"][0]["description"], json!("x".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn an_absent_limit_returns_one_page_not_the_whole_board() {
+        let db = make_test_pool().await;
+        for i in 0..60 {
+            seed_long_story(&db, &format!("s{i:02}"), 16).await;
+        }
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        assert_eq!(reply["returned"], json!(STORY_DEFAULT_LIMIT));
+        assert_eq!(reply["total"], json!(60));
+        assert_eq!(reply["next_offset"], json!(STORY_DEFAULT_LIMIT + 1));
+    }
+
+    #[tokio::test]
+    async fn an_agent_can_page_through_the_whole_board() {
+        let db = make_test_pool().await;
+        for i in 0..7 {
+            seed_long_story(&db, &format!("s{i}"), 16).await;
+        }
+        let ctx = make_ctx(db.clone());
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut offset = 1;
+        loop {
+            let reply = list(&ctx, json!({ "offset": offset, "limit": 3 })).await;
+            for story in reply["stories"].as_array().expect("stories") {
+                seen.push(story["id"].as_str().expect("id").to_string());
+            }
+            match reply["next_offset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+
+        assert_eq!(seen, ["s0", "s1", "s2", "s3", "s4", "s5", "s6"]);
+    }
+
+    /// The window has to line up with the rows it claims to be.
+    ///
+    /// The tool narrows the result set itself rather than handing the whole
+    /// list to `paged_rows`, so that a page of ten does not convert four
+    /// hundred rows. That trade buys an off-by-one it has to be held to: only
+    /// the story actually on the page may be converted, capped, or counted.
+    #[tokio::test]
+    async fn a_page_carries_its_own_rows_and_only_its_own() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s0", 8).await;
+        seed_long_story(&db, "s1", MAX_FIELD_BYTES * 2).await;
+        seed_long_story(&db, "s2", 8).await;
+        let ctx = make_ctx(db.clone());
+
+        let first = list(&ctx, json!({ "offset": 1, "limit": 1 })).await;
+        assert_eq!(first["stories"][0]["id"], json!("s0"));
+        assert_eq!(first["stories"][0]["description"], json!("x".repeat(8)));
+
+        let second = list(&ctx, json!({ "offset": 2, "limit": 1 })).await;
+        assert_eq!(second["stories"][0]["id"], json!("s1"));
+        assert!(second["stories"][0]["description"]
+            .as_str()
+            .expect("description")
+            .contains("TRUNCATED"));
+
+        let last = list(&ctx, json!({ "offset": 3, "limit": 1 })).await;
+        assert_eq!(last["stories"][0]["id"], json!("s2"));
+        assert_eq!(last["next_offset"], serde_json::Value::Null);
+
+        // …and every page agrees on how big the board is.
+        for page in [&first, &second, &last] {
+            assert_eq!(page["total"], json!(3));
+            assert_eq!(page["returned"], json!(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_above_the_ceiling_is_clamped_rather_than_refused() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 16).await;
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({ "limit": 100_000 })).await;
+
+        assert_eq!(reply["limit"], json!(STORY_MAX_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_is_an_error_naming_the_row_count() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 16).await;
+        let ctx = make_ctx(db.clone());
+
+        let out = ListStoriesTool.execute(json!({ "offset": 9 }), &ctx).await;
+
+        assert!(out.is_error);
+        assert!(out.content.contains("has 1 row(s)"), "got {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn the_status_filter_still_narrows_the_board() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 16).await;
+        seed_story(&db, "s2").await; // seeded as 'ready'
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({ "status": "backlog" })).await;
+
+        assert_eq!(reply["total"], json!(1));
+        assert_eq!(reply["stories"][0]["id"], json!("s1"));
+    }
+
+    /// A filter naming a status the board holds none of is an empty page, not
+    /// an error — `failed` is in the tool's enum and in no column.
+    #[tokio::test]
+    async fn a_status_with_no_stories_is_an_empty_page() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 16).await;
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({ "status": "done" })).await;
+
+        assert_eq!(reply["stories"], json!([]));
+        assert_eq!(reply["total"], json!(0));
+        assert_eq!(reply["complete"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn chat_stories_stay_off_the_board() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 16).await;
+        sqlx::query(
+            "INSERT INTO stories (id, title, status, story_type)
+             VALUES ('c1', 'A chat', 'backlog', 'chat')",
+        )
+        .execute(&db)
+        .await
+        .expect("seed a chat story");
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        assert_eq!(reply["total"], json!(1));
+        assert_eq!(reply["stories"][0]["id"], json!("s1"));
+    }
+
+    /// Every field the description advertises is present, and nothing else is.
+    ///
+    /// The old description named five fields and returned eight, so an agent
+    /// reading it had no way to anticipate the size of the reply.
+    #[tokio::test]
+    async fn a_row_carries_exactly_the_fields_the_description_names() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s1", 16).await;
+        let ctx = make_ctx(db.clone());
+
+        let reply = list(&ctx, json!({})).await;
+
+        let row = reply["stories"][0].as_object().expect("a row");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "assigned_agent",
+                "description",
+                "id",
+                "labels",
+                "priority",
+                "status",
+                "story_type",
+                "title",
+            ],
+        );
+
+        let described = ListStoriesTool.description();
+        for key in keys {
+            assert!(described.contains(key), "the description omits '{key}': {described}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_schema_offers_the_paging_it_applies() {
+        let schema = ListStoriesTool.input_schema();
+        let properties = schema["properties"].as_object().expect("properties");
+
+        assert!(properties.contains_key("offset"));
+        assert!(properties.contains_key("limit"));
+        assert!(
+            properties["limit"]["description"]
+                .as_str()
+                .expect("limit description")
+                .contains(&STORY_DEFAULT_LIMIT.to_string()),
+            "the default has to be documented, or it silently becomes the number \
+             of stories an agent believes exist",
+        );
     }
 
     /// The defect this story exists for: every finished run lands its card in
