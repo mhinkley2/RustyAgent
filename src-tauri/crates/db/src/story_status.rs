@@ -42,6 +42,20 @@ pub const AUTO_ADVANCE_SETTING: &str = "auto_advance_story_status";
 /// does not parse where the rest of the app parses timestamps.
 const NOW_ISO8601: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
+/// Every state a `story_runs.status` may hold.
+pub const RUN_STATUSES: [&str; 4] = ["running", "done", "failed", "cancelled"];
+
+/// Whether a run has stopped, whatever it stopped as.
+///
+/// The question anything waiting on a run asks, and the reason it is phrased as
+/// "not running" rather than a list: a status this build does not recognise is
+/// still not `running`, and nothing is going to move it. Treating an unknown
+/// state as live is how a waiter hangs forever, so the unknown case resolves
+/// rather than blocks.
+pub fn is_terminal_run_status(status: &str) -> bool {
+    status != "running"
+}
+
 /// How a run ended, from the board's point of view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -447,6 +461,31 @@ mod tests {
             .map(|v| v.as_str().expect("a string"))
             .collect();
         assert_eq!(values, STORY_STATUSES);
+    }
+
+    /// Exactly one of the four run states is not terminal.
+    ///
+    /// Anything waiting on a run stops when this says so, so a state wrongly
+    /// called live hangs the waiter and one wrongly called finished reports a
+    /// result that is not in yet.
+    #[test]
+    fn only_a_running_run_is_still_going() {
+        let live: Vec<&str> = RUN_STATUSES
+            .into_iter()
+            .filter(|status| !is_terminal_run_status(status))
+            .collect();
+
+        assert_eq!(live, ["running"]);
+    }
+
+    /// A status this build does not know resolves rather than blocks.
+    ///
+    /// Nothing is going to move a row out of a state this code cannot name, so
+    /// treating it as live would wait forever.
+    #[test]
+    fn an_unrecognised_run_status_counts_as_finished() {
+        assert!(is_terminal_run_status("abandoned"));
+        assert!(is_terminal_run_status(""));
     }
 
     #[test]

@@ -1,6 +1,9 @@
 pub mod story;
 pub mod memory;
 pub mod notify;
+pub mod run;
+#[cfg(test)]
+mod run_tests;
 pub mod subtask;
 pub mod file;
 
@@ -19,6 +22,7 @@ pub fn register_builtins(registry: &mut ToolRegistry, _db: DbPool) {
     registry.register(Box::new(memory::MemoryWriteTool));
     registry.register(Box::new(notify::SendNotificationTool));
     registry.register(Box::new(subtask::SpawnSubtaskTool));
+    registry.register(Box::new(run::GetRunTool));
     registry.register(Box::new(file::FileReadTool));
     registry.register(Box::new(file::FileWriteTool));
     registry.register(Box::new(file::FileEditTool));

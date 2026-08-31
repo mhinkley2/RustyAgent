@@ -3,7 +3,22 @@ use serde_json::json;
 
 use crate::{Tool, ToolContext, ToolOutput};
 
-const MAX_PIPELINE_DEPTH: u32 = 5;
+/// How deep spawning may go.
+///
+/// One, because one is what the engine can do. A spawned child is built with
+/// `spawn_subtask: None` (`pipeline/src/lib.rs`, "No further spawn_subtask
+/// recursion") to break a circular closure that would otherwise make the future
+/// `!Send` — so a child has no spawning tool at all, and the depth counter can
+/// never reach two.
+///
+/// This said 5. The guard below could therefore never fire, and the limit an
+/// agent read in the refusal message described a capability that did not exist.
+/// A ceiling nothing can reach is not a safety margin; it is a false claim
+/// about the system, and the one place an agent would look to find out.
+///
+/// Raising it is an async architecture change — a spawn broker or a trait
+/// object in place of the captured closure — not a change to this number.
+const MAX_PIPELINE_DEPTH: u32 = 1;
 
 /// Built-in tool that lets an orchestrator agent spawn a subtask (a new agent
 /// run on a given story) as part of a pipeline chain.
@@ -19,8 +34,10 @@ impl Tool for SpawnSubtaskTool {
 
     fn description(&self) -> &str {
         "Spawn a subtask: run an agent on a story as a child task of the current pipeline. \
-         Returns the new run_id. The parent pipeline must poll get_story or use \
-         memory_read/memory_write with scope=shared_scratchpad to exchange results."
+         Returns the new run_id — poll it with get_run to see whether the subtask has \
+         finished and how it ended. Use memory_read/memory_write with \
+         scope=shared_scratchpad to exchange data with it. A subtask cannot spawn \
+         subtasks of its own."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -50,10 +67,15 @@ impl Tool for SpawnSubtaskTool {
             None => return ToolOutput::err("Missing required field: agent_id"),
         };
 
-        // Depth guard
+        // Depth guard. Reachable now that the limit is the real one: a subtask
+        // that finds this tool in its registry is told why it cannot use it,
+        // rather than being handed the misleading "not available in this
+        // context" that a missing callback produces.
         if ctx.pipeline_depth >= MAX_PIPELINE_DEPTH {
             return ToolOutput::err(format!(
-                "Pipeline depth limit ({MAX_PIPELINE_DEPTH}) reached — cannot spawn further subtasks"
+                "Spawn depth limit ({MAX_PIPELINE_DEPTH}) reached — a subtask cannot spawn \
+                 subtasks of its own. Do this work here, or return it to the run that \
+                 spawned you."
             ));
         }
 
@@ -83,7 +105,10 @@ impl Tool for SpawnSubtaskTool {
                 "run_id": run_id,
                 "story_id": story_id,
                 "agent_id": agent_id,
-                "message": "Subtask spawned — use get_story to poll progress"
+                "message": "Subtask spawned. Poll get_run with this run_id to see when it \
+                            finishes; the story's own status depends on the subtask agent \
+                            choosing to set it, and on a workspace setting, so the run is \
+                            the reliable one."
             })).unwrap_or_default()),
             Err(e) => ToolOutput::err(format!("Failed to spawn subtask: {e}")),
         }
