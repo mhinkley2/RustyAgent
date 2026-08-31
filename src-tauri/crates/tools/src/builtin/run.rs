@@ -233,9 +233,14 @@ impl Tool for WaitForSubtaskTool {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
         let mut cancelled = false;
+        // Kept from the last tick so the cancellation path below can act on
+        // what it already knows. Re-reading there would be a second chance to
+        // fail at the one moment the children most need to be told.
+        // Assigned on the first tick, before anything reads it.
+        let mut statuses: Vec<(String, Option<String>)>;
 
         loop {
-            let statuses = match statuses_of(&ctx.db, &run_ids).await {
+            statuses = match statuses_of(&ctx.db, &run_ids).await {
                 Ok(statuses) => statuses,
                 Err(error) => return ToolOutput::err(error),
             };
@@ -270,9 +275,9 @@ impl Tool for WaitForSubtaskTool {
         // but asking is still a lock and a lookup.
         if cancelled {
             if let Some(control) = ctx.run_control.as_ref() {
-                for (run_id, status) in statuses_of(&ctx.db, &run_ids).await.unwrap_or_default() {
+                for (run_id, status) in &statuses {
                     if status.as_deref() == Some("running") {
-                        control.cancel_run(&run_id);
+                        control.cancel_run(run_id);
                     }
                 }
             }
@@ -361,22 +366,44 @@ fn waited_ids(input: &serde_json::Value) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
-/// Each named run's status, or `None` where no such run exists.
+/// Each named run's status, in the order asked for, or `None` where no such
+/// run exists.
+///
+/// One query rather than one per run: this is re-read every tick for the whole
+/// wait, so a query per id would be thirty-two round trips twice a second for
+/// as long as the children take.
 async fn statuses_of(
     db: &db::DbPool,
     run_ids: &[String],
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    let mut out = Vec::with_capacity(run_ids.len());
+    // `run_ids` is already bounded by `MAX_WAITED_RUNS` and deduplicated, so
+    // the placeholder list cannot grow without limit.
+    let placeholders = vec!["?"; run_ids.len()].join(", ");
+    let sql = format!("SELECT id, status FROM story_runs WHERE id IN ({placeholders})");
+
+    let mut query = sqlx::query(&sql);
     for run_id in run_ids {
-        let status = sqlx::query("SELECT status FROM story_runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| format!("DB error: {e}"))?
-            .and_then(|row| row.try_get::<String, _>("status").ok());
-        out.push((run_id.clone(), status));
+        query = query.bind(run_id);
     }
-    Ok(out)
+    let rows = query
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("DB error: {e}"))?;
+
+    let found: std::collections::HashMap<String, String> = rows
+        .iter()
+        .filter_map(|row| {
+            Some((row.try_get::<String, _>("id").ok()?, row.try_get::<String, _>("status").ok()?))
+        })
+        .collect();
+
+    // Mapped back to the requested order, and to the requested length: a row
+    // the query did not return is a run that does not exist, which the caller
+    // treats as finished rather than waiting on it forever.
+    Ok(run_ids
+        .iter()
+        .map(|run_id| (run_id.clone(), found.get(run_id).cloned()))
+        .collect())
 }
 
 /// What one subtask produced: how it ended, and what it said.

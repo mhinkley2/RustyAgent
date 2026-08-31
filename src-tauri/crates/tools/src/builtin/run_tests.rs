@@ -565,3 +565,28 @@ async fn both_run_tools_are_registered() {
         assert!(names.contains(&expected.to_string()), "{expected} missing from {names:?}");
     }
 }
+
+#[tokio::test]
+async fn results_keep_the_order_asked_for_even_when_some_runs_are_missing() {
+    // Statuses are fetched in one `IN (...)` query now, which returns rows in
+    // whatever order it likes and omits ids it does not have. Both have to be
+    // mapped back, or a caller matching results to the ids it sent reads the
+    // wrong subtask's output.
+    let db = pool().await;
+    seed_story(&db, "s1", "review").await;
+    seed_story(&db, "s2", "blocked").await;
+    seed_run(&db, "zzz-last", "s1", "done", true).await;
+    seed_run(&db, "aaa-first", "s2", "failed", true).await;
+    let ctx = make_ctx(db.clone());
+
+    let reply = wait(&ctx, json!({ "run_ids": ["zzz-last", "gone", "aaa-first"] })).await;
+
+    let results = reply["results"].as_array().expect("results");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["run_id"], json!("zzz-last"));
+    assert_eq!(results[0]["status"], json!("done"));
+    assert_eq!(results[1]["run_id"], json!("gone"));
+    assert_eq!(results[1]["status"], serde_json::Value::Null);
+    assert_eq!(results[2]["run_id"], json!("aaa-first"));
+    assert_eq!(results[2]["status"], json!("failed"));
+}

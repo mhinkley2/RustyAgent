@@ -60,7 +60,29 @@ pub struct PipelineStep {
 fn default_max_depth() -> u32 { 1 }
 
 /// Bytes of a step's final message carried forward to the next step.
+///
+/// A hard ceiling on what is carried, marker included — the ellipsis is
+/// subtracted from the budget rather than added on top of it, so a reader
+/// budgeting for this figure gets it.
 const HANDOFF_MAX_BYTES: usize = 8192;
+
+/// What a shortened handoff ends with, and what it costs.
+const HANDOFF_ELLIPSIS: &str = "…";
+
+/// A step's final message, shortened to what the next step is given.
+///
+/// Named rather than inline because of what it used to do: it sliced at
+/// `&s[..8192]`, which panics when byte 8192 lands inside a codepoint. A reply
+/// containing a table, an emoji or any CJK text arranges that, and every
+/// sequential pipeline passes its handoff through here.
+pub(crate) fn handoff_output(message: String) -> String {
+    if message.len() <= HANDOFF_MAX_BYTES {
+        return message;
+    }
+    let budget = HANDOFF_MAX_BYTES - HANDOFF_ELLIPSIS.len();
+    let cut = tools::read_cap::floor_char_boundary(&message, budget);
+    format!("{}{HANDOFF_ELLIPSIS}", &message[..cut])
+}
 
 // ---------------------------------------------------------------------------
 // Runtime progress types returned to the frontend
@@ -920,14 +942,7 @@ async fn fire_step_run(
     // inside a codepoint, which a reply containing a box-drawing table, an
     // emoji or any CJK text can easily arrange — and this is the handoff every
     // sequential pipeline step passes through.
-    let output = last_assistant.map(|s| {
-        if s.len() > HANDOFF_MAX_BYTES {
-            let cut = tools::read_cap::floor_char_boundary(&s, HANDOFF_MAX_BYTES);
-            format!("{}…", &s[..cut])
-        } else {
-            s
-        }
-    });
+    let output = last_assistant.map(handoff_output);
 
     Ok((run_id, output))
 }
