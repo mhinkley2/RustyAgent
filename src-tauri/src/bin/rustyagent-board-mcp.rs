@@ -204,8 +204,15 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// What [`OWNED_VARS`] currently hold.
-    fn snapshot() -> Vec<(&'static str, Option<String>)> {
-        OWNED_VARS.iter().map(|key| (*key, env::var(key).ok())).collect()
+    ///
+    /// `var_os`, not `var`. A path is not required to be UTF-8 on either
+    /// platform this ships to, and `env::var` reports a non-UTF-8 value as
+    /// though the variable were unset — so a developer whose `RUSTYAGENT_DB_PATH`
+    /// contained one would have it read as absent, cleared, and then "restored"
+    /// to absent. That is precisely the silent clearing this guard exists to
+    /// stop, surviving in the one case nobody would think to try.
+    fn snapshot() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        OWNED_VARS.iter().map(|key| (*key, env::var_os(key))).collect()
     }
 
     /// Start from nothing, whatever the developer's shell had.
@@ -216,7 +223,7 @@ mod tests {
     }
 
     /// Put back exactly what [`snapshot`] found, absence included.
-    fn restore(saved: &[(&'static str, Option<String>)]) {
+    fn restore(saved: &[(&'static str, Option<std::ffi::OsString>)]) {
         for (key, value) in saved {
             match value {
                 Some(value) => env::set_var(key, value),
@@ -238,7 +245,7 @@ mod tests {
     /// a worse thing to discover than a failing one.
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Vec<(&'static str, Option<String>)>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
     impl EnvGuard {
@@ -342,6 +349,40 @@ mod tests {
         env::set_var(db::paths::DB_PATH_ENV, "/tmp/set-by-the-test.db");
         restore(&saved_empty);
         assert_eq!(env::var(db::paths::DB_PATH_ENV).ok(), None);
+    }
+
+    /// A value that is not valid UTF-8 survives the round trip.
+    ///
+    /// `env::var` reports one as though the variable were unset, so a guard
+    /// built on it would read absent, clear, and "restore" to absent — silently
+    /// destroying the value, which is the exact failure this guard exists to
+    /// prevent. Paths are not required to be UTF-8 on either platform this
+    /// ships to, and a database path is the kind of thing that would carry one.
+    #[test]
+    #[cfg(windows)]
+    fn a_value_that_is_not_valid_utf8_is_restored_intact() {
+        use std::os::windows::ffi::{OsStringExt, OsStrExt};
+
+        let _env = EnvGuard::take();
+
+        // An unpaired surrogate: a valid Windows environment value, and not
+        // representable as UTF-8.
+        let awkward = std::ffi::OsString::from_wide(&[0x0044, 0x003A, 0x005C, 0xD800]);
+        assert!(
+            awkward.to_str().is_none(),
+            "this test is pointless if the value round-trips as UTF-8",
+        );
+
+        env::set_var(db::paths::DB_PATH_ENV, &awkward);
+        let saved = snapshot();
+        clear();
+        restore(&saved);
+
+        let restored = env::var_os(db::paths::DB_PATH_ENV).expect("the value was destroyed");
+        assert_eq!(
+            restored.encode_wide().collect::<Vec<u16>>(),
+            awkward.encode_wide().collect::<Vec<u16>>(),
+        );
     }
 }
 
