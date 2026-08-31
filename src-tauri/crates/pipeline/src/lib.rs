@@ -33,6 +33,15 @@ pub struct PipelineConfig {
     pub mode: String,
     pub steps: Vec<PipelineStep>,
     /// Maximum recursion depth when agents spawn further subtasks.
+    ///
+    /// Read by nothing. The enforced limit lives in
+    /// [`tools::builtin::subtask`], which cannot see this struct, and is fixed
+    /// at the one level the engine supports — a spawned child is built without
+    /// a spawning callback at all.
+    ///
+    /// Kept as a field so an existing `pipeline_config` carrying it still
+    /// deserializes, and defaulted to the real limit so it stops advertising a
+    /// depth nothing can reach.
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
 }
@@ -48,7 +57,7 @@ pub struct PipelineStep {
     pub agent_id: String,
 }
 
-fn default_max_depth() -> u32 { 5 }
+fn default_max_depth() -> u32 { 1 }
 
 // ---------------------------------------------------------------------------
 // Runtime progress types returned to the frontend
