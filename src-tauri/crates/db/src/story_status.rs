@@ -215,6 +215,44 @@ pub fn status_list_prose() -> String {
     STORY_STATUSES.join(", ")
 }
 
+/// SQL ranking `stories.priority` from most to least urgent.
+///
+/// `priority` is a text column, so ordering by it directly sorts
+/// lexically — which puts `critical` *after* `low` and `high` after
+/// `critical`. The rank has to be explicit.
+///
+/// Lives here, beside the status vocabulary, because the scheduler's two pick
+/// queries and the board's own read all have to agree on it: an order the user
+/// sees but agents do not follow is worse than no ordering at all.
+/// `prefix` qualifies the column for the caller's table alias — `"s."` where
+/// the query aliases `stories`, `""` where it does not.
+pub fn priority_rank_sql(prefix: &str) -> String {
+    format!(
+        "CASE {prefix}priority \
+           WHEN 'critical' THEN 0 \
+           WHEN 'high' THEN 1 \
+           WHEN 'medium' THEN 2 \
+           WHEN 'low' THEN 3 \
+           ELSE 4 END"
+    )
+}
+
+/// How a queue of stories is ordered, for the scheduler and the board alike.
+///
+/// Priority first, then the position a user dragged the card to, then age.
+/// Priority outranks manual position deliberately: marking something
+/// `critical` should not require also dragging it, and a user who wants a
+/// different order within a priority band still has the drag.
+///
+/// An unrecognised priority sorts last rather than first — a typo should not
+/// jump the queue.
+pub fn queue_order_sql(prefix: &str) -> String {
+    format!(
+        "{} ASC, {prefix}sort_order ASC, {prefix}created_at ASC",
+        priority_rank_sql(prefix)
+    )
+}
+
 /// The Tauri event announcing that the board has changed underneath whoever is
 /// looking at it.
 ///

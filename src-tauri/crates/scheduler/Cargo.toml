@@ -21,3 +21,6 @@ dashmap = { workspace = true }
 chrono = "0.4"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
 tauri = { workspace = true }
+
+[dev-dependencies]
+db = { path = "../db", features = ["testing"] }

@@ -229,11 +229,36 @@ impl SchedulerState {
 // Public API
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod pick_order_tests;
+
+/// The next Ready story for one agent profile, in the board's own order.
+///
+/// One function because there were two copies of this query, and they are the
+/// only thing deciding what an agent works on next — two copies of that is two
+/// chances to answer the question differently.
+///
+/// The ordering comes from `db::story_status::queue_order_sql`, which the
+/// board's own read uses as well, so what a user sees at the top of Ready is
+/// what gets picked.
+fn next_ready_story_sql() -> String {
+    format!(
+        "SELECT id, title FROM stories \
+          WHERE status = 'ready' AND assigned_agent_id = ? \
+         ORDER BY {} LIMIT 1",
+        db::story_status::queue_order_sql("")
+    )
+}
+
 /// Start a continuous-poll loop for the given profile.
 ///
-/// The loop waits `poll_interval_secs`, then finds the oldest Ready story
-/// assigned to this profile and fires `start_run` for it. Only one story
-/// runs at a time.
+/// The loop waits `poll_interval_secs`, then takes the profile's next Ready
+/// story — the most urgent, then the highest-placed on the board, then the
+/// oldest, per [`next_ready_story_sql`] — and fires `start_run` for it. Only
+/// one story runs at a time.
+///
+/// It used to take the oldest, full stop, which meant the order a user
+/// arranged the Ready column into had no bearing on what this picked.
 pub async fn start_continuous(
     profile_id: &str,
     poll_interval_secs: u64,
@@ -279,15 +304,14 @@ pub async fn start_continuous(
                 continue;
             }
 
-            // Find the oldest Ready story assigned to this profile
-            let story_row = sqlx::query(
-                "SELECT id, title FROM stories \
-                  WHERE status = 'ready' AND assigned_agent_id = ? \
-                 ORDER BY created_at ASC LIMIT 1",
-            )
-            .bind(&pid)
-            .fetch_optional(&db_clone)
-            .await;
+            // Take the next Ready story for this profile, in the order the
+            // board shows it. Both copies of this query used to order by age
+            // alone, so dragging a card up the Ready column — the board's
+            // central gesture — changed nothing about what an agent picked.
+            let story_row = sqlx::query(&next_ready_story_sql())
+                .bind(&pid)
+                .fetch_optional(&db_clone)
+                .await;
 
             match story_row {
                 Ok(Some(row)) => {
@@ -394,7 +418,9 @@ pub async fn start_continuous(
 ///
 /// `cron_expr` is a 5-field cron expression (minute-level, no seconds field).
 /// On each fire, `start_run` is called with the provided `story_id` override,
-/// or the oldest Ready story assigned to the profile if `story_id` is None.
+/// or the profile's next Ready story if `story_id` is None — the most urgent,
+/// then the highest-placed on the board, then the oldest, per
+/// [`next_ready_story_sql`], which `start_continuous` picks by too.
 pub async fn start_scheduled(
     profile_id: &str,
     cron_expr: &str,
@@ -459,15 +485,14 @@ pub async fn start_scheduled(
                 break;
             }
 
-            // Find the oldest Ready story assigned to this profile
-            let story_row = sqlx::query(
-                "SELECT id, title FROM stories \
-                  WHERE status = 'ready' AND assigned_agent_id = ? \
-                 ORDER BY created_at ASC LIMIT 1",
-            )
-            .bind(&pid)
-            .fetch_optional(&db_clone)
-            .await;
+            // Take the next Ready story for this profile, in the order the
+            // board shows it. Both copies of this query used to order by age
+            // alone, so dragging a card up the Ready column — the board's
+            // central gesture — changed nothing about what an agent picked.
+            let story_row = sqlx::query(&next_ready_story_sql())
+                .bind(&pid)
+                .fetch_optional(&db_clone)
+                .await;
 
             match story_row {
                 Ok(Some(row)) => {
