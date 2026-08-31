@@ -147,3 +147,57 @@ async fn the_run_summary_carries_what_the_card_shows() {
     assert_eq!(latest.output_tokens, 50);
     assert!((latest.estimated_cost_usd - 0.25).abs() < f64::EPSILON);
 }
+
+
+// ---------------------------------------------------------------------------
+// Timestamp shape
+// ---------------------------------------------------------------------------
+
+/// `CURRENT_TIMESTAMP` writes `YYYY-MM-DD HH:MM:SS`, which JavaScript parses as
+/// *local* time — so a card built on the raw value shows every elapsed time
+/// shifted by the reader's UTC offset, and a run a minute old can appear to
+/// start in the future. Every run in a real database is stored this way.
+#[tokio::test]
+async fn a_current_timestamp_run_comes_back_as_rfc3339() {
+    let db = pool().await;
+    seed_story(&db, "s1", "Legacy timestamps", "in_progress").await;
+    sqlx::query(
+        "INSERT INTO story_runs (id, story_id, agent_profile_id, status, started_at, finished_at)
+         VALUES ('r1', 's1', ?, 'done', '2026-05-22 20:58:30', '2026-05-22 20:59:12')",
+    )
+    .bind(PROFILE)
+    .execute(&db)
+    .await
+    .expect("seed a run the way CURRENT_TIMESTAMP would");
+
+    let latest = stories_of(&db).await.remove(0).latest_run.expect("a run");
+
+    assert_eq!(latest.started_at, "2026-05-22T20:58:30.000Z");
+    assert_eq!(latest.finished_at.as_deref(), Some("2026-05-22T20:59:12.000Z"));
+}
+
+/// A value already stored in the ISO shape must come back unchanged in
+/// meaning, not double-converted.
+#[tokio::test]
+async fn an_already_iso_timestamp_survives_the_conversion() {
+    let db = pool().await;
+    seed_story(&db, "s1", "ISO timestamps", "in_progress").await;
+    seed_run_at(&db, "r1", "s1", "2026-05-22T20:58:30.000Z", "done").await;
+
+    let latest = stories_of(&db).await.remove(0).latest_run.expect("a run");
+
+    assert_eq!(latest.started_at, "2026-05-22T20:58:30.000Z");
+}
+
+/// A run still going has no finish time, and the conversion must leave that
+/// absence alone rather than inventing an epoch.
+#[tokio::test]
+async fn a_running_run_still_has_no_finish_time() {
+    let db = pool().await;
+    seed_story(&db, "s1", "Running", "in_progress").await;
+    seed_run_at(&db, "r1", "s1", "2026-05-22T20:58:30.000Z", "running").await;
+
+    let latest = stories_of(&db).await.remove(0).latest_run.expect("a run");
+
+    assert_eq!(latest.finished_at, None);
+}

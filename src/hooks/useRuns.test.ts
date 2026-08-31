@@ -100,12 +100,14 @@ describe("useRuns", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     await act(async () => {
-      await result.current.refresh({ storyId: "story-9" });
+      await result.current.refresh({ story_id: "story-9" });
     });
 
     expect(tauriMock.calls("get_runs")).toEqual([
       { filters: { status: "failed" } },
-      { filters: { storyId: "story-9" } },
+      // snake_case, matching `commands::RunFilters`. A camelCase key here is
+      // dropped by serde without an error and every run comes back.
+      { filters: { story_id: "story-9" } },
     ]);
   });
 

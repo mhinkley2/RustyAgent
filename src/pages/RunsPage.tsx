@@ -97,7 +97,7 @@ export default function RunsPage() {
   }
 
   function updateAgent(value: string) {
-    setFilters(f => ({ ...f, agentProfileId: value || undefined }));
+    setFilters(f => ({ ...f, agent_profile_id: value || undefined }));
   }
 
   async function handleDelete(run: StoryRun) {
@@ -137,7 +137,7 @@ export default function RunsPage() {
           <div className="runs-filters__select-wrap">
             <select
               className="runs-filters__select"
-              value={filters.agentProfileId ?? ""}
+              value={filters.agent_profile_id ?? ""}
               onChange={e => updateAgent(e.target.value)}
             >
               <option value="">All agents</option>

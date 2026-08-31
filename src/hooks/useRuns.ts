@@ -362,7 +362,7 @@ export function useRunEvents(runId: string | null): UseRunEventsReturn {
  * copy of that mapping is how the two would come to disagree about a run.
  */
 export async function runsForStory(storyId: string): Promise<StoryRun[]> {
-  const raw = await invoke<RawRun[]>("get_runs", { filters: { storyId } });
+  const raw = await invoke<RawRun[]>("get_runs", { filters: { story_id: storyId } });
   return raw.map(mapRun);
 }
 

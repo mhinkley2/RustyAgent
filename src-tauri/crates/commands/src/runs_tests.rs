@@ -421,3 +421,49 @@ async fn accept_refuses_when_the_owning_repository_cannot_be_determined() {
     assert_eq!(fx.isolation_status("run-1").await.as_deref(), Some("isolated"));
     assert!(fx.branch_exists(&branch), "the branch must survive a refusal");
 }
+
+
+// ---------------------------------------------------------------------------
+// The filter wire format
+// ---------------------------------------------------------------------------
+
+/// `RunFilters` carries no `rename_all`, so the keys on the wire are
+/// snake_case. This is pinned because getting it wrong is *silent*: serde
+/// ignores unrecognised fields, so a camelCase key does not error — it leaves
+/// the filter unset and every run comes back.
+///
+/// The TypeScript `RunFilters` promised camelCase for a long time without
+/// anyone noticing, because every caller passed `null` until a story panel
+/// needed one story's runs.
+#[test]
+fn a_filter_arrives_under_its_snake_case_key() {
+    let filters: crate::runs::RunFilters =
+        serde_json::from_value(serde_json::json!({ "story_id": "s1" })).expect("parse");
+
+    assert_eq!(filters.story_id.as_deref(), Some("s1"));
+}
+
+#[test]
+fn a_camel_case_key_is_dropped_rather_than_refused() {
+    let filters: crate::runs::RunFilters =
+        serde_json::from_value(serde_json::json!({ "storyId": "s1" })).expect("parse");
+
+    assert_eq!(
+        filters.story_id, None,
+        "this is the failure mode: no error, no filter, and every run returned"
+    );
+}
+
+#[test]
+fn every_filter_field_uses_the_same_convention() {
+    let filters: crate::runs::RunFilters = serde_json::from_value(serde_json::json!({
+        "story_id": "s1",
+        "agent_profile_id": "a1",
+        "status": "done",
+    }))
+    .expect("parse");
+
+    assert_eq!(filters.story_id.as_deref(), Some("s1"));
+    assert_eq!(filters.agent_profile_id.as_deref(), Some("a1"));
+    assert_eq!(filters.status.as_deref(), Some("done"));
+}

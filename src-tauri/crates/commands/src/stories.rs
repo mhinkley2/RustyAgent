@@ -154,6 +154,12 @@ fn row_to_latest_run(row: &sqlx::sqlite::SqliteRow) -> Option<StoryLatestRun> {
 
 /// The board's read, with each story's most recent run joined in.
 ///
+/// Run timestamps are emitted as RFC 3339 rather than passed through.
+/// `story_runs.started_at` is usually written with `CURRENT_TIMESTAMP`, whose
+/// `YYYY-MM-DD HH:MM:SS` output JavaScript parses as *local* time — so a card
+/// would show every elapsed time shifted by the reader's UTC offset. See
+/// story `7b74f638` for fixing what is written; this fixes what is read.
+///
 /// One query for the whole board. The obvious alternative — fetch the stories,
 /// then a run per card — is a query per card on a surface that renders every
 /// story at once.
@@ -169,8 +175,8 @@ const SELECT_STORIES: &str = "
            s.track_history, s.labels, s.sort_order, s.created_at, s.updated_at,
            r.id                 AS run_id,
            r.status             AS run_status,
-           r.started_at         AS run_started_at,
-           r.finished_at        AS run_finished_at,
+           strftime('%Y-%m-%dT%H:%M:%fZ', r.started_at)  AS run_started_at,
+           strftime('%Y-%m-%dT%H:%M:%fZ', r.finished_at) AS run_finished_at,
            r.iteration_count    AS run_iteration_count,
            r.input_tokens       AS run_input_tokens,
            r.output_tokens      AS run_output_tokens,
