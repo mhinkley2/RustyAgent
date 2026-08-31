@@ -20,6 +20,11 @@ function renderPage(settings: Partial<AppSettings> = {}) {
       saved.push(args.settings as AppSettings);
       return null;
     },
+    // Deliberately not the real version. This test is "the page shows what
+    // the backend reports", not "the page shows 0.2.0" — a fixture that
+    // happens to match the shipped number invites the reader to think
+    // otherwise, and `version_drift_tests` is what actually guards the number.
+    get_app_version: () => "9.9.9",
   });
   render(<SettingsPage />);
   return saved;
@@ -28,6 +33,39 @@ function renderPage(settings: Partial<AppSettings> = {}) {
 async function save() {
   await userEvent.click(screen.getByRole("button", { name: /save settings/i }));
 }
+
+describe("SettingsPage version", () => {
+  // Every build was 0.1.0 for four local releases, so a bug report naming a
+  // version said nothing. The number has to be reachable without hunting for
+  // an installer filename.
+  it("shows the version this build was stamped with", async () => {
+    renderPage();
+
+    expect(await screen.findByText("9.9.9")).toBeInTheDocument();
+  });
+
+  // The version is a nicety; failing to read it must not take the settings
+  // page down with it, since the page is also where the API keys live.
+  it("says unknown rather than failing when the version cannot be read", async () => {
+    tauriMock.handleAll({
+      get_settings: () => ({
+        anthropic_api_key: null,
+        openrouter_api_key: null,
+        deepseek_api_key: null,
+        ollama_base_url: null,
+      }),
+      save_settings: () => null,
+      get_app_version: () => {
+        throw new Error("no app handle");
+      },
+    });
+    render(<SettingsPage />);
+
+    expect(await screen.findByText("unknown")).toBeInTheDocument();
+    // And the rest of the page still works.
+    expect(screen.getByLabelText(/anthropic api key/i)).toBeInTheDocument();
+  });
+});
 
 describe("SettingsPage notifications", () => {
   it("defaults every category to on when settings.json predates the feature", async () => {

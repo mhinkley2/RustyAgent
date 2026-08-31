@@ -1,6 +1,6 @@
 [package]
 name = "board-mcp"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "MCP server exposing RustyAgent's board, run history, and agent state"
 

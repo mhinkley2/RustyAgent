@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { PageHeader } from "../components/board/PageHeader";
 import { useSettings } from "../hooks/useSettings";
 import type { AppSettings, NotificationSettings } from "../types/settings";
@@ -106,6 +107,20 @@ export default function SettingsPage() {
   const [notifications, setNotifications] =
     useState<NotificationSettings>(DEFAULT_NOTIFICATIONS);
   const [saved, setSaved] = useState(false);
+  /**
+   * The version this build was stamped with.
+   *
+   * Read at runtime rather than baked into the bundle, so it is the same
+   * number on the installer's filename — the one a bug report should quote.
+   */
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<string>("get_app_version")
+      .then(setAppVersion)
+      // A missing version is not worth a toast; the row simply says so.
+      .catch(() => setAppVersion(null));
+  }, []);
 
   // Populate draft once settings load.
   useEffect(() => {
@@ -317,6 +332,25 @@ export default function SettingsPage() {
               Leave blank to wait indefinitely, so a run parks until you come
               back. A value here ends the wait instead — recorded as expired,
               never as a decision you made.
+            </p>
+          </div>
+        </section>
+
+        {/* ── About ──────────────────────────────────────────────── */}
+        <section className="settings-section">
+          <h2 className="settings-section__title">About</h2>
+          <p className="settings-section__desc">
+            Quote this version in a bug report. It is the same number on the
+            installer that produced this build.
+          </p>
+
+          <div className="settings-field">
+            <span className="settings-field__label">Version</span>
+            <p className="settings-field__hint">
+              RustyAgent{" "}
+              <code className="settings-section__path">
+                {appVersion ?? "unknown"}
+              </code>
             </p>
           </div>
         </section>

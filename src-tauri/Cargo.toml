@@ -14,6 +14,16 @@ members = [
 ]
 resolver = "2"
 
+# The one place the version is written.
+#
+# Every crate below takes `version.workspace = true`, including the app package
+# itself, so there is a single value rather than eleven copies drifting apart.
+# `tauri.conf.json` is the source of truth a *user* can observe — it is what
+# Tauri stamps onto a bundle — and `version_drift_tests` holds the two in step
+# along with `package.json`.
+[workspace.package]
+version = "0.2.0"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,7 +40,7 @@ dashmap = "6"
 
 [package]
 name = "rustyagentrustyagent"
-version = "0.1.0"
+version.workspace = true
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

@@ -15,6 +15,48 @@ npm install
 npm run tauri dev
 ```
 
+## Versioning
+
+The version lives in three files, and they must agree:
+
+| File | Role |
+|---|---|
+| `src-tauri/tauri.conf.json` | **source of truth** — Tauri stamps it onto the installer |
+| `package.json` | the npm package |
+| `src-tauri/Cargo.toml` | `[workspace.package]`, inherited by all eleven crates |
+
+`tauri.conf.json` is authoritative because it is the only one a user can
+observe from an installed artifact: it is the number in
+`RustyAgent_<VERSION>_x64-setup.exe` and the one Settings → About displays. A
+bug report quoting a version is quoting that one.
+
+`version_drift_tests` fails if the three disagree, naming each path and its
+value, and it runs under `cargo test` — so it catches drift before a push
+rather than in CI afterwards. The member crates take `version.workspace = true`
+and are covered by a test of their own; do not add a literal version back to
+one.
+
+### Cutting a release
+
+Two steps, by convention — there is no release workflow and this repo builds
+locally only:
+
+```bash
+# 1. Bump all three (keep them identical, plain MAJOR.MINOR.PATCH —
+#    the MSI bundler rejects pre-release suffixes)
+
+# 2. Tag the commit once it is on main. Read the number back from the
+#    source of truth rather than retyping it, so the tag cannot disagree
+#    with what the build will stamp:
+git tag "v$(node -p "require('./src-tauri/tauri.conf.json').version")"
+```
+
+The tag is a local ref. Nothing is published, signed, or auto-updated; the tag
+exists so a build can be located in history afterwards, which no build before
+`v0.2.0` can be.
+
+Then `npm run tauri build`, as under Development above.
+
 ## Data directory
 
 Everything RustyAgent writes lives under one directory: `rustyagent.db`, `logs/`,
