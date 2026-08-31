@@ -1,7 +1,21 @@
-import { useState } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Play, ExternalLink, GitBranch, ArrowLeft } from "lucide-react";
 import { SlidePanel } from "../forms";
-import type { Story, StoryStatus, StoryPriority, StoryType } from "../../types/board";
+import type {
+  Story,
+  StoryStatus,
+  StoryPriority,
+  StoryType,
+  StoryLatestRun,
+} from "../../types/board";
+import type { StoryRun, RunStatus } from "../../types/runs";
+import {
+  RUN_STATUS_LABELS,
+  formatCost,
+  formatDuration,
+  formatEstimatedCost,
+} from "../../types/runs";
+import { runsForStory } from "../../hooks/useRuns";
 import { usePipelineProgress } from "../../hooks/usePipelineProgress";
 import { PipelineProgressPanel } from "../pipeline/PipelineProgressPanel";
 import { RunPanel } from "../RunPanel";
@@ -112,13 +126,29 @@ function timeAgo(date: Date): string {
   return `${d}d ago`;
 }
 
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+/**
+ * A glyph per run state, alongside the shared `RUN_STATUS_LABELS` so the two
+ * cannot come to describe different sets.
+ */
+const RUN_STATUS_GLYPHS: Record<RunStatus, string> = {
+  running:   "⟳",
+  done:      "✓",
+  failed:    "✗",
+  cancelled: "⊘",
+};
+
+/**
+ * How long a run took, or how long it has been going.
+ *
+ * A running row has no `finishedAt`, so it counts against now — which is what
+ * makes an active run read as active rather than as one that took zero time.
+ * The value is a snapshot: the panel re-renders on the board's refresh rather
+ * than ticking, which is enough for a detail view nobody watches by the
+ * second.
+ */
+function runDuration(run: StoryLatestRun): string {
+  const end = run.finishedAt?.getTime() ?? Date.now();
+  return formatDuration(Math.max(0, end - run.startedAt.getTime()) / 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,9 +175,49 @@ interface StoryDetailPanelProps {
   onDelete?: (story: Story) => void;
   /** Called when user clicks "Run Now" */
   onRun?: (story: Story) => void;
+  /**
+   * Open the run detail view for a run id.
+   *
+   * The panel does not navigate itself: it is rendered inside the board, and
+   * the board owns where a run opens.
+   */
+  onOpenRun?: (runId: string) => void;
 }
 
-export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun }: StoryDetailPanelProps) {
+export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOpenRun }: StoryDetailPanelProps) {
+  /**
+   * Every run for this story, so the panel can list the ones before the
+   * latest. Fetched for the open story only — the board's own query carries
+   * just the newest run per card.
+   */
+  const [allRuns, setAllRuns] = useState<StoryRun[]>([]);
+
+  useEffect(() => {
+    if (!story) {
+      setAllRuns([]);
+      return;
+    }
+    let cancelled = false;
+    runsForStory(story.id)
+      .then((runs) => {
+        if (!cancelled) setAllRuns(runs);
+      })
+      // A missing history is not worth a toast; the section simply does not
+      // render, and the latest run above it still does.
+      .catch(() => {
+        if (!cancelled) setAllRuns([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [story?.id]);
+
+  /** Everything but the run already shown above. */
+  const priorRuns = useMemo(
+    () => allRuns.filter((run) => run.id !== story?.latestRun?.id),
+    [allRuns, story?.latestRun?.id],
+  );
+
   const [activePipelineRunId, setActivePipelineRunId] = useState<string | null>(null);
   const [showRun, setShowRun] = useState(false);
   const { progress, startPipelineRun } = usePipelineProgress(
@@ -294,20 +364,62 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun }: St
                     <span
                       className={`sdp__run-status sdp__run-status--${story.latestRun.status}`}
                     >
-                      {story.latestRun.status === "success" ? "✓" : story.latestRun.status === "failure" ? "✗" : "⟳"}
-                      &nbsp;{story.latestRun.status.charAt(0).toUpperCase() + story.latestRun.status.slice(1)}
+                      {RUN_STATUS_GLYPHS[story.latestRun.status]}
+                      &nbsp;{RUN_STATUS_LABELS[story.latestRun.status]}
                     </span>
                     <span className="sdp__muted">{timeAgo(story.latestRun.startedAt)}</span>
                   </div>
                   <div className="sdp__run-meta">
-                    <span>Duration: {formatDuration(story.latestRun.durationMs)}</span>
-                    <span>Steps: {story.latestRun.stepsCompleted}/{story.latestRun.stepsTotal}</span>
+                    <span>Duration: {runDuration(story.latestRun)}</span>
+                    <span>
+                      {story.latestRun.iterationCount} iteration
+                      {story.latestRun.iterationCount === 1 ? "" : "s"}
+                    </span>
+                    <span>{formatCost(story.latestRun.estimatedCostUsd)}</span>
                   </div>
-                  <button className="btn btn--ghost btn--sm sdp__run-link">
+                  <button
+                    className="btn btn--ghost btn--sm sdp__run-link"
+                    onClick={() => onOpenRun?.(story.latestRun!.id)}
+                  >
                     <ExternalLink size={12} />
                     View full run
                   </button>
                 </div>
+              </section>
+            </>
+          )}
+
+          {/* ── Run history ─────────────────────────────────────────────── */}
+          {priorRuns.length > 0 && (
+            <>
+              <hr className="sdp__divider" />
+              <section className="sdp__section">
+                <h3 className="sdp__section-title">
+                  Earlier Runs ({priorRuns.length})
+                </h3>
+                <ul className="sdp__run-history">
+                  {priorRuns.map((run) => (
+                    <li key={run.id} className="sdp__run-history-row">
+                      <button
+                        className="sdp__run-history-link"
+                        onClick={() => onOpenRun?.(run.id)}
+                        title="Open this run"
+                      >
+                        <span
+                          className={`sdp__run-status sdp__run-status--${run.status}`}
+                        >
+                          {RUN_STATUS_GLYPHS[run.status]}
+                        </span>
+                        <span className="sdp__run-history-when">
+                          {timeAgo(run.startedAt)}
+                        </span>
+                        <span className="sdp__muted">
+                          {run.iterationCount} iter · {formatEstimatedCost(run)}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
               </section>
             </>
           )}

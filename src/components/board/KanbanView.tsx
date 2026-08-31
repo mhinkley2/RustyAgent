@@ -22,8 +22,10 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { Story, StoryStatus, StoryPriority } from "../../types/board";
+import type { Story, StoryStatus, StoryPriority, StoryLatestRun } from "../../types/board";
 import { KANBAN_COLUMNS } from "../../types/board";
+import type { RunStatus } from "../../types/runs";
+import { RUN_STATUS_LABELS, formatCost } from "../../types/runs";
 
 // ---------------------------------------------------------------------------
 // Priority helpers
@@ -46,6 +48,35 @@ const PRIORITY_LABELS: Record<StoryPriority, string> = {
 // ---------------------------------------------------------------------------
 // Recency formatting
 // ---------------------------------------------------------------------------
+
+/**
+ * A glyph per finished run state. Mirrors `RUN_STATUS_GLYPHS` in the detail
+ * panel; both are small enough that sharing them across a component boundary
+ * would cost more indirection than it saves.
+ */
+const RUN_STATUS_GLYPHS: Record<RunStatus, string> = {
+  running:   "⟳",
+  done:      "✓",
+  failed:    "✗",
+  cancelled: "⊘",
+};
+
+/**
+ * How long an active run has been going, in the compact form a card can hold.
+ *
+ * The fetched row carries only `started_at`, so elapsed time is computed here.
+ * It advances when the board refreshes rather than ticking per second — the
+ * board follows the database on its own now, and a card that re-rendered every
+ * second across six columns would cost more than the precision is worth.
+ */
+function elapsedSince(start: Date): string {
+  const secs = Math.max(0, Math.round((Date.now() - start.getTime()) / 1000));
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return `${hours}h ${mins % 60}m`;
+}
 
 function timeAgo(date: Date): string {
   const diffMs = Date.now() - date.getTime();
@@ -103,6 +134,7 @@ export function StoryCard({ story, onSelect, isDragging, dragProps }: StoryCardP
         <span className="story-card__assignee">
           {story.assignee ?? "Unassigned"}
         </span>
+        <RunIndicator run={story.latestRun} />
       </div>
       <div className="story-card__footer">
         <span className="story-card__key">{story.key}</span>
@@ -206,6 +238,43 @@ function buildColMap(stories: Story[]): ColMap {
 
 function isColumnId(id: UniqueIdentifier): id is StoryStatus {
   return KANBAN_COLUMNS.some(c => c.status === id);
+}
+
+/**
+ * What a story's most recent run is doing, on the card.
+ *
+ * This is the difference between the board of an agent-orchestration tool and
+ * a generic task tracker: without it you cannot tell a card an agent is
+ * working right now from one nobody has touched in a week.
+ *
+ * A story that has never run renders nothing at all — no empty slot, no
+ * placeholder. The meta row is one line and the board shows six columns, so
+ * the indicator has to earn its space.
+ */
+function RunIndicator({ run }: { run?: StoryLatestRun }) {
+  if (!run) return null;
+
+  if (run.status === "running") {
+    return (
+      <span
+        className="story-card__run story-card__run--running"
+        title={`Running · ${run.iterationCount} iteration${run.iterationCount === 1 ? "" : "s"}`}
+      >
+        <span className="story-card__run-pulse" aria-hidden="true" />
+        {elapsedSince(run.startedAt)}
+        {run.iterationCount > 0 && ` · ${run.iterationCount} iter`}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      className={`story-card__run story-card__run--${run.status}`}
+      title={`${RUN_STATUS_LABELS[run.status]} · ${formatCost(run.estimatedCostUsd)}`}
+    >
+      {RUN_STATUS_GLYPHS[run.status]} {timeAgo(run.finishedAt ?? run.startedAt)}
+    </span>
+  );
 }
 
 interface KanbanViewProps {

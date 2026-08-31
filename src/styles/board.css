@@ -727,3 +727,84 @@
   overflow: hidden;
   padding: 0;
 }
+
+/* ── Run state on the card ──────────────────────────────────────────────────
+   The difference between this board and a generic task tracker: whether an
+   agent is working on a card right now. Sits in the one-line meta row, so it
+   stays compact and disappears entirely for a story that has never run. */
+
+.story-card__run {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.story-card__run--running {
+  color: var(--color-primary, #6366f1);
+  font-variant-numeric: tabular-nums;
+}
+
+.story-card__run--done      { color: var(--text-muted); }
+.story-card__run--cancelled { color: var(--text-muted); }
+
+/* Failure is the one state worth interrupting a scan for — it is the reason
+   to open the card. */
+.story-card__run--failed {
+  color: var(--error);
+}
+
+.story-card__run-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: story-card-run-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes story-card-run-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.25; }
+}
+
+/* A pulse is decoration; someone who has asked for less motion should get a
+   steady dot rather than none, since the dot is what marks the card active. */
+@media (prefers-reduced-motion: reduce) {
+  .story-card__run-pulse { animation: none; }
+}
+
+/* ── Run history in the detail panel ─────────────────────────────────────── */
+
+.sdp__run-history {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sdp__run-history-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sdp__run-history-link:hover {
+  background: var(--surface-2);
+}
+
+.sdp__run-history-when {
+  min-width: 5.5rem;
+}

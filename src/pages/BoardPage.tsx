@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import { LayoutGrid, List, MessageSquare, RefreshCw, ShieldAlert } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 import { KanbanView } from "../components/board/KanbanView";
 import { ListView } from "../components/board/ListView";
@@ -19,6 +20,7 @@ import { useHumanRequests, requestDesktopNotification } from "../hooks/useHumanR
 type View = "kanban" | "list";
 
 export default function BoardPage() {
+  const navigate = useNavigate();
   const {
     stories,
     refresh,
@@ -261,6 +263,9 @@ export default function BoardPage() {
       <StoryDetailPanel
         story={selectedStory}
         onClose={handleClosePanel}
+        // The runs page already renders a live timeline for a single run, so
+        // opening one is a navigation rather than another view to build.
+        onOpenRun={(runId) => navigate(`/runs?runId=${runId}`)}
         onEdit={openEdit}
         onDelete={setDeleteTarget}
         onRun={(story) => {

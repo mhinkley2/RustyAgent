@@ -25,6 +25,37 @@ pub struct Story {
     pub sort_order: i64,
     pub created_at: String,
     pub updated_at: String,
+    /// The most recent run against this story, if it has ever been run.
+    ///
+    /// Joined in `SELECT_STORIES` rather than fetched per card: the board
+    /// renders every story at once, and a query per card is a query per card.
+    pub latest_run: Option<StoryLatestRun>,
+}
+
+/// What the board needs to know about a story's most recent run.
+///
+/// A narrow projection of `story_runs`, not the whole row — the card shows a
+/// state, an age and a cost, and the run detail view is one click away for
+/// anything more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoryLatestRun {
+    pub id: String,
+    /// `running` | `done` | `failed` | `cancelled`.
+    ///
+    /// The *run* vocabulary, which is not the story vocabulary and legitimately
+    /// contains `failed` — see `db::story_status` for the other one. The type
+    /// this replaced invented a third spelling, `success` / `failure`, which
+    /// matched neither.
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    /// Iterations the run has entered, which is what a card can honestly show
+    /// as progress. There is no total to count against — an agent loop runs
+    /// until it is done or hits `max_iterations`.
+    pub iteration_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub estimated_cost_usd: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,15 +119,72 @@ fn row_to_story(row: &sqlx::sqlite::SqliteRow) -> Story {
         sort_order:          row.try_get("sort_order").unwrap_or(0),
         created_at:          row.try_get("created_at").unwrap_or_default(),
         updated_at:          row.try_get("updated_at").unwrap_or_default(),
+        latest_run:          row_to_latest_run(row),
     }
 }
 
+/// The joined run columns, when the story has a run at all.
+///
+/// Keyed on the run's id being present: the join is a `LEFT JOIN`, so a story
+/// nobody has run yet comes back with every run column NULL, and the card must
+/// render exactly as it did before rather than showing an empty slot.
+fn row_to_latest_run(row: &sqlx::sqlite::SqliteRow) -> Option<StoryLatestRun> {
+    let id: Option<String> = row.try_get("run_id").ok().flatten();
+    let id = id?;
+
+    Some(StoryLatestRun {
+        id,
+        status: row
+            .try_get("run_status")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "running".to_string()),
+        started_at: row.try_get("run_started_at").ok().flatten().unwrap_or_default(),
+        finished_at: row.try_get("run_finished_at").ok().flatten(),
+        iteration_count: row.try_get("run_iteration_count").ok().flatten().unwrap_or(0),
+        input_tokens: row.try_get("run_input_tokens").ok().flatten().unwrap_or(0),
+        output_tokens: row.try_get("run_output_tokens").ok().flatten().unwrap_or(0),
+        estimated_cost_usd: row
+            .try_get("run_estimated_cost_usd")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0),
+    })
+}
+
+/// The board's read, with each story's most recent run joined in.
+///
+/// One query for the whole board. The obvious alternative — fetch the stories,
+/// then a run per card — is a query per card on a surface that renders every
+/// story at once.
+///
+/// `ROW_NUMBER()` picks the latest run per story. The tiebreak on `rowid`
+/// matters: `story_runs.started_at` is written with `CURRENT_TIMESTAMP`, whose
+/// resolution is one second, so two runs started in the same second are not
+/// ordered by their timestamps alone. Without it the "latest" run of a
+/// fast-retried story would be arbitrary.
 const SELECT_STORIES: &str = "
     SELECT s.id, s.title, s.description, s.story_type, s.status, s.priority,
            s.assigned_agent_id, a.name AS agent_name, s.requires_approval,
-           s.track_history, s.labels, s.sort_order, s.created_at, s.updated_at
+           s.track_history, s.labels, s.sort_order, s.created_at, s.updated_at,
+           r.id                 AS run_id,
+           r.status             AS run_status,
+           r.started_at         AS run_started_at,
+           r.finished_at        AS run_finished_at,
+           r.iteration_count    AS run_iteration_count,
+           r.input_tokens       AS run_input_tokens,
+           r.output_tokens      AS run_output_tokens,
+           r.estimated_cost_usd AS run_estimated_cost_usd
     FROM stories s
-    LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id";
+    LEFT JOIN agent_profiles a ON a.id = s.assigned_agent_id
+    LEFT JOIN (
+        SELECT id, story_id, status, started_at, finished_at, iteration_count,
+               input_tokens, output_tokens, estimated_cost_usd,
+               ROW_NUMBER() OVER (
+                   PARTITION BY story_id ORDER BY started_at DESC, rowid DESC
+               ) AS rn
+        FROM story_runs
+    ) r ON r.story_id = s.id AND r.rn = 1";
 
 // ---------------------------------------------------------------------------
 // Commands

@@ -35,6 +35,9 @@ mod permissions_tests;
 
 #[cfg(test)]
 mod agent_profiles_tests;
+
+#[cfg(test)]
+mod stories_tests;
 pub use permissions::AgentPermissions;
 pub use runtime::ApprovalGate;
 
