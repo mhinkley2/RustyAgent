@@ -6,12 +6,15 @@
  * card, and answering it should not require mounting a drag-and-drop board.
  * `KanbanView` is left with the dragging.
  */
+import { useState } from "react";
 import { GitBranch } from "lucide-react";
 
 import type { Story, StoryPriority, StoryLatestRun } from "../../types/board";
 import type { RunStatus } from "../../types/runs";
 import { RUN_STATUS_LABELS, formatCost } from "../../types/runs";
+import type { AgentProfile } from "../../types/agent";
 import { attentionCount, attentionLabel, type StoryAttention } from "./attention";
+import { AgentPicker } from "./AgentPicker";
 
 // ---------------------------------------------------------------------------
 // Priority helpers
@@ -98,6 +101,13 @@ interface StoryCardProps {
   attention?: StoryAttention;
   /** Open the dialog for `attention`'s request. Absent means render no marker. */
   onAttention?: (attention: StoryAttention) => void;
+  /** Profiles the assignee slot can offer. */
+  agents?: AgentProfile[];
+  /**
+   * Assign this story from the card. Absent leaves the assignee read-only, as
+   * it is in the drag overlay and anywhere else a card is only being shown.
+   */
+  onAssign?: (agentId: string | null) => Promise<void> | void;
 }
 
 export function StoryCard({
@@ -108,7 +118,19 @@ export function StoryCard({
   isNextUp,
   attention,
   onAttention,
+  agents,
+  onAssign,
 }: StoryCardProps) {
+  /**
+   * The slot shows a name until you press it, then becomes a real select.
+   *
+   * A select in every card's meta row, on a six-column board, would shout over
+   * the thing the row is for. Pressing the name is the cheapest gesture that
+   * still leads somewhere, and it collapses again as soon as you leave.
+   */
+  const [picking, setPicking] = useState(false);
+  const canAssign = Boolean(agents && onAssign);
+
   return (
     <div
       className={`story-card story-card--${story.type}${isDragging ? " story-card--dragging" : ""}`}
@@ -137,9 +159,45 @@ export function StoryCard({
         )}
       </div>
       <div className="story-card__meta">
-        <span className="story-card__assignee">
-          {story.assignee ?? "Unassigned"}
-        </span>
+        {picking && agents && onAssign ? (
+          <AgentPicker
+            className="story-card__assignee-picker"
+            agents={agents}
+            value={story.assignedAgentId ?? null}
+            ariaLabel={`Assign an agent to ${story.title}`}
+            autoFocus
+            // dnd-kit's listeners are on the card, and the card opens the
+            // detail panel. Neither should fire while you are using a select
+            // that happens to sit inside it.
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Escape") setPicking(false);
+            }}
+            onBlur={() => setPicking(false)}
+            onChange={(agentId) => {
+              setPicking(false);
+              void onAssign(agentId);
+            }}
+          />
+        ) : canAssign ? (
+          <button
+            type="button"
+            className="story-card__assignee story-card__assignee--editable"
+            title="Assign an agent"
+            aria-label={`Assignee: ${story.assignee ?? "Unassigned"}. Press to change.`}
+            onClick={(e) => { e.stopPropagation(); setPicking(true); }}
+            onKeyDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {story.assignee ?? "Unassigned"}
+          </button>
+        ) : (
+          <span className="story-card__assignee">
+            {story.assignee ?? "Unassigned"}
+          </span>
+        )}
         {attention && onAttention && (
           <button
             type="button"

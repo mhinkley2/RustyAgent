@@ -9,6 +9,7 @@ import { StoryForm } from "../components/board/StoryForm";
 import { PageHeader } from "../components/board/PageHeader";
 import { FilterBar, DEFAULT_FILTERS } from "../components/board/FilterBar";
 import { attentionByStory, type StoryAttention } from "../components/board/attention";
+import { assignmentInput } from "../components/board/assignment";
 import {
   activeRequests,
   pruneDismissed,
@@ -136,6 +137,34 @@ export default function BoardPage() {
   const handleAttention = useCallback(
     (a: StoryAttention) => openRequest(a.requestId),
     [openRequest],
+  );
+
+  /**
+   * Assign one story.
+   *
+   * `updateStory` replaces the row in local state with what the write returned,
+   * and the open panel is derived from that row rather than from a snapshot —
+   * so Run Now and Start Pipeline stop being disabled without a refetch.
+   */
+  const handleAssign = useCallback(
+    async (storyId: string, agentId: string | null) => {
+      await updateStory(storyId, assignmentInput(agentId));
+    },
+    [updateStory],
+  );
+
+  /**
+   * Assign a selection.
+   *
+   * Sequential rather than `Promise.all`: each write returns the whole story
+   * and sets it into the same list, and firing them together would have several
+   * responses racing to replace it.
+   */
+  const handleAssignMany = useCallback(
+    async (ids: string[], agentId: string | null) => {
+      for (const id of ids) await updateStory(id, assignmentInput(agentId));
+    },
+    [updateStory],
   );
 
   // All unique labels across all stories
@@ -322,11 +351,15 @@ export default function BoardPage() {
             }
             attention={attention}
             onAttention={handleAttention}
+            agents={agents}
+            onAssign={handleAssign}
           />
         ) : (
           <ListView
             stories={filteredStories}
             onSelect={handleSelect}
+            agents={agents}
+            onAssignStories={handleAssignMany}
             onDeleteStories={async (ids) => {
               for (const id of ids) await deleteStory(id);
               if (selectedStoryId && ids.includes(selectedStoryId)) setSelectedStoryId(null);
@@ -343,6 +376,8 @@ export default function BoardPage() {
         onOpenRun={(runId) => navigate(`/runs?runId=${runId}`)}
         onEdit={openEdit}
         onDelete={setDeleteTarget}
+        agents={agents}
+        onAssign={handleAssign}
         onRun={(story) => {
           // TODO: dispatch IPC run command
           console.info("Run story:", story.id);

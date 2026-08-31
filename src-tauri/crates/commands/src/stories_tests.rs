@@ -4,10 +4,11 @@
 //! run summary on a card has to arrive with the stories rather than as a query
 //! per card.
 
-use db::testing::{make_test_pool, seed_profile, seed_story};
+use db::testing::{make_test_pool, run_status, seed_profile, seed_run, seed_story};
 use db::DbPool;
+use sqlx::Row;
 
-use crate::stories::{get_stories, Story};
+use crate::stories::{get_stories, update_story, Story, UpdateStoryInput};
 
 const PROFILE: &str = "agent-1";
 
@@ -292,4 +293,159 @@ async fn an_unrecognised_priority_sorts_last_rather_than_first() {
     seed_ready(&db, "known", "low", 1, at).await;
 
     assert_eq!(ordered_ids(&db).await, vec!["known", "nonsense"]);
+}
+
+// ---------------------------------------------------------------------------
+// Assignment
+// ---------------------------------------------------------------------------
+//
+// Assignment gates both actions that start work, and the board now writes it
+// from three places rather than only from the edit form. These pin what those
+// writes mean — chiefly the third state of `assigned_agent_id`, which is easy
+// to send by accident and impossible to see going wrong.
+
+/// A blank update, so a test can name only the field it is exercising.
+fn no_change() -> UpdateStoryInput {
+    UpdateStoryInput {
+        title: None,
+        description: None,
+        story_type: None,
+        status: None,
+        priority: None,
+        assigned_agent_id: None,
+        requires_approval: None,
+        track_history: None,
+        labels: None,
+    }
+}
+
+fn assign_to(agent: &str) -> UpdateStoryInput {
+    UpdateStoryInput {
+        assigned_agent_id: Some(agent.to_string()),
+        ..no_change()
+    }
+}
+
+async fn run_profile(db: &DbPool, run_id: &str) -> String {
+    sqlx::query("SELECT agent_profile_id FROM story_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_one(db)
+        .await
+        .expect("fetch the run")
+        .get::<String, _>("agent_profile_id")
+}
+
+#[tokio::test]
+async fn assigning_sets_the_agent_and_reports_its_name() {
+    let db = pool().await;
+    seed_story(&db, "s1", "Migrate the database", "ready").await;
+
+    let updated = update_story("s1".into(), assign_to(PROFILE), &db, None)
+        .await
+        .expect("assign");
+
+    assert_eq!(updated.assigned_agent_id.as_deref(), Some(PROFILE));
+    // The name comes from a JOIN, so the board can render the change without
+    // refetching the profile list.
+    assert_eq!(updated.assigned_agent_name.as_deref(), Some("An agent"));
+}
+
+#[tokio::test]
+async fn an_empty_agent_id_clears_the_assignment() {
+    let db = pool().await;
+    seed_story(&db, "s1", "Migrate the database", "ready").await;
+    update_story("s1".into(), assign_to(PROFILE), &db, None)
+        .await
+        .expect("assign");
+
+    let cleared = update_story(
+        "s1".into(),
+        UpdateStoryInput {
+            assigned_agent_id: Some(String::new()),
+            ..no_change()
+        },
+        &db,
+        None,
+    )
+    .await
+    .expect("unassign");
+
+    assert_eq!(cleared.assigned_agent_id, None);
+    assert_eq!(cleared.assigned_agent_name, None);
+}
+
+#[tokio::test]
+async fn an_absent_agent_id_keeps_the_assignment() {
+    // The distinction the frontend has to get right: omitting the field is not
+    // how you unassign, it is how you edit a title without touching the agent.
+    let db = pool().await;
+    seed_story(&db, "s1", "Migrate the database", "ready").await;
+    update_story("s1".into(), assign_to(PROFILE), &db, None)
+        .await
+        .expect("assign");
+
+    let renamed = update_story(
+        "s1".into(),
+        UpdateStoryInput {
+            title: Some("Migrate the database, carefully".into()),
+            ..no_change()
+        },
+        &db,
+        None,
+    )
+    .await
+    .expect("rename");
+
+    assert_eq!(renamed.title, "Migrate the database, carefully");
+    assert_eq!(renamed.assigned_agent_id.as_deref(), Some(PROFILE));
+}
+
+#[tokio::test]
+async fn reassigning_during_a_run_leaves_that_run_on_the_agent_it_started_with() {
+    // The panel tells the user a change applies to the next run. This is why
+    // that is true rather than a hope: a run records its profile on its own row
+    // when it starts, and nothing about the story reaches back into it.
+    let db = pool().await;
+    seed_profile(&db, "agent-2", "Another agent").await;
+    seed_story(&db, "s1", "Migrate the database", "in_progress").await;
+    update_story("s1".into(), assign_to(PROFILE), &db, None)
+        .await
+        .expect("assign");
+    seed_run(&db, "run-1", "s1", PROFILE).await;
+
+    let reassigned = update_story("s1".into(), assign_to("agent-2"), &db, None)
+        .await
+        .expect("reassign mid-run");
+
+    assert_eq!(reassigned.assigned_agent_id.as_deref(), Some("agent-2"));
+    assert_eq!(
+        run_profile(&db, "run-1").await,
+        PROFILE,
+        "the live run keeps the agent it started with",
+    );
+    assert_eq!(run_status(&db, "run-1").await, "running", "and keeps running");
+}
+
+#[tokio::test]
+async fn unassigning_during_a_run_does_not_strip_the_run_of_its_agent() {
+    let db = pool().await;
+    seed_story(&db, "s1", "Migrate the database", "in_progress").await;
+    update_story("s1".into(), assign_to(PROFILE), &db, None)
+        .await
+        .expect("assign");
+    seed_run(&db, "run-1", "s1", PROFILE).await;
+
+    update_story(
+        "s1".into(),
+        UpdateStoryInput {
+            assigned_agent_id: Some(String::new()),
+            ..no_change()
+        },
+        &db,
+        None,
+    )
+    .await
+    .expect("unassign mid-run");
+
+    assert_eq!(run_profile(&db, "run-1").await, PROFILE);
 }

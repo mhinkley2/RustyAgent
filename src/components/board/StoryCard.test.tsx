@@ -6,6 +6,7 @@ import { StoryCard } from "./StoryCard";
 import { attentionByStory } from "./attention";
 import type { Story } from "../../types/board";
 import type { ApprovalRequest, HumanRequest } from "../../types/human";
+import type { AgentProfile } from "../../types/agent";
 
 function makeStory(overrides: Partial<Story> = {}): Story {
   return {
@@ -141,5 +142,146 @@ describe("StoryCard — the waiting-on-you marker", () => {
     render(<StoryCard story={makeStory()} onSelect={() => {}} attention={attention} />);
 
     expect(screen.queryByText(/waiting on you/i)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Assigning from the card
+// ---------------------------------------------------------------------------
+
+function agent(id: string, name: string): AgentProfile {
+  return {
+    id,
+    name,
+    description: null,
+    system_prompt: "",
+    provider: "anthropic",
+    model: "claude-opus-5",
+    context_strategy: "recent",
+    persistent_memory: false,
+    max_input_tokens: null,
+    max_output_tokens: null,
+    run_mode: "manual",
+    cron_expression: null,
+    continuous_poll_interval_secs: 60,
+    max_iterations: 10,
+    max_retries: 2,
+    scope: "global",
+    toml_path: null,
+    created_at: "2026-08-31T00:00:00.000Z",
+    updated_at: "2026-08-31T00:00:00.000Z",
+  };
+}
+
+const AGENTS = [agent("a1", "Agent One"), agent("a2", "Agent Two")];
+
+const assigneeButton = () => screen.getByRole("button", { name: /^Assignee:/ });
+const assigneePicker = () => screen.queryByRole("combobox", { name: /^Assign an agent to/ });
+
+describe("StoryCard - assigning from the card", () => {
+  it("leaves the assignee as plain text with no handler", () => {
+    // The drag overlay renders a card that is only being shown; a control on it
+    // would be unreachable and would suggest otherwise.
+    render(<StoryCard story={makeStory({ assignee: "Agent One" })} onSelect={() => {}} />);
+
+    expect(screen.getByText("Agent One")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Assignee:/ })).toBeNull();
+  });
+
+  it("names the current assignee for a screen reader", () => {
+    render(
+      <StoryCard
+        story={makeStory({ assignee: undefined })}
+        onSelect={() => {}}
+        agents={AGENTS}
+        onAssign={() => {}}
+      />,
+    );
+
+    expect(assigneeButton().getAttribute("aria-label")).toBe(
+      "Assignee: Unassigned. Press to change.",
+    );
+  });
+
+  it("swaps the name for a picker when pressed, without opening the panel", async () => {
+    const onSelect = vi.fn();
+    render(
+      <StoryCard
+        story={makeStory()}
+        onSelect={onSelect}
+        agents={AGENTS}
+        onAssign={() => {}}
+      />,
+    );
+
+    expect(assigneePicker()).toBeNull();
+    await userEvent.click(assigneeButton());
+
+    expect(assigneePicker()).not.toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("assigns the chosen agent and collapses again", async () => {
+    const onAssign = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <StoryCard
+        story={makeStory()}
+        onSelect={onSelect}
+        agents={AGENTS}
+        onAssign={onAssign}
+      />,
+    );
+
+    await userEvent.click(assigneeButton());
+    await userEvent.selectOptions(assigneePicker()!, "a2");
+
+    expect(onAssign).toHaveBeenCalledWith("a2");
+    expect(assigneePicker()).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("unassigns", async () => {
+    const onAssign = vi.fn();
+    render(
+      <StoryCard
+        story={makeStory({ assignee: "Agent One", assignedAgentId: "a1" })}
+        onSelect={() => {}}
+        agents={AGENTS}
+        onAssign={onAssign}
+      />,
+    );
+
+    await userEvent.click(assigneeButton());
+    await userEvent.selectOptions(assigneePicker()!, "");
+
+    expect(onAssign).toHaveBeenCalledWith(null);
+  });
+
+  it("collapses on Escape without assigning", async () => {
+    const onAssign = vi.fn();
+    render(
+      <StoryCard story={makeStory()} onSelect={() => {}} agents={AGENTS} onAssign={onAssign} />,
+    );
+
+    await userEvent.click(assigneeButton());
+    await userEvent.keyboard("{Escape}");
+
+    expect(assigneePicker()).toBeNull();
+    expect(onAssign).not.toHaveBeenCalled();
+  });
+
+  it("does not open the panel from the keys used to work the picker", async () => {
+    // The card opens on Enter and Space. Those are also how you drive a select,
+    // so without stopping them a keyboard user would get the panel over the top.
+    const onSelect = vi.fn();
+    render(
+      <StoryCard story={makeStory()} onSelect={onSelect} agents={AGENTS} onAssign={() => {}} />,
+    );
+
+    await userEvent.click(assigneeButton());
+    await userEvent.keyboard("{Enter}");
+
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

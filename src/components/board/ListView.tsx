@@ -1,6 +1,8 @@
 import { useState } from "react";
 import type { Story, StoryPriority } from "../../types/board";
 import { ConfirmDialog } from "../forms";
+import type { AgentProfile } from "../../types/agent";
+import { AgentPicker } from "./AgentPicker";
 
 const PRIORITY_COLORS: Record<StoryPriority, string> = {
   critical: "var(--error)",
@@ -30,13 +32,28 @@ interface BulkActionBarProps {
   count: number;
   onClear: () => void;
   onDelete: () => void;
+  agents?: AgentProfile[];
+  onAssign?: (agentId: string | null) => Promise<void> | void;
 }
 
-function BulkActionBar({ count, onClear, onDelete }: BulkActionBarProps) {
+function BulkActionBar({ count, onClear, onDelete, agents, onAssign }: BulkActionBarProps) {
   return (
     <div className="bulk-bar" role="toolbar" aria-label="Bulk actions">
       <span className="bulk-bar__count">{count} selected</span>
       <div className="bulk-bar__actions">
+        {agents && onAssign && (
+          <AgentPicker
+            className="bulk-bar__assign"
+            agents={agents}
+            // Always empty: this is a command, not a field. The selection can
+            // hold several different assignees, so there is no one value it
+            // could be showing.
+            value={null}
+            unassignedLabel={`Assign ${count}…`}
+            ariaLabel={`Assign an agent to ${count} selected stories`}
+            onChange={(agentId) => { void onAssign(agentId); }}
+          />
+        )}
         <button className="btn btn--destructive btn--sm" onClick={onDelete}>Delete</button>
         <button className="btn btn--ghost btn--sm" onClick={onClear}>Clear selection</button>
       </div>
@@ -52,9 +69,17 @@ interface ListViewProps {
   stories: Story[];
   onSelect: (story: Story) => void;
   onDeleteStories?: (ids: string[]) => Promise<void>;
+  agents?: AgentProfile[];
+  onAssignStories?: (ids: string[], agentId: string | null) => Promise<void>;
 }
 
-export function ListView({ stories, onSelect, onDeleteStories }: ListViewProps) {
+export function ListView({
+  stories,
+  onSelect,
+  onDeleteStories,
+  agents,
+  onAssignStories,
+}: ListViewProps) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -145,6 +170,17 @@ export function ListView({ stories, onSelect, onDeleteStories }: ListViewProps) 
           count={selected.size}
           onClear={() => setSelected(new Set())}
           onDelete={() => setConfirmDelete(true)}
+          agents={agents}
+          onAssign={
+            onAssignStories &&
+            (async (agentId) => {
+              const ids = [...selected];
+              // Cleared before the write, like Delete: leaving rows selected
+              // after a bulk action invites a second, accidental one.
+              setSelected(new Set());
+              await onAssignStories(ids, agentId);
+            })
+          }
         />
       )}
 
