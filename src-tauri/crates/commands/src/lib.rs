@@ -576,3 +576,6 @@ pub async fn start_chat_run(
     Ok(ChatRunResponse { run_id, session_id })
 }
 
+
+#[cfg(test)]
+mod human_tests;

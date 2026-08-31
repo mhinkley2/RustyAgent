@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { LayoutGrid, List, MessageSquare, RefreshCw, ShieldAlert } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 
@@ -8,6 +8,12 @@ import { StoryDetailPanel } from "../components/board/StoryDetailPanel";
 import { StoryForm } from "../components/board/StoryForm";
 import { PageHeader } from "../components/board/PageHeader";
 import { FilterBar, DEFAULT_FILTERS } from "../components/board/FilterBar";
+import { attentionByStory, type StoryAttention } from "../components/board/attention";
+import {
+  activeRequests,
+  pruneDismissed,
+  undismiss,
+} from "../components/board/activeRequest";
 import { HumanInputDialog } from "../components/board/HumanInputDialog";
 import { ApprovalGateDialog } from "../components/board/ApprovalGateDialog";
 import { ConfirmDialog } from "../components/forms";
@@ -70,9 +76,67 @@ export default function BoardPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [humanRequests.length]);
 
-  // Active dialogs: pick the first non-dismissed pending request
-  const activeHumanRequest = humanRequests.find(r => !dismissedHumanIds.has(r.id)) ?? null;
-  const activeApprovalRequest = approvalRequests.find(r => !dismissedApprovalIds.has(r.id)) ?? null;
+  /**
+   * The one request the user explicitly asked to see.
+   *
+   * Everything used to be "the first non-dismissed request", which is exactly
+   * what made a dismissed request unreachable: dismiss them all and there is no
+   * first non-dismissed one left for a button to act on. A run could be left
+   * blocked with no UI that could reopen it.
+   */
+  const [focusedRequestId, setFocusedRequestId] = useState<string | null>(null);
+
+  const { human: activeHumanRequest, approval: activeApprovalRequest } = useMemo(
+    () =>
+      activeRequests(
+        humanRequests,
+        approvalRequests,
+        dismissedHumanIds,
+        dismissedApprovalIds,
+        focusedRequestId,
+      ),
+    [
+      humanRequests,
+      approvalRequests,
+      dismissedHumanIds,
+      dismissedApprovalIds,
+      focusedRequestId,
+    ],
+  );
+
+  /** Open one specific request, undoing any dismissal that is hiding it. */
+  const openRequest = useCallback((id: string) => {
+    setFocusedRequestId(id);
+    setDismissedHumanIds(prev => undismiss(prev, id));
+    setDismissedApprovalIds(prev => undismiss(prev, id));
+  }, []);
+
+  const closeRequest = useCallback(() => setFocusedRequestId(null), []);
+
+  // Forget dismissals of requests that no longer exist, so the sets do not
+  // grow for the life of the page remembering things that are gone.
+  useEffect(() => {
+    const liveHuman = new Set(humanRequests.map(r => r.id));
+    const liveApproval = new Set(approvalRequests.map(r => r.id));
+    setDismissedHumanIds(prev => pruneDismissed(prev, liveHuman));
+    setDismissedApprovalIds(prev => pruneDismissed(prev, liveApproval));
+  }, [humanRequests, approvalRequests]);
+
+  /**
+   * Which cards are blocking a person.
+   *
+   * The banners say how many; this is what says *which*, on the board itself,
+   * without opening anything.
+   */
+  const attention = useMemo(
+    () => attentionByStory(humanRequests, approvalRequests),
+    [humanRequests, approvalRequests],
+  );
+
+  const handleAttention = useCallback(
+    (a: StoryAttention) => openRequest(a.requestId),
+    [openRequest],
+  );
 
   // All unique labels across all stories
   const availableLabels = useMemo(() => {
@@ -215,15 +279,14 @@ export default function BoardPage() {
               : `${humanRequests.length} agents are waiting for your input.`}
           </span>
           <button
-              className="btn btn--primary btn--xs"
-              onClick={() => {
-                if (activeHumanRequest) {
-                  setDismissedHumanIds(s => { const n = new Set(s); n.delete(activeHumanRequest.id); return n; });
-                }
-              }}
-            >
-              Respond
-            </button>
+            className="btn btn--primary btn--xs"
+            // The oldest request, dismissed or not. The button has to work in
+            // exactly the case you would reach for it, which is when you have
+            // dismissed everything and want one back.
+            onClick={() => openRequest(humanRequests[0].id)}
+          >
+            Respond
+          </button>
         </div>
       )}
       {approvalRequests.length > 0 && (
@@ -234,6 +297,12 @@ export default function BoardPage() {
               ? "A tool call is waiting for your approval."
               : `${approvalRequests.length} tool calls are waiting for approval.`}
           </span>
+          <button
+            className="btn btn--primary btn--xs"
+            onClick={() => openRequest(approvalRequests[0].id)}
+          >
+            Review
+          </button>
         </div>
       )}
 
@@ -247,6 +316,8 @@ export default function BoardPage() {
             onDragActiveChange={(dragging) =>
               dragging ? pauseAutoRefresh() : resumeAutoRefresh()
             }
+            attention={attention}
+            onAttention={handleAttention}
           />
         ) : (
           <ListView
@@ -297,12 +368,14 @@ export default function BoardPage() {
         <HumanInputDialog
           request={activeHumanRequest}
           onSubmit={async (storyId, response) => {
+            closeRequest();
             await respondToHuman(storyId, response);
             await refreshHuman();
           }}
-          onDismiss={() =>
-            setDismissedHumanIds(s => new Set([...s, activeHumanRequest.id]))
-          }
+          onDismiss={() => {
+            closeRequest();
+            setDismissedHumanIds(s => new Set([...s, activeHumanRequest.id]));
+          }}
           pendingApprovalCount={activeApprovalRequest ? 1 : 0}
         />
       )}
@@ -312,12 +385,14 @@ export default function BoardPage() {
         <ApprovalGateDialog
           request={activeApprovalRequest}
           onDecide={async (id, approved, reason) => {
+            closeRequest();
             await decideApproval(id, approved, reason);
             await refreshHuman();
           }}
-          onDismiss={() =>
-            setDismissedApprovalIds(s => new Set([...s, activeApprovalRequest.id]))
-          }
+          onDismiss={() => {
+            closeRequest();
+            setDismissedApprovalIds(s => new Set([...s, activeApprovalRequest.id]));
+          }}
         />
       )}
     </div>
