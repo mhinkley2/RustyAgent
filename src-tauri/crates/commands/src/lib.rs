@@ -13,6 +13,9 @@ pub use runs::{StoryRun, RunEvent, RunFilters};
 #[cfg(test)]
 mod runs_tests;
 
+pub mod models;
+pub use models::{list_provider_models, ModelOption};
+
 pub mod human;
 pub use human::{HumanRequest, ApprovalRequest};
 
