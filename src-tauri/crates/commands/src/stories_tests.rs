@@ -201,3 +201,95 @@ async fn a_running_run_still_has_no_finish_time() {
 
     assert_eq!(latest.finished_at, None);
 }
+
+
+// ---------------------------------------------------------------------------
+// Queue order
+// ---------------------------------------------------------------------------
+
+async fn seed_ready(db: &DbPool, id: &str, priority: &str, sort_order: i64, created_at: &str) {
+    sqlx::query(
+        "INSERT INTO stories (id, title, status, priority, sort_order, created_at)
+         VALUES (?, ?, 'ready', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(format!("Story {id}"))
+    .bind(priority)
+    .bind(sort_order)
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("seed a ready story");
+}
+
+async fn ordered_ids(db: &DbPool) -> Vec<String> {
+    stories_of(db).await.into_iter().map(|s| s.id).collect()
+}
+
+/// `priority` is a text column, so ordering by it directly sorts lexically:
+/// `critical` after `low`, `high` after `critical`. The rank has to be
+/// explicit, and this is the test that would catch losing it.
+#[tokio::test]
+async fn priority_ranks_by_urgency_not_alphabetically() {
+    let db = pool().await;
+    let at = "2026-04-13T00:00:00.000Z";
+    seed_ready(&db, "low", "low", 0, at).await;
+    seed_ready(&db, "critical", "critical", 1, at).await;
+    seed_ready(&db, "medium", "medium", 2, at).await;
+    seed_ready(&db, "high", "high", 3, at).await;
+
+    assert_eq!(
+        ordered_ids(&db).await,
+        vec!["critical", "high", "medium", "low"],
+        "alphabetical order would put critical after low"
+    );
+}
+
+/// Within one priority band, the position a user dragged a card to decides —
+/// which is the gesture the board is built around.
+#[tokio::test]
+async fn manual_position_decides_within_a_priority() {
+    let db = pool().await;
+    let at = "2026-04-13T00:00:00.000Z";
+    seed_ready(&db, "third", "high", 2, at).await;
+    seed_ready(&db, "first", "high", 0, at).await;
+    seed_ready(&db, "second", "high", 1, at).await;
+
+    assert_eq!(ordered_ids(&db).await, vec!["first", "second", "third"]);
+}
+
+/// Marking something critical should not also require dragging it.
+#[tokio::test]
+async fn priority_outranks_the_position_a_card_was_dragged_to() {
+    let db = pool().await;
+    let at = "2026-04-13T00:00:00.000Z";
+    seed_ready(&db, "dragged-to-top", "low", 0, at).await;
+    seed_ready(&db, "urgent-at-bottom", "critical", 99, at).await;
+
+    assert_eq!(
+        ordered_ids(&db).await,
+        vec!["urgent-at-bottom", "dragged-to-top"]
+    );
+}
+
+/// Age is the last word, so two cards never sit in an order that depends on
+/// which row the database happened to return first.
+#[tokio::test]
+async fn age_breaks_a_tie_on_priority_and_position() {
+    let db = pool().await;
+    seed_ready(&db, "newer", "medium", 0, "2026-04-13T02:00:00.000Z").await;
+    seed_ready(&db, "older", "medium", 0, "2026-04-13T01:00:00.000Z").await;
+
+    assert_eq!(ordered_ids(&db).await, vec!["older", "newer"]);
+}
+
+/// A typo in the priority column should not jump the queue.
+#[tokio::test]
+async fn an_unrecognised_priority_sorts_last_rather_than_first() {
+    let db = pool().await;
+    let at = "2026-04-13T00:00:00.000Z";
+    seed_ready(&db, "nonsense", "urgent-ish", 0, at).await;
+    seed_ready(&db, "known", "low", 1, at).await;
+
+    assert_eq!(ordered_ids(&db).await, vec!["known", "nonsense"]);
+}

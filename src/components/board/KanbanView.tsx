@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { GitBranch } from "lucide-react";
 import {
   DndContext,
@@ -24,6 +24,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import type { Story, StoryStatus, StoryPriority, StoryLatestRun } from "../../types/board";
 import { KANBAN_COLUMNS } from "../../types/board";
+import { nextUpIds } from "./queue";
 import type { RunStatus } from "../../types/runs";
 import { RUN_STATUS_LABELS, formatCost } from "../../types/runs";
 
@@ -100,9 +101,17 @@ interface StoryCardProps {
   isDragging?: boolean;
   /** Spread onto the drag-handle element (from useSortable). */
   dragProps?: React.HTMLAttributes<HTMLDivElement>;
+  /**
+   * This is the story its assigned agent will pick up next.
+   *
+   * Shown because the ordering alone is not legible when several agents draw
+   * from one column: the top card is next for *someone*, but not necessarily
+   * for the agent you are thinking about.
+   */
+  isNextUp?: boolean;
 }
 
-export function StoryCard({ story, onSelect, isDragging, dragProps }: StoryCardProps) {
+export function StoryCard({ story, onSelect, isDragging, dragProps, isNextUp }: StoryCardProps) {
   return (
     <div
       className={`story-card story-card--${story.type}${isDragging ? " story-card--dragging" : ""}`}
@@ -134,6 +143,14 @@ export function StoryCard({ story, onSelect, isDragging, dragProps }: StoryCardP
         <span className="story-card__assignee">
           {story.assignee ?? "Unassigned"}
         </span>
+        {isNextUp && (
+          <span
+            className="story-card__next-up"
+            title={`Next up for ${story.assignee ?? "its agent"}`}
+          >
+            next up
+          </span>
+        )}
         <RunIndicator run={story.latestRun} />
       </div>
       <div className="story-card__footer">
@@ -151,7 +168,15 @@ export function StoryCard({ story, onSelect, isDragging, dragProps }: StoryCardP
 // SortableCard — wraps StoryCard with useSortable
 // ---------------------------------------------------------------------------
 
-function SortableCard({ story, onSelect }: { story: Story; onSelect: (s: Story) => void }) {
+function SortableCard({
+  story,
+  onSelect,
+  isNextUp,
+}: {
+  story: Story;
+  onSelect: (s: Story) => void;
+  isNextUp?: boolean;
+}) {
   const {
     attributes,
     listeners,
@@ -176,6 +201,7 @@ function SortableCard({ story, onSelect }: { story: Story; onSelect: (s: Story) 
         onSelect={onSelect}
         isDragging={isDragging}
         dragProps={{ ...attributes, ...listeners }}
+        isNextUp={isNextUp}
       />
     </div>
   );
@@ -198,6 +224,13 @@ function KanbanColumn({ status, label, stories, isDragOver, onSelect, emptyMessa
   const { setNodeRef } = useDroppable({ id: status });
   const ids = stories.map(s => s.id);
 
+  // Only Ready is a queue. A card in Backlog or Review is not next for
+  // anybody, and marking one would say something untrue.
+  const nextUp = useMemo(
+    () => (status === "ready" ? nextUpIds(stories) : new Set<string>()),
+    [status, stories],
+  );
+
   return (
     <div
       className={`kb-col${isDragOver ? " kb-col--drag-over" : ""}`}
@@ -213,7 +246,12 @@ function KanbanColumn({ status, label, stories, isDragOver, onSelect, emptyMessa
             <div className="kb-col__empty" aria-hidden>{emptyMessage ?? "Drop here"}</div>
           ) : (
             stories.map(s => (
-              <SortableCard key={s.id} story={s} onSelect={onSelect} />
+              <SortableCard
+                key={s.id}
+                story={s}
+                onSelect={onSelect}
+                isNextUp={nextUp.has(s.id)}
+              />
             ))
           )}
         </SortableContext>

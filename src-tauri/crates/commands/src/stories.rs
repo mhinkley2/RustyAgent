@@ -152,6 +152,16 @@ fn row_to_latest_run(row: &sqlx::sqlite::SqliteRow) -> Option<StoryLatestRun> {
     })
 }
 
+/// The board's order, qualified for this query's `stories s` alias.
+///
+/// Shares `db::story_status::queue_order_sql` with the scheduler. Sorting the
+/// board one way and picking another is the defect this replaces — deciding
+/// priority outranks manual position and then not showing it that way would
+/// recreate the same lie pointing the other direction.
+fn board_order() -> String {
+    db::story_status::queue_order_sql("s.")
+}
+
 /// The board's read, with each story's most recent run joined in.
 ///
 /// Run timestamps are emitted as RFC 3339 rather than passed through.
@@ -203,8 +213,12 @@ pub async fn get_stories(
     let rows = match workspace_id {
         Some(ref ws_id) => {
             let sql = format!(
-                "{} WHERE s.story_type != 'chat' AND (s.workspace_id = ? OR s.workspace_id IS NULL) ORDER BY s.sort_order ASC, s.created_at ASC",
-                SELECT_STORIES
+                "{} WHERE s.story_type != 'chat' AND (s.workspace_id = ? OR s.workspace_id IS NULL) ORDER BY {}",
+                SELECT_STORIES,
+                // The same ordering the scheduler picks by, so the top of the
+                // Ready column is the story an agent takes next rather than
+                // merely the one drawn first.
+                board_order()
             );
             sqlx::query(&sql)
                 .bind(ws_id)
@@ -214,8 +228,12 @@ pub async fn get_stories(
         }
         None => {
             let sql = format!(
-                "{} WHERE s.story_type != 'chat' AND s.workspace_id IS NULL ORDER BY s.sort_order ASC, s.created_at ASC",
-                SELECT_STORIES
+                "{} WHERE s.story_type != 'chat' AND s.workspace_id IS NULL ORDER BY {}",
+                SELECT_STORIES,
+                // The same ordering the scheduler picks by, so the top of the
+                // Ready column is the story an agent takes next rather than
+                // merely the one drawn first.
+                board_order()
             );
             sqlx::query(&sql)
                 .fetch_all(db)
