@@ -23,6 +23,14 @@ pub struct HumanRequest {
     pub id: String,
     /// The human-type story id.
     pub story_id: String,
+    /// The *task* story whose run asked the question, via `parent_run_id`.
+    ///
+    /// Distinct from `story_id`: that one is the synthetic human story, which
+    /// the board deliberately keeps out of its columns. This is the card a user
+    /// would look at to find the work that is blocked, so it is the one that
+    /// can be marked. `None` when the request has no run behind it, or when
+    /// the task story has since been deleted.
+    pub task_story_id: Option<String>,
     /// Title of the human story (also shown as the subject line).
     pub story_title: String,
     /// Which run is paused waiting for this input.
@@ -39,6 +47,12 @@ pub struct HumanRequest {
 pub struct ApprovalRequest {
     pub id: String,
     pub run_id: String,
+    /// The story whose run wants to make this tool call (from JOIN).
+    ///
+    /// Carried so the board can mark the card that is actually blocked rather
+    /// than only announcing a count in a banner. `None` when the run or its
+    /// story has been deleted out from under a still-pending approval.
+    pub story_id: Option<String>,
     /// Friendly story title for context (from JOIN).
     pub story_title: Option<String>,
     pub tool_name: String,
@@ -54,15 +68,24 @@ pub struct ApprovalRequest {
 // ---------------------------------------------------------------------------
 
 /// Return all human-type stories that have not yet been answered.
+///
+/// Oldest first, matching [`get_pending_approvals`]. Both feed the same two
+/// things — a banner button and the dialog the board opens by default — so a
+/// disagreement between them shows up as the board behaving one way for
+/// questions and the other way for approvals. Oldest first is also the order
+/// that unblocks the run that has been stuck longest.
 pub async fn get_pending_human_requests(
     db: &DbPool,
 ) -> Result<Vec<HumanRequest>, String> {
     let rows = sqlx::query(
-        "SELECT s.id, s.title, s.status, s.parent_run_id, s.human_question, s.created_at
+        "SELECT s.id, s.title, s.status, s.parent_run_id, s.human_question, s.created_at,
+                task.id AS task_story_id
          FROM stories s
+         LEFT JOIN story_runs sr ON sr.id = s.parent_run_id
+         LEFT JOIN stories task  ON task.id = sr.story_id
          WHERE s.story_type = 'human'
            AND s.status NOT IN ('done', 'failed')
-         ORDER BY s.created_at DESC",
+         ORDER BY s.created_at ASC",
     )
     .fetch_all(db)
     .await
@@ -75,6 +98,7 @@ pub async fn get_pending_human_requests(
             story_id: r.try_get("id").unwrap_or_default(),
             story_title: r.try_get("title").unwrap_or_default(),
             run_id: r.try_get("parent_run_id").ok().flatten(),
+            task_story_id: r.try_get("task_story_id").ok().flatten(),
             question: r.try_get("human_question").ok().flatten(),
             status: r.try_get("status").unwrap_or_default(),
             created_at: r.try_get("created_at").unwrap_or_default(),
@@ -190,7 +214,7 @@ pub async fn get_pending_approvals(
 ) -> Result<Vec<ApprovalRequest>, String> {
     let rows = sqlx::query(
         "SELECT ar.id, ar.run_id, ar.tool_name, ar.tool_input, ar.status, ar.created_at,
-                s.title AS story_title
+                s.id AS story_id, s.title AS story_title
          FROM approval_requests ar
          LEFT JOIN story_runs sr ON sr.id = ar.run_id
          LEFT JOIN stories s    ON s.id  = sr.story_id
@@ -206,6 +230,7 @@ pub async fn get_pending_approvals(
         .map(|r| ApprovalRequest {
             id: r.try_get("id").unwrap_or_default(),
             run_id: r.try_get("run_id").unwrap_or_default(),
+            story_id: r.try_get("story_id").ok().flatten(),
             story_title: r.try_get("story_title").ok().flatten(),
             tool_name: r.try_get("tool_name").unwrap_or_default(),
             tool_input: r

@@ -11,6 +11,7 @@ function mapRequest(raw: Record<string, unknown>): HumanRequest {
   return {
     id:          String(raw.id ?? ""),
     storyId:     String(raw.story_id ?? raw.id ?? ""),
+    taskStoryId: raw.task_story_id != null ? String(raw.task_story_id) : null,
     storyTitle:  String(raw.story_title ?? ""),
     runId:       raw.run_id != null ? String(raw.run_id) : null,
     question:    raw.question != null ? String(raw.question) : null,
@@ -23,6 +24,7 @@ function mapApproval(raw: Record<string, unknown>): ApprovalRequest {
   return {
     id:          String(raw.id ?? ""),
     runId:       String(raw.run_id ?? ""),
+    storyId:     raw.story_id != null ? String(raw.story_id) : null,
     storyTitle:  raw.story_title != null ? String(raw.story_title) : null,
     toolName:    String(raw.tool_name ?? ""),
     toolInput:   String(raw.tool_input ?? "{}"),

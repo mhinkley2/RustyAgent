@@ -6,6 +6,7 @@
      2. Human story card badge
      3. HumanInputDialog (hid-*)
      4. ApprovalGateDialog (agd-*)
+     5. Card-level "waiting on you" marker
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ─── 1. HITL Banner ─────────────────────────────────────────────────────── */
@@ -346,4 +347,47 @@
 @keyframes slide-up {
   from { transform: translateY(12px); opacity: 0; }
   to   { transform: translateY(0);    opacity: 1; }
+}
+
+/* ─── 5. Card-level "waiting on you" marker ──────────────────────────────────
+   The banners say how many things are blocked. This says which card, on the
+   board itself, and clicking it opens that specific request — the thing the
+   banners could never do. */
+
+.story-card__attention {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: 999px;
+  background: var(--warning-subtle);
+  color: var(--warning);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  /* The card is a drag handle; the marker is not. */
+  touch-action: manipulation;
+  animation: hitl-pulse 2.2s ease-in-out infinite;
+}
+
+.story-card__attention:hover {
+  background: color-mix(in srgb, var(--warning) 22%, transparent);
+  animation: none;
+}
+
+.story-card__attention:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 1px;
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .story-card__attention,
+  .story-card__human-badge {
+    animation: none;
+  }
 }

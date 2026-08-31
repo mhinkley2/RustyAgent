@@ -17,6 +17,7 @@ function rawHuman(overrides: Record<string, unknown> = {}) {
   return {
     id: "hr-1",
     story_id: "story-1",
+    task_story_id: "task-1",
     story_title: "Needs a decision",
     run_id: "run-1",
     question: "Which database?",
@@ -30,6 +31,7 @@ function rawApproval(overrides: Record<string, unknown> = {}) {
   return {
     id: "ap-1",
     run_id: "run-1",
+    story_id: "task-1",
     story_title: "Needs approval",
     tool_name: "file_write",
     tool_input: '{"path":"a.txt"}',
@@ -79,12 +81,46 @@ describe("useHumanRequests — loading and mapping", () => {
     expect(result.current.humanRequests[0]).toEqual({
       id: "hr-1",
       storyId: "story-1",
+      taskStoryId: "task-1",
       storyTitle: "Needs a decision",
       runId: "run-1",
       question: "Which database?",
       status: "pending",
       createdAt: "2026-04-13T00:00:00Z",
     });
+  });
+
+  it("maps snake_case approval fields to camelCase", async () => {
+    backend([], [rawApproval()]);
+
+    const { result } = await renderLoaded();
+
+    expect(result.current.approvalRequests[0]).toEqual({
+      id: "ap-1",
+      runId: "run-1",
+      storyId: "task-1",
+      storyTitle: "Needs approval",
+      toolName: "file_write",
+      toolInput: '{"path":"a.txt"}',
+      status: "pending",
+      createdAt: "2026-04-13T00:00:00Z",
+    });
+  });
+
+  it("keeps an absent story on either request kind as null", async () => {
+    // A question raised outside a run, and an approval whose story has been
+    // deleted. Both stay pending; neither has a card to mark. The string
+    // "null" or "undefined" here would badge a story id that cannot exist.
+    backend(
+      [rawHuman({ task_story_id: null })],
+      [rawApproval({ story_id: undefined, story_title: null })],
+    );
+
+    const { result } = await renderLoaded();
+
+    expect(result.current.humanRequests[0].taskStoryId).toBeNull();
+    expect(result.current.approvalRequests[0].storyId).toBeNull();
+    expect(result.current.approvalRequests[0].storyTitle).toBeNull();
   });
 
   it("keeps a null run_id and question as null rather than the string 'null'", async () => {
