@@ -59,6 +59,31 @@ pub struct PipelineStep {
 
 fn default_max_depth() -> u32 { 1 }
 
+/// Bytes of a step's final message carried forward to the next step.
+///
+/// A hard ceiling on what is carried, marker included — the ellipsis is
+/// subtracted from the budget rather than added on top of it, so a reader
+/// budgeting for this figure gets it.
+const HANDOFF_MAX_BYTES: usize = 8192;
+
+/// What a shortened handoff ends with, and what it costs.
+const HANDOFF_ELLIPSIS: &str = "…";
+
+/// A step's final message, shortened to what the next step is given.
+///
+/// Named rather than inline because of what it used to do: it sliced at
+/// `&s[..8192]`, which panics when byte 8192 lands inside a codepoint. A reply
+/// containing a table, an emoji or any CJK text arranges that, and every
+/// sequential pipeline passes its handoff through here.
+pub(crate) fn handoff_output(message: String) -> String {
+    if message.len() <= HANDOFF_MAX_BYTES {
+        return message;
+    }
+    let budget = HANDOFF_MAX_BYTES - HANDOFF_ELLIPSIS.len();
+    let cut = tools::read_cap::floor_char_boundary(&message, budget);
+    format!("{}{HANDOFF_ELLIPSIS}", &message[..cut])
+}
+
 // ---------------------------------------------------------------------------
 // Runtime progress types returned to the frontend
 // ---------------------------------------------------------------------------
@@ -772,6 +797,13 @@ async fn fire_step_run(
     // Build spawn_subtask callback.
     // IMPORTANT: Do NOT call fire_step_run recursively here — that would create a
     // self-referential future that the compiler cannot prove is Send.
+    //
+    // Also deliberately NOT routed through `run_bounded`: a spawned subtask
+    // takes no permit from the parallel-step semaphore. A parent sitting in
+    // `wait_for_subtask` is holding its own step permit for the whole wait, so
+    // if its child needed one too, a fan-out at the ceiling would deadlock —
+    // the parent waiting on a child queued behind the parent. Keep it that way,
+    // or make the parent release its permit first.
     // Instead, delegate to run_subtask_impl which is a separate non-recursive fn.
     let db_for_spawn = db.clone();
     let app_for_spawn = app.clone();
@@ -797,6 +829,14 @@ async fn fire_step_run(
     completion_config.system_prompt = system_prompt;
 
     let cancel = runtime::CancelFlag::new();
+
+    // What lets `wait_for_subtask` notice this run was stopped, and stop the
+    // children it was waiting on. Built here because this is the only place
+    // holding both halves: the flag is created on the line above, and the
+    // registry is the same map `stop_run` reaches for.
+    let run_control: std::sync::Arc<dyn tools::RunControl> = std::sync::Arc::new(
+        runtime::RegistryRunControl::new(cancel.clone(), pipeline.run_registry.clone()),
+    );
 
     let pipeline_run_id_str = pipeline_run_id.to_string();
     let registry_arc = Arc::new(tokio::sync::Mutex::new(registry));
@@ -825,6 +865,7 @@ async fn fire_step_run(
     )
     .await
     .context("Failed to create ConversationRuntime for pipeline step")?;
+    rt.run_control = Some(run_control);
 
     // Give the loop the profile's context settings. Set here rather than
     // passed to the constructor, which already carries far too many
@@ -897,9 +938,11 @@ async fn fire_step_run(
     .flatten()
     .and_then(|row| row.try_get::<String, _>("content").ok());
 
-    let output = last_assistant.map(|s| {
-        if s.len() > 8192 { format!("{}…", &s[..8192]) } else { s }
-    });
+    // Cut on a character boundary. `&s[..8192]` panics when byte 8192 lands
+    // inside a codepoint, which a reply containing a box-drawing table, an
+    // emoji or any CJK text can easily arrange — and this is the handoff every
+    // sequential pipeline step passes through.
+    let output = last_assistant.map(handoff_output);
 
     Ok((run_id, output))
 }

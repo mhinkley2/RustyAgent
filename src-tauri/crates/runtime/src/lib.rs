@@ -25,5 +25,7 @@ pub use approval_gate::ApprovalGate;
 pub use notifier::AppNotifier;
 pub use context::{ContextPolicy, ContextStrategy};
 pub use permission::{PermissionPolicy, PolicyDecision, ToolRequest};
-pub use runtime::{ApprovalOutcome, CancelFlag, ConversationRuntime, RunEvent};
+pub use runtime::{
+    ApprovalOutcome, CancelFlag, ConversationRuntime, RegistryRunControl, RunEvent,
+};
 pub use worktree::{Isolation, RunWorktree};

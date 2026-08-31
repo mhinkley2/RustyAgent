@@ -279,3 +279,57 @@ async fn an_unknown_step_starts_no_chain() {
 
     assert_eq!(step_tip("nope", &db).await, None);
 }
+
+// ---------------------------------------------------------------------------
+// The sequential handoff
+// ---------------------------------------------------------------------------
+
+mod handoff {
+    use crate::{handoff_output, HANDOFF_MAX_BYTES};
+
+    #[test]
+    fn a_short_message_is_carried_whole() {
+        assert_eq!(handoff_output("done".into()), "done");
+    }
+
+    #[test]
+    fn a_message_exactly_at_the_cap_is_left_alone() {
+        let message = "x".repeat(HANDOFF_MAX_BYTES);
+        assert_eq!(handoff_output(message.clone()), message);
+    }
+
+    #[test]
+    fn a_long_message_is_cut_and_marked() {
+        let out = handoff_output("x".repeat(HANDOFF_MAX_BYTES * 2));
+        assert!(out.ends_with('…'), "a shortened handoff should say so");
+        assert!(out.starts_with("xxxx"));
+    }
+
+    #[test]
+    fn the_cap_includes_the_ellipsis_it_appends() {
+        // Otherwise the constant is not the ceiling it claims: the marker was
+        // added on top of the budget rather than taken out of it.
+        let out = handoff_output("x".repeat(HANDOFF_MAX_BYTES * 2));
+        assert!(out.len() <= HANDOFF_MAX_BYTES, "carried {} bytes", out.len());
+    }
+
+    #[test]
+    fn cutting_never_splits_a_codepoint() {
+        // The panic this function exists for. A reply full of box-drawing
+        // characters is ordinary, and slicing at a fixed byte offset inside one
+        // brings the whole pipeline step down.
+        let out = handoff_output("│".repeat(HANDOFF_MAX_BYTES));
+        assert!(out.ends_with('…'));
+        assert!(out.len() <= HANDOFF_MAX_BYTES);
+        // Round-trips as UTF-8, which is the whole point.
+        assert!(out.chars().all(|c| c == '│' || c == '…'));
+    }
+
+    #[test]
+    fn an_emoji_at_the_boundary_does_not_panic() {
+        let mut message = "a".repeat(HANDOFF_MAX_BYTES - 2);
+        message.push_str("🙂🙂🙂");
+        let out = handoff_output(message);
+        assert!(out.len() <= HANDOFF_MAX_BYTES);
+    }
+}
