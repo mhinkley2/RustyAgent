@@ -68,6 +68,12 @@ pub struct ApprovalRequest {
 // ---------------------------------------------------------------------------
 
 /// Return all human-type stories that have not yet been answered.
+///
+/// Oldest first, matching [`get_pending_approvals`]. Both feed the same two
+/// things — a banner button and the dialog the board opens by default — so a
+/// disagreement between them shows up as the board behaving one way for
+/// questions and the other way for approvals. Oldest first is also the order
+/// that unblocks the run that has been stuck longest.
 pub async fn get_pending_human_requests(
     db: &DbPool,
 ) -> Result<Vec<HumanRequest>, String> {
@@ -79,7 +85,7 @@ pub async fn get_pending_human_requests(
          LEFT JOIN stories task  ON task.id = sr.story_id
          WHERE s.story_type = 'human'
            AND s.status NOT IN ('done', 'failed')
-         ORDER BY s.created_at DESC",
+         ORDER BY s.created_at ASC",
     )
     .fetch_all(db)
     .await

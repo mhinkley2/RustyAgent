@@ -21,25 +21,51 @@ async fn pool() -> DbPool {
 
 /// Insert the synthetic story the `request_human_input` tool creates.
 async fn seed_human_story(db: &DbPool, id: &str, parent_run_id: Option<&str>) {
+    seed_human_story_at(db, id, parent_run_id, "2026-08-31T00:00:00.000Z").await;
+}
+
+/// As [`seed_human_story`], with an explicit creation time so a test can order
+/// two of them.
+async fn seed_human_story_at(
+    db: &DbPool,
+    id: &str,
+    parent_run_id: Option<&str>,
+    created_at: &str,
+) {
     sqlx::query(
-        "INSERT INTO stories (id, title, story_type, status, parent_run_id, human_question)
-         VALUES (?, 'Which database?', 'human', 'ready', ?, 'Postgres or SQLite?')",
+        "INSERT INTO stories
+             (id, title, story_type, status, parent_run_id, human_question, created_at)
+         VALUES (?, 'Which database?', 'human', 'ready', ?, 'Postgres or SQLite?', ?)",
     )
     .bind(id)
     .bind(parent_run_id)
+    .bind(created_at)
     .execute(db)
     .await
     .expect("seed a human story");
 }
 
 async fn seed_approval(db: &DbPool, id: &str, run_id: &str, status: &str) {
+    seed_approval_at(db, id, run_id, status, "2026-08-31T00:00:00.000Z").await;
+}
+
+/// As [`seed_approval`], with an explicit creation time.
+async fn seed_approval_at(
+    db: &DbPool,
+    id: &str,
+    run_id: &str,
+    status: &str,
+    created_at: &str,
+) {
     sqlx::query(
-        "INSERT INTO approval_requests (id, run_id, tool_name, tool_input, status)
-         VALUES (?, ?, 'file_write', '{\"path\":\"a.txt\"}', ?)",
+        "INSERT INTO approval_requests
+             (id, run_id, tool_name, tool_input, status, created_at)
+         VALUES (?, ?, 'file_write', '{\"path\":\"a.txt\"}', ?, ?)",
     )
     .bind(id)
     .bind(run_id)
     .bind(status)
+    .bind(created_at)
     .execute(db)
     .await
     .expect("seed an approval request");
@@ -185,4 +211,42 @@ async fn two_approvals_on_one_story_both_name_it() {
     for approval in &approvals {
         assert_eq!(approval.story_id.as_deref(), Some("task-1"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ordering
+// ---------------------------------------------------------------------------
+//
+// Both banners open `[0]`, and the board opens `[0]` by default. If these two
+// reads disagree, the board answers "which one is waiting on me" one way for
+// questions and the other way for approvals, from the same press.
+
+#[tokio::test]
+async fn pending_human_requests_come_back_oldest_first() {
+    let db = pool().await;
+    seed_human_story_at(&db, "newer", None, "2026-08-31T12:00:00.000Z").await;
+    seed_human_story_at(&db, "older", None, "2026-08-31T09:00:00.000Z").await;
+
+    let requests = get_pending_human_requests(&db).await.expect("read");
+
+    let ids: Vec<&str> = requests.iter().map(|r| r.story_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["older", "newer"],
+        "the run stuck longest is the one to unblock first",
+    );
+}
+
+#[tokio::test]
+async fn pending_approvals_come_back_oldest_first() {
+    let db = pool().await;
+    seed_story(&db, "task-1", "Migrate the database", "in_progress").await;
+    seed_run(&db, "run-1", "task-1", PROFILE).await;
+    seed_approval_at(&db, "newer", "run-1", "pending", "2026-08-31T12:00:00.000Z").await;
+    seed_approval_at(&db, "older", "run-1", "pending", "2026-08-31T09:00:00.000Z").await;
+
+    let approvals = get_pending_approvals(&db).await.expect("read");
+
+    let ids: Vec<&str> = approvals.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, ["older", "newer"]);
 }

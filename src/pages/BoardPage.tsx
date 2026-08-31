@@ -280,9 +280,12 @@ export default function BoardPage() {
           </span>
           <button
             className="btn btn--primary btn--xs"
-            // The oldest request, dismissed or not. The button has to work in
-            // exactly the case you would reach for it, which is when you have
-            // dismissed everything and want one back.
+            // `[0]` is the oldest: both reads come back `created_at ASC`, so
+            // this unblocks the run that has been stuck longest.
+            //
+            // Dismissed or not — the button has to work in exactly the case you
+            // would reach for it, which is when you have dismissed everything
+            // and want one back.
             onClick={() => openRequest(humanRequests[0].id)}
           >
             Respond
@@ -299,6 +302,7 @@ export default function BoardPage() {
           </span>
           <button
             className="btn btn--primary btn--xs"
+            // Same rule as Respond above: oldest first, dismissed or not.
             onClick={() => openRequest(approvalRequests[0].id)}
           >
             Review
