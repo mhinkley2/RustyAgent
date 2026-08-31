@@ -23,6 +23,7 @@ pub fn register_builtins(registry: &mut ToolRegistry, _db: DbPool) {
     registry.register(Box::new(notify::SendNotificationTool));
     registry.register(Box::new(subtask::SpawnSubtaskTool));
     registry.register(Box::new(run::GetRunTool));
+    registry.register(Box::new(run::WaitForSubtaskTool));
     registry.register(Box::new(file::FileReadTool));
     registry.register(Box::new(file::FileWriteTool));
     registry.register(Box::new(file::FileEditTool));

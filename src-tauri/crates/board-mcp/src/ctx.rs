@@ -87,6 +87,7 @@ impl McpCtx {
             // No desktop to notify through from this process. `send_notification`
             // is not among the adapted tools, and if it ever were it would now
             // report the failure rather than claim delivery.
+            run_control: None,
             notifier: None,
         }
     }

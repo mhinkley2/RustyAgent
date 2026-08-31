@@ -141,6 +141,29 @@ pub enum NotificationCategory {
     RunCompleted,
 }
 
+/// How a tool reaches the run machinery it is executing inside.
+///
+/// A tool that returns promptly needs none of this. `wait_for_subtask` does not
+/// return promptly — it sits inside one tool call for as long as its children
+/// take — so for the length of that call it is the only thing in a position to
+/// notice that the run was stopped, and the only thing that knows which
+/// children are still owed an answer.
+///
+/// A trait object rather than the flag itself, because the flag lives in
+/// `runtime` and `runtime` depends on this crate. Same shape as `spawn_subtask`
+/// and `notifier` above it.
+pub trait RunControl: Send + Sync {
+    /// Whether the run this tool is executing inside has been asked to stop.
+    fn is_cancelled(&self) -> bool;
+
+    /// Ask another run to stop.
+    ///
+    /// Best-effort: a run that has already finished, or that this process does
+    /// not know about, is not an error — it is the normal race between a parent
+    /// giving up and a child finishing on its own.
+    fn cancel_run(&self, run_id: &str);
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     pub db: DbPool,
@@ -160,6 +183,12 @@ pub struct ToolContext {
     /// How `send_notification` reaches the desktop. `None` where no desktop
     /// exists to reach — the stdio MCP binary, and most tests.
     pub notifier: Option<Arc<dyn Notifier>>,
+    /// How a long-running tool observes cancellation and stops other runs.
+    ///
+    /// `None` outside a pipeline and on the MCP surface, where nothing can
+    /// spawn children to wait on in the first place. A tool that needs it must
+    /// degrade rather than refuse — see [`RunControl`].
+    pub run_control: Option<Arc<dyn RunControl>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +361,7 @@ pub(crate) mod test_support {
             spawn_subtask: None,
             workspace_root: None,
             notifier: None,
+            run_control: None,
         }
     }
 }

@@ -279,6 +279,55 @@ impl CancelFlag {
     }
 }
 
+/// [`tools::RunControl`] backed by the app-wide run registry.
+///
+/// The registry is the same `HashMap<run_id, CancelFlag>` that `stop_run`
+/// reaches for, so a tool cancelling a child cancels it exactly the way the
+/// Stop button does — one mechanism, not a parallel one that could drift.
+///
+/// Built where both halves are already in hand: the pipeline creates a run's
+/// flag and holds the registry, so it is the only place that can pair them.
+pub struct RegistryRunControl {
+    /// The flag of the run whose tool call is executing.
+    own: CancelFlag,
+    registry: Arc<std::sync::Mutex<std::collections::HashMap<String, CancelFlag>>>,
+}
+
+impl RegistryRunControl {
+    pub fn new(
+        own: CancelFlag,
+        registry: Arc<std::sync::Mutex<std::collections::HashMap<String, CancelFlag>>>,
+    ) -> Self {
+        Self { own, registry }
+    }
+}
+
+impl tools::RunControl for RegistryRunControl {
+    fn is_cancelled(&self) -> bool {
+        self.own.is_cancelled()
+    }
+
+    fn cancel_run(&self, run_id: &str) {
+        // A poisoned registry mutex must not take the process down over a
+        // best-effort cancellation. Nothing here can leave it inconsistent —
+        // the map is only read — so the poison is recovered from rather than
+        // propagated.
+        let flag = match self.registry.lock() {
+            Ok(registry) => registry.get(run_id).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(run_id).cloned(),
+        };
+        match flag {
+            Some(flag) => {
+                info!(run_id, "Cancelling a subtask its parent stopped waiting for");
+                flag.cancel();
+            }
+            // The ordinary race: the child finished and deregistered while the
+            // parent was deciding to give up.
+            None => debug!(run_id, "No live run to cancel"),
+        }
+    }
+}
+
 impl Default for CancelFlag {
     fn default() -> Self {
         Self::new()
@@ -314,6 +363,9 @@ pub struct ConversationRuntime {
     pub db: DbPool,
     pub app: Arc<dyn EventSink>,
     pub cancel: CancelFlag,
+    /// How a long-running tool observes this run's cancellation and stops the
+    /// children it is waiting on. Set by the pipeline, which owns both halves.
+    pub run_control: Option<Arc<dyn tools::RunControl>>,
     /// Semantic + episodic memory for this agent profile. None when the profile
     /// has `persistent_memory = false`.
     pub memory: Option<MemoryStore>,
@@ -512,6 +564,7 @@ impl ConversationRuntime {
             db,
             app,
             cancel,
+            run_control: None,
             memory,
             pipeline_run_id,
             pipeline_depth,
@@ -1016,6 +1069,7 @@ impl ConversationRuntime {
                 pipeline_depth: self.pipeline_depth,
                 spawn_subtask: self.spawn_subtask.clone(),
                 workspace_root: self.workspace_root.clone(),
+                run_control: self.run_control.clone(),
             };
 
             // Clone the Arc out of the registry before the await so we don't
