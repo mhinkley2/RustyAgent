@@ -9,15 +9,22 @@ export interface ModelOption {
   value: string;
   label: string;
   /**
-   * Whether the app can cost a run on this model.
+   * Whether the app can cost a run on this model, or `null` for "not asked yet".
    *
    * An unpriced model still runs. It records no cost and budgets its context at
    * the conservative default rather than its real window — two things a user
    * reads later, degrading quietly. The editor says so at the point of choosing.
+   *
+   * Three-valued because the built-in list genuinely does not know: only the
+   * backend holds the price table, and guessing in either direction is worse
+   * than admitting it. A warning fires on `false`, never on `null`.
    */
-  priced: boolean;
-  /** The window the app will budget with, in tokens — not necessarily the model's. */
-  contextWindow: number;
+  priced: boolean | null;
+  /**
+   * The window the app will budget with, in tokens — not necessarily the
+   * model's own. `null` alongside an unknown `priced`.
+   */
+  contextWindow: number | null;
 }
 
 interface RawModelOption {
@@ -28,20 +35,22 @@ interface RawModelOption {
 }
 
 /**
- * The static catalogue, as `ModelOption`s.
+ * The static catalogue, as `ModelOption`s, with pricing left unanswered.
  *
- * Everything in `PROVIDER_MODELS` is priced by construction — a drift test
- * fails the build otherwise — so the fallback claims so rather than warning
- * about models it has no reason to doubt. `contextWindow` is 0 to mean "not
- * known here"; the fallback is used precisely when the backend has not
- * answered, and inventing a number would be worse than admitting that.
+ * It would be convenient to claim these are all priced. They are not: the
+ * price table covers Anthropic models only, so every DeepSeek and OpenRouter
+ * id in `PROVIDER_MODELS` is unpriced today. Claiming otherwise here would
+ * suppress the warning for exactly the providers that need it.
+ *
+ * The honest answer is that this list does not know — only the backend holds
+ * the table — so it says so, and the warning waits for a real answer.
  */
 function staticOptions(provider: Provider): ModelOption[] {
   return PROVIDER_MODELS[provider].map(m => ({
     value: m.value,
     label: m.label,
-    priced: true,
-    contextWindow: 0,
+    priced: null,
+    contextWindow: null,
   }));
 }
 

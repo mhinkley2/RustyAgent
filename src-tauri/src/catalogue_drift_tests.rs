@@ -145,3 +145,53 @@ fn the_offline_fallback_offers_the_same_models_as_the_editor() {
         "the two hand-written catalogues have drifted apart",
     );
 }
+
+/// Providers whose every offered model is in the price table.
+///
+/// Anthropic alone, today. Not an oversight to fix in passing — inventing rates
+/// for the others would be worse than recording none, and a wrong price is a
+/// wrong invoice.
+const PRICED_PROVIDERS: [&str; 1] = ["anthropic"];
+
+/// Providers whose runs currently report no cost at all.
+const UNPRICED_PROVIDERS: [&str; 2] = ["deepseek", "openrouter"];
+
+#[test]
+fn the_providers_the_app_cannot_price_are_the_ones_recorded_here() {
+    // This is a gap, written down. Every DeepSeek and OpenRouter run records
+    // zero cost today — not an estimate, zero — and nothing in the app says so
+    // except the editor's warning, which relies on `pricing` genuinely not
+    // knowing them.
+    //
+    // It is asserted in both directions on purpose. Adding rates for one of
+    // these providers should fail this test and send the author here to move
+    // its name, rather than leaving two stale lists behind.
+    let source = agent_ts();
+
+    for provider in PRICED_PROVIDERS {
+        let unpriced: Vec<String> = frontend_models(&source, provider)
+            .into_iter()
+            .filter(|id| api::pricing::lookup(id).is_none())
+            .collect();
+        assert!(
+            unpriced.is_empty(),
+            "{provider} is listed as priced but offers {unpriced:?}, which PRICES does not know",
+        );
+    }
+
+    for provider in UNPRICED_PROVIDERS {
+        let models = frontend_models(&source, provider);
+        assert!(
+            !models.is_empty(),
+            "no models parsed for {provider} — the parser or the catalogue has moved",
+        );
+        let priced: Vec<String> = models
+            .into_iter()
+            .filter(|id| api::pricing::lookup(id).is_some())
+            .collect();
+        assert!(
+            priced.is_empty(),
+            "{provider} now has rates for {priced:?}. Move it to PRICED_PROVIDERS — its runs              will start reporting real costs, and the editor will stop warning about them.",
+        );
+    }
+}

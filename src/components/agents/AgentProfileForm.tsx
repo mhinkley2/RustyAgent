@@ -218,7 +218,7 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
   // The provider's own catalogue, falling back to the built-in list. Asking
   // the provider is what stops the editor offering ids that were retired
   // months ago — the drift that shipped four unusable models once already.
-  const { models: catalogue } = useProviderModels(form.provider);
+  const { models: catalogue, loading: catalogueLoading } = useProviderModels(form.provider);
   const modelOptions: SelectOption[] = catalogue.map(m => ({
     value: m.value,
     label: m.label,
@@ -233,7 +233,7 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
    * default rather than the model's real window. A user reading a cost report
    * would have no way to tell the difference from a free run.
    */
-  const unpricedModel = catalogue.find(m => m.value === form.model && !m.priced);
+  const unpricedModel = catalogue.find(m => m.value === form.model && m.priced === false);
 
   // When provider changes, clear the model
   const handleProviderChange = (v: Provider | "") => {
@@ -368,13 +368,19 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
             }
           </FormField>
 
+          {catalogueLoading && form.model && (
+            <p className="agent-form__hint" role="status">
+              Checking this model against the provider's catalogue…
+            </p>
+          )}
+
           {unpricedModel && (
             <p className="agent-form__hint agent-form__hint--warning" role="status">
               This app has no price or context window on record for{" "}
               <code>{unpricedModel.value}</code>. Runs will work, but will report
               no cost and will budget{" "}
-              {unpricedModel.contextWindow.toLocaleString()} tokens of context
-              rather than the model's real window.
+              {(unpricedModel.contextWindow ?? 0).toLocaleString()} tokens of
+              context rather than the model's real window.
             </p>
           )}
         </section>

@@ -105,15 +105,18 @@ describe("useProviderModels", () => {
     expect(result.current.isFallback).toBe(true);
   });
 
-  it("treats every built-in model as priced", async () => {
-    // A drift test fails the build if that stops being true, so the fallback
-    // must not warn about models it has no reason to doubt.
+  it("does not claim the built-in models are priced", async () => {
+    // The tempting shortcut, and wrong: the price table covers Anthropic only,
+    // so every DeepSeek and OpenRouter id in the built-in list is unpriced.
+    // Claiming otherwise would suppress the warning for exactly the providers
+    // that need it. Unknown is the honest answer until the backend replies.
     tauriMock.handleAll({ list_provider_models: () => [] });
 
     const { result } = renderHook(() => useProviderModels("deepseek"));
 
     await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.models.every(m => m.priced)).toBe(true);
+    expect(result.current.models.every(m => m.priced === null)).toBe(true);
+    expect(result.current.models.every(m => m.contextWindow === null)).toBe(true);
   });
 
   it("refetches when the provider changes", async () => {
