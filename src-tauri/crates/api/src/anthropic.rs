@@ -5,7 +5,9 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tracing::debug;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 use crate::{
     error::ApiError,
@@ -16,9 +18,69 @@ use crate::{
 const BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// How long a fetched catalogue is reused before another call re-fetches it.
+///
+/// `list_models` is a trait method callers treat as cheap, and the settings
+/// screen calls it on every open. A model catalogue changes a few times a year,
+/// so an hour is generous and still means at most one request per app session
+/// in ordinary use.
+const CATALOGUE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// The catalogue used when the API cannot be reached.
+///
+/// Not a convenience. An empty dropdown makes the app look broken, and the
+/// cases that produce one — no key configured yet, an offline laptop, a rate
+/// limit — are all ordinary. This is the last hand-maintained copy of this
+/// list; the API is the source of truth whenever it can be reached.
+const FALLBACK_MODELS: [&str; 5] = [
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+    "claude-opus-4-8",
+    "claude-fable-5",
+];
+
+/// One model as the provider describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// What the provider calls it, for a dropdown. Falls back to the id.
+    pub display_name: String,
+    /// The model's real context window, when the provider reports one.
+    ///
+    /// Anthropic's Models API does not return this today — it carries `id`,
+    /// `display_name`, `created_at` and `type`. Parsed as an `Option` so the
+    /// day it does, the table in `pricing.rs` stops being the authority
+    /// without another round of this work.
+    pub max_input_tokens: Option<u32>,
+}
+
+impl ModelInfo {
+    fn from_id(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            max_input_tokens: None,
+        }
+    }
+}
+
+/// A catalogue and when it was fetched.
+struct CachedCatalogue {
+    models: Vec<ModelInfo>,
+    fetched_at: Instant,
+}
+
 pub struct AnthropicClient {
     client: Client,
     api_key: String,
+    base_url: String,
+    /// The last catalogue fetched, and when.
+    ///
+    /// A `std::sync::Mutex` rather than tokio's: it is held only to read or
+    /// replace the value, never across an await, and the guard is dropped
+    /// before any network call begins.
+    catalogue: Arc<Mutex<Option<CachedCatalogue>>>,
 }
 
 impl AnthropicClient {
@@ -26,7 +88,86 @@ impl AnthropicClient {
         Self {
             client: Client::new(),
             api_key: api_key.into(),
+            base_url: BASE_URL.to_string(),
+            catalogue: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Point the client at a different origin. For tests.
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    /// The model catalogue, fetched at most once per [`CATALOGUE_TTL`].
+    ///
+    /// Never fails. Every reason the call can go wrong — no key, no network, a
+    /// rate limit, a shape this build does not understand — resolves to the
+    /// fallback, because a caller populating a dropdown has nothing useful to
+    /// do with an error and a user has nothing useful to do with an empty list.
+    pub async fn catalogue(&self) -> Vec<ModelInfo> {
+        if let Some(cached) = self.cached_catalogue() {
+            return cached;
+        }
+
+        match self.fetch_catalogue().await {
+            Ok(models) if !models.is_empty() => {
+                self.store_catalogue(models.clone());
+                models
+            }
+            // An empty catalogue is treated as a failure rather than cached.
+            // Believing the provider has no models would empty the dropdown
+            // for an hour on one odd response.
+            Ok(_) => {
+                warn!("Anthropic returned an empty model catalogue; using the built-in list");
+                fallback_catalogue()
+            }
+            Err(error) => {
+                // The key is in a header, never in the URL, and `ApiError`
+                // carries only the status and body — so this cannot print it.
+                warn!("Could not fetch the Anthropic model catalogue: {error}");
+                fallback_catalogue()
+            }
+        }
+    }
+
+    fn cached_catalogue(&self) -> Option<Vec<ModelInfo>> {
+        let guard = self.catalogue.lock().ok()?;
+        let cached = guard.as_ref()?;
+        (cached.fetched_at.elapsed() < CATALOGUE_TTL).then(|| cached.models.clone())
+    }
+
+    fn store_catalogue(&self, models: Vec<ModelInfo>) {
+        if let Ok(mut guard) = self.catalogue.lock() {
+            *guard = Some(CachedCatalogue {
+                models,
+                fetched_at: Instant::now(),
+            });
+        }
+    }
+
+    async fn fetch_catalogue(&self) -> Result<Vec<ModelInfo>, ApiError> {
+        let response = self
+            .client
+            .get(format!("{}/models?limit=100", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // The body, not the request: nothing here echoes the key back.
+            let body = response.text().await.unwrap_or_default();
+            return Err(ApiError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let body: Value = response.json().await?;
+        Ok(parse_catalogue(&body))
     }
 
     fn build_request_body(
@@ -399,20 +540,52 @@ impl LlmProvider for AnthropicClient {
     }
 
     async fn list_models(&self) -> Result<Vec<String>, ApiError> {
-        // Hardcoded rather than fetched. Anthropic does expose `GET /v1/models`,
-        // which would also carry each model's real context window — worth moving
-        // to, but it is a network call on a trait method callers treat as cheap.
-        //
-        // Keep this in step with the frontend catalogue in `src/types/agent.ts`
-        // and with the PRICES / CONTEXT_WINDOWS tables in `pricing.rs`.
-        Ok(vec![
-            "claude-opus-5".to_string(),
-            "claude-sonnet-5".to_string(),
-            "claude-haiku-4-5".to_string(),
-            "claude-opus-4-8".to_string(),
-            "claude-fable-5".to_string(),
-        ])
+        // Fetched, cached for an hour, and never an error: see
+        // `AnthropicClient::catalogue`. Callers treat this method as cheap, and
+        // within the TTL it is.
+        Ok(self
+            .catalogue()
+            .await
+            .into_iter()
+            .map(|model| model.id)
+            .collect())
     }
+}
+
+/// The built-in catalogue, as [`ModelInfo`].
+fn fallback_catalogue() -> Vec<ModelInfo> {
+    FALLBACK_MODELS.iter().map(|id| ModelInfo::from_id(id)).collect()
+}
+
+/// Read a `GET /v1/models` body.
+///
+/// Tolerant on purpose. An entry without an `id` is the only thing that makes a
+/// model unusable, so that one is dropped; everything else the provider adds or
+/// renames later degrades to a default rather than failing the whole fetch and
+/// emptying a dropdown.
+fn parse_catalogue(body: &Value) -> Vec<ModelInfo> {
+    let Some(entries) = body.get("data").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?;
+            Some(ModelInfo {
+                id: id.to_string(),
+                display_name: entry
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_string(),
+                max_input_tokens: entry
+                    .get("max_input_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1048,3 +1221,236 @@ mod tests {
         assert_eq!(usage.output_tokens, 3);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The model catalogue
+// ---------------------------------------------------------------------------
+//
+// Four hand-maintained lists had to agree and only two were cross-checked. The
+// drift shipped once already: three retired ids and one that was never valid
+// were selectable in the profile editor, each of which would have failed on
+// first use. These pin the replacement — fetch, cache, and above all fall back,
+// because the failure modes here are all ordinary.
+
+#[cfg(test)]
+mod catalogue {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A one-shot HTTP server that answers every request the same way.
+    ///
+    /// Hand-rolled rather than a mocking crate: this needs one route and a
+    /// request count, and `tokio` is already here.
+    struct StubServer {
+        base_url: String,
+        requests: Arc<AtomicUsize>,
+    }
+
+    async fn stub(status: u16, body: &'static str) -> StubServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read the request line so the client is not writing into a
+                // socket nobody drained.
+                let mut scratch = [0u8; 1024];
+                let _ = socket.read(&mut scratch).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        StubServer {
+            base_url: format!("http://127.0.0.1:{port}"),
+            requests,
+        }
+    }
+
+    fn client_for(server: &StubServer) -> AnthropicClient {
+        AnthropicClient::new("sk-ant-secret").with_base_url(&server.base_url)
+    }
+
+    const TWO_MODELS: &str = r#"{"data":[
+        {"id":"claude-opus-5","display_name":"Claude Opus 5","type":"model"},
+        {"id":"claude-sonnet-5","display_name":"Claude Sonnet 5","type":"model"}
+    ]}"#;
+
+    // -- parsing ------------------------------------------------------------
+
+    #[test]
+    fn a_catalogue_body_yields_its_models() {
+        let body: Value = serde_json::from_str(TWO_MODELS).expect("valid json");
+
+        let models = parse_catalogue(&body);
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "claude-opus-5");
+        assert_eq!(models[0].display_name, "Claude Opus 5");
+        assert_eq!(models[0].max_input_tokens, None);
+    }
+
+    #[test]
+    fn a_model_without_a_display_name_falls_back_to_its_id() {
+        let body = json!({ "data": [{ "id": "claude-opus-5" }] });
+
+        let models = parse_catalogue(&body);
+
+        assert_eq!(models[0].display_name, "claude-opus-5");
+    }
+
+    #[test]
+    fn a_context_window_is_read_when_the_provider_reports_one() {
+        // Anthropic does not return this today. Parsed anyway so the day it
+        // does, the hand-kept table stops being the authority for free.
+        let body = json!({ "data": [{ "id": "m", "max_input_tokens": 200_000 }] });
+
+        assert_eq!(parse_catalogue(&body)[0].max_input_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn an_entry_with_no_id_is_dropped_rather_than_failing_the_fetch() {
+        // An id is the only field that makes a model usable. Everything else
+        // the provider might add or rename should degrade, not empty a dropdown.
+        let body = json!({ "data": [{ "display_name": "Mystery" }, { "id": "real" }] });
+
+        let models = parse_catalogue(&body);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "real");
+    }
+
+    #[test]
+    fn a_body_of_an_unexpected_shape_yields_nothing_rather_than_panicking() {
+        assert!(parse_catalogue(&json!({})).is_empty());
+        assert!(parse_catalogue(&json!({ "data": "not an array" })).is_empty());
+        assert!(parse_catalogue(&json!([])).is_empty());
+    }
+
+    // -- fetching, caching, falling back ------------------------------------
+
+    #[tokio::test]
+    async fn the_provider_catalogue_is_what_list_models_returns() {
+        let server = stub(200, TWO_MODELS).await;
+
+        let models = client_for(&server).list_models().await.expect("never errors");
+
+        assert_eq!(models, ["claude-opus-5", "claude-sonnet-5"]);
+    }
+
+    #[tokio::test]
+    async fn repeated_calls_within_the_ttl_make_one_request() {
+        // `list_models` is a trait method callers treat as cheap, and the
+        // settings screen calls it on every open.
+        let server = stub(200, TWO_MODELS).await;
+        let client = client_for(&server);
+
+        for _ in 0..5 {
+            let models = client.list_models().await.expect("never errors");
+            assert_eq!(models.len(), 2);
+        }
+
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_api_yields_the_built_in_list_rather_than_an_error() {
+        let server = stub(500, r#"{"error":"upstream is unhappy"}"#).await;
+
+        let models = client_for(&server).list_models().await.expect("never errors");
+
+        assert_eq!(models, FALLBACK_MODELS);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_yields_the_built_in_list() {
+        // The state a user is in before configuring a provider — and the one
+        // most likely to be read as "the app is broken" if it emptied the list.
+        let server = stub(401, r#"{"type":"error","error":{"type":"authentication_error"}}"#).await;
+
+        let models = client_for(&server).list_models().await.expect("never errors");
+
+        assert_eq!(models, FALLBACK_MODELS);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_api_yields_the_built_in_list() {
+        // A port that was just released, so the connection is refused at once.
+        // An unroutable address would exercise the same path but would spend
+        // the connect timeout doing it, and this runs on every CI build.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let client =
+            AnthropicClient::new("sk-ant-secret").with_base_url(format!("http://127.0.0.1:{port}"));
+
+        let models = client.list_models().await.expect("never errors");
+
+        assert_eq!(models, FALLBACK_MODELS);
+    }
+
+    #[tokio::test]
+    async fn an_empty_catalogue_is_not_cached_as_the_answer() {
+        // Believing the provider has no models would empty the dropdown for the
+        // whole TTL on the strength of one odd response.
+        let server = stub(200, r#"{"data":[]}"#).await;
+        let client = client_for(&server);
+
+        assert_eq!(client.list_models().await.expect("never errors"), FALLBACK_MODELS);
+        let _ = client.list_models().await;
+
+        assert_eq!(
+            server.requests.load(Ordering::SeqCst),
+            2,
+            "an empty answer was cached and the provider never asked again",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_retried_rather_than_cached() {
+        let server = stub(500, "{}").await;
+        let client = client_for(&server);
+
+        let _ = client.list_models().await;
+        let _ = client.list_models().await;
+
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn the_api_key_never_reaches_an_error_message() {
+        // Errors get logged. The key travels in a header and the URL carries
+        // only the path, so a failure has nowhere to pick it up — this is what
+        // holds that true.
+        let server = stub(403, r#"{"error":"forbidden"}"#).await;
+        let client = client_for(&server);
+
+        let error = client
+            .fetch_catalogue()
+            .await
+            .expect_err("a 403 should fail the fetch");
+
+        let rendered = format!("{error}");
+        assert!(!rendered.contains("sk-ant-secret"), "the key leaked: {rendered}");
+        assert!(rendered.contains("403"), "and the status should still be there: {rendered}");
+    }
+}
+
