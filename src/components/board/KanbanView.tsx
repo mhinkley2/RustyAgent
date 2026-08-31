@@ -26,6 +26,7 @@ import { KANBAN_COLUMNS } from "../../types/board";
 import { nextUpIds } from "./queue";
 import { StoryCard } from "./StoryCard";
 import type { StoryAttention } from "./attention";
+import type { AgentProfile } from "../../types/agent";
 
 // ---------------------------------------------------------------------------
 // SortableCard — wraps StoryCard with useSortable
@@ -37,12 +38,16 @@ function SortableCard({
   isNextUp,
   attention,
   onAttention,
+  agents,
+  onAssign,
 }: {
   story: Story;
   onSelect: (s: Story) => void;
   isNextUp?: boolean;
   attention?: StoryAttention;
   onAttention?: (attention: StoryAttention) => void;
+  agents?: AgentProfile[];
+  onAssign?: (storyId: string, agentId: string | null) => Promise<void> | void;
 }) {
   const {
     attributes,
@@ -71,6 +76,8 @@ function SortableCard({
         isNextUp={isNextUp}
         attention={attention}
         onAttention={onAttention}
+        agents={agents}
+        onAssign={onAssign && ((agentId) => onAssign(story.id, agentId))}
       />
     </div>
   );
@@ -89,6 +96,8 @@ interface KanbanColumnProps {
   emptyMessage?: string;
   attention: Map<string, StoryAttention>;
   onAttention?: (attention: StoryAttention) => void;
+  agents?: AgentProfile[];
+  onAssign?: (storyId: string, agentId: string | null) => Promise<void> | void;
 }
 
 function KanbanColumn({
@@ -100,6 +109,8 @@ function KanbanColumn({
   emptyMessage,
   attention,
   onAttention,
+  agents,
+  onAssign,
 }: KanbanColumnProps) {
   const { setNodeRef } = useDroppable({ id: status });
   const ids = stories.map(s => s.id);
@@ -133,6 +144,8 @@ function KanbanColumn({
                 isNextUp={nextUp.has(s.id)}
                 attention={attention.get(s.id)}
                 onAttention={onAttention}
+                agents={agents}
+                onAssign={onAssign}
               />
             ))
           )}
@@ -184,6 +197,15 @@ interface KanbanViewProps {
   attention?: Map<string, StoryAttention>;
   /** Open the dialog behind a card's marker. */
   onAttention?: (attention: StoryAttention) => void;
+  /**
+   * Profiles the cards' assignee slots can offer.
+   *
+   * Assignment is a precondition for everything that starts work, so it has to
+   * be reachable where the stories are — not only inside the edit form.
+   */
+  agents?: AgentProfile[];
+  /** Assign a story from its card. Absent leaves the assignee read-only. */
+  onAssign?: (storyId: string, agentId: string | null) => Promise<void> | void;
 }
 
 const EMPTY_MESSAGES: Record<StoryStatus, string> = {
@@ -205,6 +227,8 @@ export function KanbanView({
   onDragActiveChange,
   attention = NO_ATTENTION,
   onAttention,
+  agents,
+  onAssign,
 }: KanbanViewProps) {
   // Local column map — drives rendering during and after drags
   const [colMap, setColMap] = useState<ColMap>(() => buildColMap(stories));
@@ -363,6 +387,8 @@ export function KanbanView({
               emptyMessage={EMPTY_MESSAGES[status]}
               attention={attention}
               onAttention={onAttention}
+              agents={agents}
+              onAssign={onAssign}
             />
           ))}
         </div>

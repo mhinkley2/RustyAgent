@@ -15,10 +15,13 @@ import {
   formatDuration,
   formatEstimatedCost,
 } from "../../types/runs";
+import type { AgentProfile } from "../../types/agent";
 import { runsForStory } from "../../hooks/useRuns";
 import { usePipelineProgress } from "../../hooks/usePipelineProgress";
 import { PipelineProgressPanel } from "../pipeline/PipelineProgressPanel";
 import { RunPanel } from "../RunPanel";
+import { AgentPicker } from "./AgentPicker";
+import { agentName, fireAssign, hasActiveRun, runProfileId } from "./assignment";
 
 // ---------------------------------------------------------------------------
 // SimpleMarkdown — renders a small subset of Markdown without external deps
@@ -182,9 +185,28 @@ interface StoryDetailPanelProps {
    * the board owns where a run opens.
    */
   onOpenRun?: (runId: string) => void;
+  /** Profiles the assignee picker and "Run with" can offer. */
+  agents?: AgentProfile[];
+  /**
+   * Assign the story to a profile, or to nobody.
+   *
+   * The panel already holds the story and the two buttons that are disabled
+   * without an assignee; sending the user to the edit form to fix that was the
+   * only way to enable them.
+   */
+  onAssign?: (storyId: string, agentId: string | null) => Promise<void>;
 }
 
-export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOpenRun }: StoryDetailPanelProps) {
+export function StoryDetailPanel({
+  story,
+  onClose,
+  onEdit,
+  onDelete,
+  onRun,
+  onOpenRun,
+  agents = [],
+  onAssign,
+}: StoryDetailPanelProps) {
   /**
    * Every run for this story, so the panel can list the ones before the
    * latest. Fetched for the open story only — the board's own query carries
@@ -220,6 +242,15 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOp
 
   const [activePipelineRunId, setActivePipelineRunId] = useState<string | null>(null);
   const [showRun, setShowRun] = useState(false);
+  /**
+   * A profile chosen for one run, without writing it to the story.
+   *
+   * The "try an agent on this" case. Silently persisting that choice is the
+   * trap here, so this deliberately never reaches `update_story` — and it is
+   * cleared whenever the panel changes story, below.
+   */
+  const [runWithId, setRunWithId] = useState<string | null>(null);
+  const [assigning, setAssigning] = useState(false);
   const { progress, startPipelineRun } = usePipelineProgress(
     story?.type === "pipeline" ? activePipelineRunId : null
   );
@@ -231,14 +262,16 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOp
     setLastStoryId(storyId);
     if (showRun) setShowRun(false);
     if (activePipelineRunId) setActivePipelineRunId(null);
+    if (runWithId) setRunWithId(null);
   }
 
   const isPipeline = story?.type === "pipeline";
 
   async function handleStartPipeline() {
-    if (!story || !story.assignedAgentId) return;
+    const profileId = story && runProfileId(story, runWithId);
+    if (!story || !profileId) return;
     try {
-      const runId = await startPipelineRun(story.id, story.assignedAgentId);
+      const runId = await startPipelineRun(story.id, profileId);
       setActivePipelineRunId(runId);
     } catch (err) {
       console.error("start_pipeline_run failed:", err);
@@ -246,6 +279,9 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOp
   }
 
   const isPipelineRunning = progress && (progress.status === "running");
+
+  /** The profile a run started right now would use. */
+  const effectiveProfileId = story ? runProfileId(story, runWithId) : null;
 
   const footer = story ? (
     showRun ? (
@@ -272,27 +308,47 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOp
           Delete
         </button>
       </div>
-      {isPipeline ? (
-        <button
-          className="btn btn--primary"
-          onClick={handleStartPipeline}
-          disabled={isPipelineRunning || !story.assignedAgentId}
-          title={!story.assignedAgentId ? "Assign an agent profile first" : undefined}
-        >
-          <GitBranch size={14} />
-          {isPipelineRunning ? "Running…" : "Start Pipeline"}
-        </button>
-      ) : (
-        <button
-          className="btn btn--primary"
-          disabled={!story.assignedAgentId}
-          title={!story.assignedAgentId ? "Assign an agent profile first" : undefined}
-          onClick={() => { onRun?.(story); setShowRun(true); }}
-        >
-          <Play size={14} />
-          Run Now
-        </button>
-      )}
+      <div className="sdp__run-actions">
+        {/*
+          Choose a profile for this run only. Empty means "use the assignee",
+          which is why the label is not "Unassigned" here — there is no such
+          thing as running with nobody.
+
+          Hidden when there are no profiles: a select whose only option is its
+          own placeholder is furniture.
+        */}
+        {agents.length > 0 && (
+          <AgentPicker
+            className="sdp__run-with"
+            agents={agents}
+            value={runWithId}
+            unassignedLabel={story.assignee ? `Run as ${story.assignee}` : "Run with…"}
+            ariaLabel="Run with a different agent, without assigning it"
+            onChange={setRunWithId}
+          />
+        )}
+        {isPipeline ? (
+          <button
+            className="btn btn--primary"
+            onClick={handleStartPipeline}
+            disabled={isPipelineRunning || !effectiveProfileId}
+            title={!effectiveProfileId ? "Assign an agent profile first" : undefined}
+          >
+            <GitBranch size={14} />
+            {isPipelineRunning ? "Running…" : "Start Pipeline"}
+          </button>
+        ) : (
+          <button
+            className="btn btn--primary"
+            disabled={!effectiveProfileId}
+            title={!effectiveProfileId ? "Assign an agent profile first" : undefined}
+            onClick={() => { onRun?.(story); setShowRun(true); }}
+          >
+            <Play size={14} />
+            {runWithId ? `Run as ${agentName(agents, runWithId) ?? "chosen agent"}` : "Run Now"}
+          </button>
+        )}
+      </div>
     </div>
     )
   ) : undefined;
@@ -305,10 +361,10 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOp
       footer={footer}
       width={520}
     >
-      {story && showRun && story.assignedAgentId && (
+      {story && showRun && effectiveProfileId && (
         <RunPanel
           storyId={story.id}
-          profileId={story.assignedAgentId}
+          profileId={effectiveProfileId}
           storyTitle={story.title}
           autoStart
         />
@@ -331,8 +387,28 @@ export function StoryDetailPanel({ story, onClose, onEdit, onDelete, onRun, onOp
           {/* ── Details grid ────────────────────────────────────────────── */}
           <div className="sdp__meta">
             <DetailRow label="Assignee">
-              {story.assignee ?? <span className="sdp__muted">Unassigned</span>}
+              {onAssign ? (
+                <AgentPicker
+                  className="sdp__assignee-picker"
+                  agents={agents}
+                  value={story.assignedAgentId ?? null}
+                  ariaLabel="Assigned agent"
+                  disabled={assigning}
+                  onChange={(agentId) => {
+                    setAssigning(true);
+                    fireAssign(onAssign(story.id, agentId), () => setAssigning(false));
+                  }}
+                />
+              ) : (
+                story.assignee ?? <span className="sdp__muted">Unassigned</span>
+              )}
             </DetailRow>
+            {hasActiveRun(story) && onAssign && (
+              <p className="sdp__assignee-note">
+                A run is in progress. It keeps the agent it started with;
+                a change here applies to the next run.
+              </p>
+            )}
             <DetailRow label="Updated">
               {timeAgo(story.updatedAt)}
             </DetailRow>

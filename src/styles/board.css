@@ -827,3 +827,88 @@
   text-transform: uppercase;
   white-space: nowrap;
 }
+
+/* ── Assigning an agent ──────────────────────────────────────────────────────
+   Assignment gates both Run Now and Start Pipeline, so it has to be reachable
+   where the stories are rather than only inside the edit form. Three surfaces
+   share one control (`AgentPicker`); each sizes it for where it sits. */
+
+/* The card's slot: a name you can press, sized like the text it replaces so
+   the meta row does not jump when it becomes a select. */
+.story-card__assignee--editable {
+  padding: 1px 4px;
+  margin: -1px -4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.story-card__assignee--editable:hover {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+
+.story-card__assignee--editable:focus-visible {
+  outline: 2px solid var(--color-primary, #6366f1);
+  outline-offset: 1px;
+}
+
+.story-card__assignee-picker {
+  min-width: 0;
+  flex: 1 1 auto;
+  max-width: 150px;
+}
+
+.story-card__assignee-picker .form-select {
+  padding: 1px 1.375rem 1px 0.25rem;
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+
+.story-card__assignee-picker .form-select__adornment {
+  right: 0.25rem;
+}
+
+/* The panel's row: the picker sits in the value column, so it is bounded
+   rather than stretching the whole width. */
+.sdp__assignee-picker {
+  min-width: 180px;
+}
+
+.sdp__assignee-note {
+  margin: 4px 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* The footer: "run with" sits immediately left of the button it changes the
+   meaning of. */
+.sdp__run-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sdp__run-with {
+  max-width: 170px;
+}
+
+.sdp__run-with .form-select {
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+  font-size: var(--text-xs);
+}
+
+.bulk-bar__assign {
+  max-width: 170px;
+}
+
+.bulk-bar__assign .form-select {
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+  font-size: var(--text-xs);
+}
