@@ -1,6 +1,9 @@
 // Tauri entry point. Command handlers are implemented in the `commands` crate.
 mod mcp_host;
 
+#[cfg(test)]
+mod version_drift_tests;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -603,6 +606,17 @@ async fn delete_custom_tool_binding(
 
 // ── Settings ─────────────────────────────────────────────────────────────────
 
+/// The version this build was stamped with.
+///
+/// Read from Tauri's package info, which comes from `tauri.conf.json` — the
+/// same value on the installer's filename. A user answering "what version are
+/// you on?" and a reader looking at a bundle are then talking about the same
+/// number.
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 #[tauri::command]
 async fn get_settings(
     app: tauri::AppHandle,
@@ -1064,6 +1078,7 @@ pub fn run() {
             get_custom_tool_bindings,
             create_custom_tool_binding,
             delete_custom_tool_binding,
+            get_app_version,
             get_settings,
             save_settings,
             get_workspace_settings,
