@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use sqlx::Row;
 use std::path::Path;
-use crate::paging::{page_request, paged_rows};
+use crate::paging::{cap_text_fields, page_envelope_of, page_request};
 use crate::{Tool, ToolContext, ToolOutput};
 
 async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
@@ -239,39 +239,59 @@ impl Tool for ListStoriesTool {
             Err(e) => return ToolOutput::err(format!("DB error: {e}")),
         };
 
-        let stories: Vec<serde_json::Value> = rows.iter().map(|row| {
-            let labels_json: String = row.try_get("labels").unwrap_or_else(|_| "[]".to_string());
-            let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
-            json!({
-                "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "title": row.try_get::<String, _>("title").unwrap_or_default(),
-                "status": row.try_get::<String, _>("status").unwrap_or_default(),
-                "priority": row.try_get::<String, _>("priority").unwrap_or_default(),
-                "story_type": row.try_get::<String, _>("story_type").unwrap_or_default(),
-                "description": row.try_get::<Option<String>, _>("description").ok().flatten(),
-                "labels": labels,
-                "assigned_agent": row.try_get::<Option<String>, _>("agent_name").ok().flatten(),
+        // Convert only the rows this page will carry.
+        //
+        // The query returns the whole board — pushing LIMIT/OFFSET into SQL is
+        // deliberately deferred, since a separate COUNT to fill in `total` buys
+        // nothing at forty rows. But converting all of them to build a page of
+        // ten means parsing forty `labels` blobs and cloning forty 5 KB
+        // descriptions to throw thirty of them away, which is the opposite of
+        // what capping is for.
+        let total = rows.len();
+        let start = request.offset.saturating_sub(1);
+        let mut stories: Vec<serde_json::Value> = rows
+            .iter()
+            .skip(start)
+            .take(request.limit)
+            .map(|row| {
+                let labels_json: String =
+                    row.try_get("labels").unwrap_or_else(|_| "[]".to_string());
+                let labels: Vec<String> = serde_json::from_str(&labels_json).unwrap_or_default();
+                json!({
+                    "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                    "title": row.try_get::<String, _>("title").unwrap_or_default(),
+                    "status": row.try_get::<String, _>("status").unwrap_or_default(),
+                    "priority": row.try_get::<String, _>("priority").unwrap_or_default(),
+                    "story_type": row.try_get::<String, _>("story_type").unwrap_or_default(),
+                    "description": row.try_get::<Option<String>, _>("description").ok().flatten(),
+                    "labels": labels,
+                    "assigned_agent": row.try_get::<Option<String>, _>("agent_name").ok().flatten(),
+                })
             })
-        }).collect();
+            .collect();
 
         // Bounded here rather than only at the MCP boundary. This board's
         // stories are written long-form on purpose — requirements, acceptance
         // criteria — so a discovery call was returning tens of thousands of
         // characters to answer "what stories exist", and an agent inside this
         // app has the same finite context an agent outside it does.
+        //
+        // Capped after windowing, so one enormous description costs the page it
+        // is on rather than every page.
+        for story in &mut stories {
+            cap_text_fields(
+                story,
+                &["description"],
+                "list_stories",
+                FULL_DESCRIPTION_VIA_GET_STORY,
+            );
+        }
+
         let subject = match status_filter.as_deref() {
             Some(status) => format!("the board ({status})"),
             None => "the board".to_string(),
         };
-        match paged_rows(
-            stories,
-            request,
-            "list_stories",
-            "stories",
-            &subject,
-            &["description"],
-            FULL_DESCRIPTION_VIA_GET_STORY,
-        ) {
+        match page_envelope_of(stories, total, request, "list_stories", "stories", &subject) {
             Ok(envelope) => ToolOutput::ok(serde_json::to_string(&envelope).unwrap_or_default()),
             Err(error) => ToolOutput::err(error),
         }
@@ -885,6 +905,42 @@ mod tests {
         }
 
         assert_eq!(seen, ["s0", "s1", "s2", "s3", "s4", "s5", "s6"]);
+    }
+
+    /// The window has to line up with the rows it claims to be.
+    ///
+    /// The tool narrows the result set itself rather than handing the whole
+    /// list to `paged_rows`, so that a page of ten does not convert four
+    /// hundred rows. That trade buys an off-by-one it has to be held to: only
+    /// the story actually on the page may be converted, capped, or counted.
+    #[tokio::test]
+    async fn a_page_carries_its_own_rows_and_only_its_own() {
+        let db = make_test_pool().await;
+        seed_long_story(&db, "s0", 8).await;
+        seed_long_story(&db, "s1", MAX_FIELD_BYTES * 2).await;
+        seed_long_story(&db, "s2", 8).await;
+        let ctx = make_ctx(db.clone());
+
+        let first = list(&ctx, json!({ "offset": 1, "limit": 1 })).await;
+        assert_eq!(first["stories"][0]["id"], json!("s0"));
+        assert_eq!(first["stories"][0]["description"], json!("x".repeat(8)));
+
+        let second = list(&ctx, json!({ "offset": 2, "limit": 1 })).await;
+        assert_eq!(second["stories"][0]["id"], json!("s1"));
+        assert!(second["stories"][0]["description"]
+            .as_str()
+            .expect("description")
+            .contains("TRUNCATED"));
+
+        let last = list(&ctx, json!({ "offset": 3, "limit": 1 })).await;
+        assert_eq!(last["stories"][0]["id"], json!("s2"));
+        assert_eq!(last["next_offset"], serde_json::Value::Null);
+
+        // …and every page agrees on how big the board is.
+        for page in [&first, &second, &last] {
+            assert_eq!(page["total"], json!(3));
+            assert_eq!(page["returned"], json!(1));
+        }
     }
 
     #[tokio::test]

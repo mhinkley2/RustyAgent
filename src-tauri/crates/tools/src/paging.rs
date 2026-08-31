@@ -162,7 +162,13 @@ pub fn page_envelope(
 /// Splitting it this way is what lets [`paged_rows`] serialize and field-cap
 /// one page rather than the entire list: a caller that already knows the
 /// window does not have to materialise four hundred rows to return fifty.
-fn page_envelope_of(
+///
+/// Public for callers whose rows are not [`Serialize`] and so cannot use
+/// [`paged_rows`] — `list_stories` builds its own from `sqlx` rows. Such a
+/// caller owns the two steps `paged_rows` would have done for it: narrowing to
+/// `request.offset`/`request.limit` before converting anything, and calling
+/// [`cap_text_fields`] on the window it produced.
+pub fn page_envelope_of(
     rows: Vec<Value>,
     total: usize,
     request: PageRequest,
