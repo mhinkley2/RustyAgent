@@ -472,3 +472,29 @@
   font-style: italic;
   margin: 0;
 }
+
+/* ── Model catalogue warning ─────────────────────────────────────────────────
+   Shown when the chosen model has no price or context window on record. Worth
+   interrupting for because the consequences are invisible later: the run works,
+   reports no cost, and budgets a conservative default rather than the model's
+   real window — a reader of the cost report could not tell it from a free run. */
+
+.agent-form__hint {
+  margin: 6px 0 0;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.agent-form__hint--warning {
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+  border-radius: var(--radius);
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+
+.agent-form__hint--warning code {
+  font-family: var(--font-mono, monospace);
+  font-size: inherit;
+}

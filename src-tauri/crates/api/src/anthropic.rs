@@ -552,6 +552,16 @@ impl LlmProvider for AnthropicClient {
     }
 }
 
+/// The ids the provider falls back to when the API cannot be reached.
+///
+/// Public so the cross-catalogue drift check can compare it with the
+/// frontend's list. These are the two hand-written copies that remain, and
+/// they are shown to the same user in the same dropdown, so a disagreement
+/// means the list changes under them the moment a key is entered.
+pub fn anthropic_fallback_models() -> &'static [&'static str] {
+    &FALLBACK_MODELS
+}
+
 /// The built-in catalogue, as [`ModelInfo`].
 fn fallback_catalogue() -> Vec<ModelInfo> {
     FALLBACK_MODELS.iter().map(|id| ModelInfo::from_id(id)).collect()

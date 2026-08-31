@@ -31,7 +31,7 @@ pub use pricing::{
 };
 pub use provider::LlmProvider;
 pub use mock::MockLlmProvider;
-pub use anthropic::AnthropicClient;
+pub use anthropic::{anthropic_fallback_models, AnthropicClient, ModelInfo};
 pub use openrouter::OpenRouterClient;
 pub use ollama::OllamaClient;
 pub use deepseek::DeepSeekClient;

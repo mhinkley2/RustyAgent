@@ -13,13 +13,13 @@ import {
 import type { SelectOption } from "../forms";
 import type { AgentProfile, CreateProfileInput, Provider, RunMode, ContextStrategy } from "../../types/agent";
 import {
-  PROVIDER_MODELS,
   PROVIDER_LABELS,
   CONTEXT_STRATEGY_OPTIONS,
 } from "../../types/agent";
 import { useMcpServers, useToolBindings } from "../../hooks/useMcpServers";
 import { useCustomTools, useCustomToolBindings } from "../../hooks/useCustomTools";
 import { useAgentPermissions } from "../../hooks/useAgentPermissions";
+import { useProviderModels } from "../../hooks/useProviderModels";
 import type { AgentPermissions } from "../../types/permissions";
 import { defaultPermissions } from "../../types/permissions";
 import { PermissionEditor } from "./PermissionEditor";
@@ -215,11 +215,25 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
     }
   };
 
-  // Dynamic model list for selected provider
-  const modelOptions: SelectOption[] = form.provider
-    ? PROVIDER_MODELS[form.provider]
-    : [];
+  // The provider's own catalogue, falling back to the built-in list. Asking
+  // the provider is what stops the editor offering ids that were retired
+  // months ago — the drift that shipped four unusable models once already.
+  const { models: catalogue, loading: catalogueLoading } = useProviderModels(form.provider);
+  const modelOptions: SelectOption[] = catalogue.map(m => ({
+    value: m.value,
+    label: m.label,
+  }));
   const ollamaSelected = form.provider === "ollama";
+
+  /**
+   * The chosen model, when the app cannot cost a run on it.
+   *
+   * Worth interrupting for because the consequences are invisible later: the
+   * run works, reports no cost, and budgets its context at a conservative
+   * default rather than the model's real window. A user reading a cost report
+   * would have no way to tell the difference from a free run.
+   */
+  const unpricedModel = catalogue.find(m => m.value === form.model && m.priced === false);
 
   // When provider changes, clear the model
   const handleProviderChange = (v: Provider | "") => {
@@ -353,6 +367,22 @@ export function AgentProfileForm({ editing, open, onClose, onSave }: AgentProfil
               )
             }
           </FormField>
+
+          {catalogueLoading && form.model && (
+            <p className="agent-form__hint" role="status">
+              Checking this model against the provider's catalogue…
+            </p>
+          )}
+
+          {unpricedModel && (
+            <p className="agent-form__hint agent-form__hint--warning" role="status">
+              This app has no price or context window on record for{" "}
+              <code>{unpricedModel.value}</code>. Runs will work, but will report
+              no cost and will budget{" "}
+              {(unpricedModel.contextWindow ?? 0).toLocaleString()} tokens of
+              context rather than the model's real window.
+            </p>
+          )}
         </section>
 
         {/* ── System Prompt ─────────────────────────────────────────── */}

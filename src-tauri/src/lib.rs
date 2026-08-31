@@ -186,6 +186,47 @@ async fn append_chat_session_message(
     .await
 }
 
+/// The models a provider offers, for the profile editor's dropdown.
+///
+/// Asks the provider rather than reading a hardcoded list, which is what stops
+/// the editor offering ids that were retired months ago. Never fails: a
+/// provider with no key configured, or one that cannot be reached, still
+/// answers with its built-in list, because an empty dropdown reads as a broken
+/// app and "no key yet" is where every user starts.
+#[tauri::command]
+async fn list_provider_models(
+    provider: String,
+    app: tauri::AppHandle,
+) -> Result<Vec<commands::ModelOption>, String> {
+    let settings = commands::settings::AppSettings::load_from(
+        &commands::settings::AppSettings::settings_path(&app),
+    );
+
+    // An absent key is not an error here. The provider is built with an empty
+    // one, the catalogue call fails, and the fallback list is what comes back —
+    // which is exactly what should fill the dropdown before a key is set.
+    let client: Box<dyn api::LlmProvider> = match provider.as_str() {
+        "anthropic" => Box::new(api::AnthropicClient::new(
+            settings.anthropic_api_key.unwrap_or_default(),
+        )),
+        "openrouter" => Box::new(api::OpenRouterClient::new(
+            settings.openrouter_api_key.unwrap_or_default(),
+        )),
+        "deepseek" => Box::new(api::DeepSeekClient::new(
+            settings.deepseek_api_key.unwrap_or_default(),
+        )),
+        "ollama" => Box::new(api::OllamaClient::with_base_url(
+            settings
+                .ollama_base_url
+                .as_deref()
+                .unwrap_or("http://localhost:11434"),
+        )),
+        other => return Err(format!("Unknown provider: {other}")),
+    };
+
+    Ok(commands::list_provider_models(client).await)
+}
+
 // ── Agent profile CRUD ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1054,6 +1095,7 @@ pub fn run() {
             get_run_diff,
             accept_run,
             revert_run,
+            list_provider_models,
             get_pending_human_requests,
             respond_to_human_request,
             create_human_request,
@@ -1115,3 +1157,5 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+#[cfg(test)]
+mod catalogue_drift_tests;
