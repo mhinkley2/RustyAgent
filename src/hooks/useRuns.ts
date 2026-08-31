@@ -350,6 +350,23 @@ export function useRunEvents(runId: string | null): UseRunEventsReturn {
 }
 
 // ---------------------------------------------------------------------------
+// runsForStory — one story's run history, without a hook
+// ---------------------------------------------------------------------------
+
+/**
+ * Every run recorded against one story, newest first.
+ *
+ * A plain function rather than a hook because the caller — the story detail
+ * panel — fetches for whichever story is open and would otherwise need a hook
+ * whose filters change underneath it. Sharing `mapRun` is the point: a second
+ * copy of that mapping is how the two would come to disagree about a run.
+ */
+export async function runsForStory(storyId: string): Promise<StoryRun[]> {
+  const raw = await invoke<RawRun[]>("get_runs", { filters: { story_id: storyId } });
+  return raw.map(mapRun);
+}
+
+// ---------------------------------------------------------------------------
 // exportRun — trigger a .jsonl download of run events
 // ---------------------------------------------------------------------------
 

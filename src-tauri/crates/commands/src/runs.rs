@@ -138,13 +138,27 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> RunEvent {
     }
 }
 
+/// Emit a timestamp column as RFC 3339, whatever shape it is stored in.
+///
+/// `story_runs` timestamps are written two ways: `CURRENT_TIMESTAMP`, which
+/// yields `YYYY-MM-DD HH:MM:SS`, and an explicit `strftime` producing
+/// `...T...Z`. Both are UTC, but only the second parses — as RFC 3339 in Rust,
+/// and as anything other than *local* time in JavaScript, where the
+/// space-separated form silently comes out shifted by the reader's UTC offset.
+///
+/// This normalises at the read boundary so every consumer sees one shape. It
+/// does not fix what is *stored* — that is story `7b74f638`, and until it lands
+/// this is what keeps a duration from being `None` and a card from claiming a
+/// run finished four hours in the future.
 const SELECT_RUNS: &str = "
     SELECT r.id, r.story_id, s.title AS story_title,
            r.agent_profile_id, a.name AS agent_name,
            r.status, r.input_tokens, r.output_tokens,
            r.cache_read_input_tokens, r.cache_creation_input_tokens,
            r.estimated_cost_usd, r.iteration_count,
-           r.started_at, r.finished_at, r.before_sha,
+           strftime('%Y-%m-%dT%H:%M:%fZ', r.started_at)  AS started_at,
+           strftime('%Y-%m-%dT%H:%M:%fZ', r.finished_at) AS finished_at,
+           r.before_sha,
            r.worktree_path, r.branch_name, r.after_sha,
            r.isolation_status, r.isolation_note
     FROM story_runs r

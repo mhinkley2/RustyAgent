@@ -107,6 +107,79 @@ describe("useStories — loading and mapping", () => {
   });
 });
 
+describe("useStories — the latest run on a card", () => {
+  const RAW_RUN = {
+    id: "run-1",
+    status: "done",
+    started_at: "2026-04-13T00:00:00Z",
+    finished_at: "2026-04-13T00:05:00Z",
+    iteration_count: 4,
+    input_tokens: 120,
+    output_tokens: 80,
+    estimated_cost_usd: 0.42,
+  };
+
+  it("maps the joined run onto the story", async () => {
+    createStoryBackend([rawStory({ id: "s1", latest_run: RAW_RUN })]);
+
+    const { result } = await renderLoaded();
+    const run = result.current.stories[0].latestRun;
+
+    expect(run).toBeDefined();
+    expect(run?.id).toBe("run-1");
+    expect(run?.status).toBe("done");
+    expect(run?.startedAt).toBeInstanceOf(Date);
+    expect(run?.finishedAt).toBeInstanceOf(Date);
+    expect(run?.iterationCount).toBe(4);
+    expect(run?.estimatedCostUsd).toBeCloseTo(0.42);
+  });
+
+  // The board is mostly stories that have never run. They must come through
+  // with nothing rather than an empty object the card would then render.
+  it("leaves a story that has never run without one", async () => {
+    createStoryBackend([rawStory({ id: "s1" })]);
+
+    const { result } = await renderLoaded();
+
+    expect(result.current.stories[0].latestRun).toBeUndefined();
+  });
+
+  // A run still going has no finish time, and that absence is what the card
+  // reads to decide it is active.
+  it("leaves finishedAt absent while a run is still going", async () => {
+    createStoryBackend([
+      rawStory({
+        id: "s1",
+        latest_run: { ...RAW_RUN, status: "running", finished_at: null },
+      }),
+    ]);
+
+    const { result } = await renderLoaded();
+    const run = result.current.stories[0].latestRun;
+
+    expect(run?.status).toBe("running");
+    expect(run?.finishedAt).toBeUndefined();
+  });
+
+  it("keeps the run summary current when the board refreshes", async () => {
+    const backend = createStoryBackend([
+      rawStory({
+        id: "s1",
+        latest_run: { ...RAW_RUN, status: "running", finished_at: null },
+      }),
+    ]);
+    const { result } = await renderLoaded();
+    expect(result.current.stories[0].latestRun?.status).toBe("running");
+
+    backend.setStories([rawStory({ id: "s1", latest_run: RAW_RUN })]);
+    await tauriMock.emit("stories-changed", null);
+
+    await waitFor(() =>
+      expect(result.current.stories[0].latestRun?.status).toBe("done"),
+    );
+  });
+});
+
 describe("useStories — following the board", () => {
   // The defect this exists for: #16 made every successful run move its story
   // in SQL, with no event and no refetch, so the routine end of a run was a

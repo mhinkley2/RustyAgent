@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useState, useCallback, useEffect, useRef } from "react";
 import { notifyError } from "../components/ui/Toast";
 import type { Story, StoryStatus, StoryPriority, StoryType } from "../types/board";
+import type { RunStatus } from "../types/runs";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -11,6 +12,18 @@ function errorMessage(error: unknown): string {
 // ---------------------------------------------------------------------------
 // Raw types — match the Rust / serde serialization (snake_case)
 // ---------------------------------------------------------------------------
+
+/** The joined run columns, as `get_stories` returns them. */
+interface RawLatestRun {
+  id: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  iteration_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost_usd: number;
+}
 
 interface RawStory {
   id: string;
@@ -24,6 +37,7 @@ interface RawStory {
   requires_approval: boolean;
   track_history: boolean;
   labels: string[];
+  latest_run: RawLatestRun | null;
   sort_order: number;
   created_at: string;
   updated_at: string;
@@ -75,6 +89,27 @@ function mapStory(raw: RawStory): Story {
     sortOrder:        raw.sort_order,
     createdAt:        new Date(raw.created_at),
     updatedAt:        new Date(raw.updated_at),
+    latestRun:        mapLatestRun(raw.latest_run),
+  };
+}
+
+/**
+ * The joined run, when there is one.
+ *
+ * A story nobody has run comes back with `latest_run: null`, and the card must
+ * render exactly as it did before rather than showing an empty slot.
+ */
+function mapLatestRun(raw: RawLatestRun | null): Story["latestRun"] {
+  if (!raw) return undefined;
+  return {
+    id:                raw.id,
+    status:            raw.status as RunStatus,
+    startedAt:         new Date(raw.started_at),
+    finishedAt:        raw.finished_at ? new Date(raw.finished_at) : undefined,
+    iterationCount:    raw.iteration_count,
+    inputTokens:       raw.input_tokens,
+    outputTokens:      raw.output_tokens,
+    estimatedCostUsd:  raw.estimated_cost_usd,
   };
 }
 

@@ -2,6 +2,8 @@
 // Board / Story shared types
 // ---------------------------------------------------------------------------
 
+import type { RunStatus } from "./runs";
+
 export type StoryStatus =
   | "backlog"
   | "ready"
@@ -57,16 +59,40 @@ export interface Story {
   createdAt: Date;
   updatedAt: Date;
   description?: string;
-  // Latest run summary (if any)
-  latestRun?: {
-    status: "running" | "success" | "failure" | "cancelled";
-    startedAt: Date;
-    durationMs: number;
-    stepsCompleted: number;
-    stepsTotal: number;
-    tokens: number;
-    costUsd: number;
-  };
+  /**
+   * The most recent run against this story, absent if it has never run.
+   *
+   * Joined into `get_stories` rather than fetched per card — the board renders
+   * every story at once.
+   */
+  latestRun?: StoryLatestRun;
+}
+
+/**
+ * What the board shows about a story's most recent run.
+ *
+ * `status` is the **run** vocabulary from `types/runs.ts`, which legitimately
+ * contains `failed` and is not the story vocabulary. The shape this replaced
+ * invented a third spelling — `success` / `failure` — that matched neither the
+ * column nor `RunStatus`, and it only ever held mock data, so nothing caught
+ * it.
+ *
+ * There is no step total: an agent loop runs until it finishes or hits
+ * `max_iterations`, so `iterationCount` is a count, not a fraction. The old
+ * shape's `stepsCompleted`/`stepsTotal` described a progress bar the data
+ * cannot support.
+ */
+export interface StoryLatestRun {
+  id: string;
+  status: RunStatus;
+  startedAt: Date;
+  /** Absent while the run is still going. */
+  finishedAt?: Date;
+  /** Iterations entered so far. */
+  iterationCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCostUsd: number;
 }
 
 export const KANBAN_COLUMNS: { status: StoryStatus; label: string }[] = [
@@ -88,7 +114,7 @@ export const MOCK_STORIES: Story[] = [
     priority: "high", type: "task", assignee: "GPT-4o Agent", requiresApproval: false, trackHistory: true, sortOrder: 0,
     labels: ["research", "phase-1"], createdAt: new Date(Date.now() - 86400_000 * 5), updatedAt: new Date(Date.now() - 3600_000),
     description: "Research and summarise the pricing structures of our top 5 competitors.",
-    latestRun: { status: "running", startedAt: new Date(Date.now() - 900_000), durationMs: 0, stepsCompleted: 3, stepsTotal: 8, tokens: 2341, costUsd: 0.04 },
+    latestRun: { id: "mock-run-1", status: "running", startedAt: new Date(Date.now() - 900_000), iterationCount: 3, inputTokens: 2341, outputTokens: 512, estimatedCostUsd: 0.04 },
   },
   {
     id: "2", key: "#2", title: "Write intro blog post", status: "ready",
@@ -111,7 +137,7 @@ export const MOCK_STORIES: Story[] = [
     id: "5", key: "#5", title: "Analyse Q1 sales data", status: "done",
     priority: "high", type: "task", assignee: "Research Agent", requiresApproval: false, trackHistory: true, sortOrder: 4,
     labels: ["analytics", "phase-1"], createdAt: new Date(Date.now() - 86400_000 * 10), updatedAt: new Date(Date.now() - 172800_000),
-    latestRun: { status: "success", startedAt: new Date(Date.now() - 172800_000 - 720_000), durationMs: 720_000, stepsCompleted: 12, stepsTotal: 12, tokens: 8401, costUsd: 0.14 },
+    latestRun: { id: "mock-run-5", status: "done", startedAt: new Date(Date.now() - 172800_000 - 720_000), finishedAt: new Date(Date.now() - 172800_000), iterationCount: 12, inputTokens: 8401, outputTokens: 1200, estimatedCostUsd: 0.14 },
   },
   {
     id: "6", key: "#6", title: "Generate product screenshots", status: "blocked",

@@ -19,6 +19,23 @@ export interface RawStory {
   sort_order: number;
   created_at: string;
   updated_at: string;
+  /**
+   * The run summary `get_stories` joins in. `null` for a story that has never
+   * run, which is most of them.
+   */
+  latest_run: RawLatestRun | null;
+}
+
+/** The joined run columns, mirroring `commands::StoryLatestRun`. */
+export interface RawLatestRun {
+  id: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  iteration_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost_usd: number;
 }
 
 /** A raw story with sensible defaults; override just what a test cares about. */
@@ -37,6 +54,9 @@ export function rawStory(overrides: Partial<RawStory> & { id: string }): RawStor
     sort_order: 0,
     created_at: "2026-04-13T00:00:00Z",
     updated_at: "2026-04-13T00:00:01Z",
+    // Most stories have never run; a card for one must render exactly as it
+    // did before the run summary existed.
+    latest_run: null,
     ...overrides,
   };
 }

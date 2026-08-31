@@ -130,9 +130,22 @@ export interface RunEvent {
   createdAt: Date;
 }
 
+/**
+ * Filters for `get_runs`.
+ *
+ * **snake_case, matching `commands::RunFilters` on the wire.** Serde ignores
+ * fields it does not recognise, so a camelCase key here does not error — the
+ * filter is silently dropped and every run comes back. This type used to
+ * promise camelCase, and nothing caught it because until now nothing ever
+ * passed a filter: every caller sent `null`.
+ *
+ * The other payload types in this app are snake_case for the same reason
+ * (`CreateStoryInput`, `UpdateStoryInput`), so this is the convention rather
+ * than an exception.
+ */
 export interface RunFilters {
-  storyId?: string;
-  agentProfileId?: string;
+  story_id?: string;
+  agent_profile_id?: string;
   status?: RunStatus;
 }
 
