@@ -159,6 +159,12 @@ export default function BoardPage() {
    * Sequential rather than `Promise.all`: each write returns the whole story
    * and sets it into the same list, and firing them together would have several
    * responses racing to replace it.
+   *
+   * It stops at the first failure, deliberately. The reasons a write fails here
+   * — the workspace closed, the database unavailable — apply to the rest of the
+   * selection too, and `updateStory` toasts every one, so pressing on would
+   * mean a column of identical toasts for a batch that was never going to land.
+   * The throw is re-raised so the caller can settle its own UI.
    */
   const handleAssignMany = useCallback(
     async (ids: string[], agentId: string | null) => {

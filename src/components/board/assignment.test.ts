@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   UNASSIGNED,
   agentName,
   assignmentInput,
+  fireAssign,
   hasActiveRun,
   pickerOptions,
   runProfileId,
@@ -145,5 +146,47 @@ describe("agentName", () => {
   it("is null for nobody and for an unknown id", () => {
     expect(agentName(AGENTS, null)).toBeNull();
     expect(agentName(AGENTS, "gone")).toBeNull();
+  });
+});
+
+describe("fireAssign", () => {
+  it("runs onSettled after the write lands", async () => {
+    const onSettled = vi.fn();
+
+    fireAssign(Promise.resolve(), onSettled);
+    await vi.waitFor(() => expect(onSettled).toHaveBeenCalledOnce());
+  });
+
+  it("absorbs a rejection instead of leaving it unhandled", async () => {
+    // `updateStory` toasts and then rethrows, and every caller here is an event
+    // handler that cannot await. Without this the failure reaches the user only
+    // as an unhandled rejection in the console.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onSettled = vi.fn();
+
+    expect(() =>
+      fireAssign(Promise.reject(new Error("no workspace is open")), onSettled),
+    ).not.toThrow();
+
+    await vi.waitFor(() => expect(onSettled).toHaveBeenCalledOnce());
+    expect(error).toHaveBeenCalledWith("Assignment failed:", expect.any(Error));
+  });
+
+  it("puts the caller's UI back even when the write fails", async () => {
+    // The panel disables its picker while a write is in flight. A rejection
+    // that skipped `onSettled` would leave it disabled for good.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let busy = true;
+
+    fireAssign(Promise.reject(new Error("boom")), () => { busy = false; });
+
+    await vi.waitFor(() => expect(busy).toBe(false));
+  });
+
+  it("accepts a handler that returns nothing", async () => {
+    const onSettled = vi.fn();
+
+    expect(() => fireAssign(undefined, onSettled)).not.toThrow();
+    await vi.waitFor(() => expect(onSettled).toHaveBeenCalledOnce());
   });
 });

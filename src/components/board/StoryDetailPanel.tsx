@@ -21,7 +21,7 @@ import { usePipelineProgress } from "../../hooks/usePipelineProgress";
 import { PipelineProgressPanel } from "../pipeline/PipelineProgressPanel";
 import { RunPanel } from "../RunPanel";
 import { AgentPicker } from "./AgentPicker";
-import { agentName, hasActiveRun, runProfileId } from "./assignment";
+import { agentName, fireAssign, hasActiveRun, runProfileId } from "./assignment";
 
 // ---------------------------------------------------------------------------
 // SimpleMarkdown — renders a small subset of Markdown without external deps
@@ -394,13 +394,9 @@ export function StoryDetailPanel({
                   value={story.assignedAgentId ?? null}
                   ariaLabel="Assigned agent"
                   disabled={assigning}
-                  onChange={async (agentId) => {
+                  onChange={(agentId) => {
                     setAssigning(true);
-                    try {
-                      await onAssign(story.id, agentId);
-                    } finally {
-                      setAssigning(false);
-                    }
+                    fireAssign(onAssign(story.id, agentId), () => setAssigning(false));
                   }}
                 />
               ) : (

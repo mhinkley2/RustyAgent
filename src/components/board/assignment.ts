@@ -71,3 +71,26 @@ export function agentName(agents: AgentProfile[], id: string | null): string | n
   if (!id) return null;
   return agents.find(a => a.id === id)?.name ?? null;
 }
+
+/**
+ * Start an assignment from an event handler, absorbing a failure.
+ *
+ * Every caller of these props is an event handler — a select's `onChange`, a
+ * bulk bar — and none of them can await. A rejection dropped there surfaces
+ * only as an unhandled promise in the console, which is the one place a user
+ * will not look.
+ *
+ * The write has already raised its own toast by the time it throws
+ * (`useStories.updateStory` notifies, then rethrows), so there is nothing left
+ * to tell the user; what is left is not losing the error entirely, and letting
+ * the caller put its UI back either way.
+ *
+ * Absorbed here, once, rather than at each of the three call sites.
+ */
+export function fireAssign(result: Promise<void> | void, onSettled?: () => void): void {
+  void Promise.resolve(result)
+    .catch((e: unknown) => {
+      console.error("Assignment failed:", e);
+    })
+    .finally(() => onSettled?.());
+}

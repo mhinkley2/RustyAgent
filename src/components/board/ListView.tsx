@@ -3,6 +3,7 @@ import type { Story, StoryPriority } from "../../types/board";
 import { ConfirmDialog } from "../forms";
 import type { AgentProfile } from "../../types/agent";
 import { AgentPicker } from "./AgentPicker";
+import { fireAssign } from "./assignment";
 
 const PRIORITY_COLORS: Record<StoryPriority, string> = {
   critical: "var(--error)",
@@ -51,7 +52,7 @@ function BulkActionBar({ count, onClear, onDelete, agents, onAssign }: BulkActio
             value={null}
             unassignedLabel={`Assign ${count}…`}
             ariaLabel={`Assign an agent to ${count} selected stories`}
-            onChange={(agentId) => { void onAssign(agentId); }}
+            onChange={(agentId) => fireAssign(onAssign(agentId))}
           />
         )}
         <button className="btn btn--destructive btn--sm" onClick={onDelete}>Delete</button>

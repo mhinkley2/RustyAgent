@@ -284,4 +284,24 @@ describe("StoryCard - assigning from the card", () => {
 
     expect(onSelect).not.toHaveBeenCalled();
   });
+
+  it("does not leave a failed assignment as an unhandled rejection", async () => {
+    // `updateStory` toasts and then rethrows, and this handler cannot await.
+    // Dropping the promise would surface the failure only in the console —
+    // and would leave the card looking as though the change had stuck.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onAssign = vi.fn().mockRejectedValue(new Error("no workspace is open"));
+
+    render(
+      <StoryCard story={makeStory()} onSelect={() => {}} agents={AGENTS} onAssign={onAssign} />,
+    );
+
+    await userEvent.click(assigneeButton());
+    await userEvent.selectOptions(assigneePicker()!, "a2");
+
+    await vi.waitFor(() =>
+      expect(error).toHaveBeenCalledWith("Assignment failed:", expect.any(Error)),
+    );
+    expect(assigneePicker()).toBeNull();
+  });
 });

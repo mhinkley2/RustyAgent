@@ -14,6 +14,7 @@ import type { RunStatus } from "../../types/runs";
 import { RUN_STATUS_LABELS, formatCost } from "../../types/runs";
 import type { AgentProfile } from "../../types/agent";
 import { attentionCount, attentionLabel, type StoryAttention } from "./attention";
+import { fireAssign } from "./assignment";
 import { AgentPicker } from "./AgentPicker";
 
 // ---------------------------------------------------------------------------
@@ -178,7 +179,7 @@ export function StoryCard({
             onBlur={() => setPicking(false)}
             onChange={(agentId) => {
               setPicking(false);
-              void onAssign(agentId);
+              fireAssign(onAssign(agentId));
             }}
           />
         ) : canAssign ? (
