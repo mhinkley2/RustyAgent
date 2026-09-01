@@ -44,6 +44,16 @@ pub const DB_PATH_ENV: &str = "RUSTYAGENT_DB_PATH";
 /// The database file name inside the data directory.
 pub const DB_FILE_NAME: &str = "rustyagent.db";
 
+/// Confines an MCP client to one workspace for its whole lifetime.
+///
+/// Unlike the two above, this relocates nothing. It answers a different
+/// question — *which project is this client working on* — which the board has
+/// only ever been able to answer once per database, from the most recently
+/// opened workspace. That is right for the app, whose window shows one project
+/// at a time, and wrong for a stdio client, which is one process per editor
+/// window with its own checkout.
+pub const WORKSPACE_ENV: &str = "RUSTYAGENT_WORKSPACE";
+
 /// Which of the two answers the data directory came from.
 ///
 /// Carried alongside the path so a failure can name the variable to fix rather
@@ -85,6 +95,48 @@ fn present(value: Option<&str>) -> Option<&str> {
 // ---------------------------------------------------------------------------
 // Pure resolution
 // ---------------------------------------------------------------------------
+
+/// Where a workspace pin came from, and therefore how hard to insist on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    /// [`WORKSPACE_ENV`] was set. The user asked for this by name.
+    Explicit,
+    /// The process's working directory. A guess, and usually a good one — an
+    /// editor launches a stdio server from the folder it has open.
+    WorkingDirectory,
+}
+
+/// A workspace a client wants to be confined to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinRequest {
+    pub path: PathBuf,
+    pub source: PinSource,
+}
+
+/// What workspace, if any, a client is asking to be confined to.
+///
+/// The environment first, then the working directory. Both are candidates at
+/// this stage: neither has been checked against the workspaces that exist, and
+/// [`PinSource`] is what lets the caller treat the two failures differently.
+///
+/// The asymmetry is the point. An explicit variable naming a folder the app has
+/// never opened is a user mistake and must be reported — an override that
+/// silently does nothing is the bug reading an override is meant to avoid. A
+/// working directory that matches nothing is the ordinary case for a client
+/// launched anywhere else, and must fall through to the shared behaviour
+/// rather than refusing to start.
+pub fn pin_request(override_value: Option<&str>, working_dir: Option<PathBuf>) -> Option<PinRequest> {
+    if let Some(path) = present(override_value) {
+        return Some(PinRequest {
+            path: PathBuf::from(path),
+            source: PinSource::Explicit,
+        });
+    }
+    working_dir.map(|path| PinRequest {
+        path,
+        source: PinSource::WorkingDirectory,
+    })
+}
 
 /// Resolve the data directory from an override and a platform default.
 ///
@@ -239,6 +291,11 @@ pub fn data_dir_override() -> Option<String> {
 /// [`DB_PATH_ENV`] as set in this process, blank treated as unset.
 pub fn db_path_override() -> Option<String> {
     env_value(DB_PATH_ENV)
+}
+
+/// [`WORKSPACE_ENV`] as set in this process, blank treated as unset.
+pub fn workspace_override() -> Option<String> {
+    env_value(WORKSPACE_ENV)
 }
 
 /// [`resolve_data_dir`] reading [`DATA_DIR_ENV`] from the environment.

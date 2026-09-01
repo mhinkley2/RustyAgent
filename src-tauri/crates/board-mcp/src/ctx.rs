@@ -25,6 +25,18 @@ pub struct McpCtx {
     pub app_data_dir: Option<PathBuf>,
     /// Present only when the server is running inside the desktop app.
     pub host: Option<Arc<dyn HostBridge>>,
+    /// This client is confined to `workspace_root` for its whole lifetime.
+    ///
+    /// Set once at startup by the stdio binary, which is one process per editor
+    /// window. `refresh_workspace` then leaves the scope alone instead of
+    /// re-reading the database's single most-recently-opened workspace, and
+    /// `use_workspace` refuses — a pin a client can undo on its own is a
+    /// default, not a confinement.
+    ///
+    /// Never set on the HTTP transport: one shared context serves every caller
+    /// there, and following the workspace the app has open is the correct
+    /// behaviour for the window the user is looking at.
+    pub pinned: bool,
 }
 
 impl McpCtx {
@@ -35,7 +47,21 @@ impl McpCtx {
             workspace_id: None,
             app_data_dir: None,
             host: None,
+            pinned: false,
         }
+    }
+
+    /// Confine this context to one workspace, resolved at startup.
+    ///
+    /// Both halves are supplied by the caller because only it can do the
+    /// lookup that refuses an unknown path — this must never be able to
+    /// register a workspace, or a client could point itself at any directory
+    /// and then read it through `read_file`.
+    pub fn pinned_to(mut self, root: PathBuf, id: Option<String>) -> Self {
+        self.workspace_root = Some(root);
+        self.workspace_id = id;
+        self.pinned = true;
+        self
     }
 
     pub fn with_app_data_dir(mut self, dir: Option<PathBuf>) -> Self {
@@ -59,7 +85,16 @@ impl McpCtx {
     /// transports. The database is the single source of truth: `touch_workspace`
     /// promotes `last_opened_at` and `get_active_workspace_path` reads the most
     /// recently promoted row.
+    ///
+    /// Unless this context is [`pinned`](Self::pinned), in which case following
+    /// that pointer is exactly the bug: two editor windows on two projects share
+    /// one database, and whichever activated its workspace last would silently
+    /// become the scope for both.
     pub async fn refresh_workspace(&mut self) {
+        if self.pinned {
+            return;
+        }
+
         self.workspace_root = db::get_active_workspace_path(&self.db).await;
         self.workspace_id = match &self.workspace_root {
             Some(path) => db::find_workspace_by_path(&self.db, path)

@@ -110,6 +110,45 @@ fn resolve_paths() -> Result<Paths, String> {
     Ok(Paths { data_dir, db_path })
 }
 
+/// The workspace this process is confined to, if any.
+///
+/// `Ok(None)` is the shared behaviour the app and every client had before:
+/// scope follows whichever workspace was opened most recently. That is right
+/// for a client launched outside any project, and wrong for one launched inside
+/// a specific one.
+///
+/// Never registers. A client that could register a workspace could point itself
+/// at any directory on the machine and then read it through `read_file`, which
+/// is why `use_workspace` refuses unknown paths too.
+async fn resolve_pin(
+    db: &db::DbPool,
+    request: Option<db::paths::PinRequest>,
+) -> Result<Option<(PathBuf, Option<String>)>, String> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+
+    if let Some(workspace) = db::find_workspace_by_path(db, &request.path).await {
+        return Ok(Some((PathBuf::from(&workspace.path), Some(workspace.id))));
+    }
+
+    match request.source {
+        // Asked for by name, and not there. Reporting it is the whole value of
+        // reading the variable: an override that silently does nothing is worse
+        // than one that was never read.
+        db::paths::PinSource::Explicit => Err(format!(
+            "{} names '{}', which is not a workspace this RustyAgent has opened. Open the \
+             folder in the app once to register it, or unset {} to share the app's workspace.",
+            db::paths::WORKSPACE_ENV,
+            request.path.display(),
+            db::paths::WORKSPACE_ENV
+        )),
+        // A guess that did not pay off. The ordinary case for a client started
+        // anywhere but a project folder, so it must not be fatal.
+        db::paths::PinSource::WorkingDirectory => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -410,8 +449,31 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|error| format!("Failed to open the database: {error}"))?;
 
+    // Which project this client is for. Read after the database is open
+    // because answering it requires knowing which workspaces exist.
+    let pin = resolve_pin(
+        &db,
+        db::paths::pin_request(
+            db::paths::workspace_override().as_deref(),
+            env::current_dir().ok(),
+        ),
+    )
+    .await?;
+
+    // On stderr with the rest of the diagnostics, and worth a line of its own:
+    // "which board am I looking at" is the question this binary is easiest to
+    // be wrong about, and the answer is otherwise invisible to the user.
+    match &pin {
+        Some((root, _)) => eprintln!("Workspace: {} (confined)", root.display()),
+        None => eprintln!("Workspace: following the app's active workspace"),
+    }
+
     // No host bridge: this process is not the desktop app.
     let ctx = McpCtx::new(db).with_app_data_dir(app_data_dir);
+    let ctx = match pin {
+        Some((root, id)) => ctx.pinned_to(root, id),
+        None => ctx,
+    };
     let registry = board_mcp::build_registry();
 
     let stdin = io::stdin();
