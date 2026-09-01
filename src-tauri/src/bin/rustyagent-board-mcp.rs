@@ -188,18 +188,94 @@ mod tests {
         );
     }
 
+    /// The variables this binary reads, and the lock that owns them.
+    ///
+    /// The environment is process-global while the test harness is not: it runs
+    /// tests in one process on parallel threads. Two tests owning the same
+    /// variable therefore race, and this binary has already been bitten by
+    /// exactly that — a default-path test and an override test, failing about
+    /// one run in six depending on which observed the other's mutation.
+    ///
+    /// One test needs no lock. This exists so that the *second* one is safe by
+    /// construction rather than by whoever writes it noticing, which is the
+    /// same reliance on memory that produced the original race.
+    const OWNED_VARS: [&str; 2] = [db::paths::DB_PATH_ENV, db::paths::DATA_DIR_ENV];
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// What [`OWNED_VARS`] currently hold.
+    ///
+    /// `var_os`, not `var`. A path is not required to be UTF-8 on either
+    /// platform this ships to, and `env::var` reports a non-UTF-8 value as
+    /// though the variable were unset — so a developer whose `RUSTYAGENT_DB_PATH`
+    /// contained one would have it read as absent, cleared, and then "restored"
+    /// to absent. That is precisely the silent clearing this guard exists to
+    /// stop, surviving in the one case nobody would think to try.
+    fn snapshot() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        OWNED_VARS.iter().map(|key| (*key, env::var_os(key))).collect()
+    }
+
+    /// Start from nothing, whatever the developer's shell had.
+    fn clear() {
+        for key in OWNED_VARS {
+            env::remove_var(key);
+        }
+    }
+
+    /// Put back exactly what [`snapshot`] found, absence included.
+    fn restore(saved: &[(&'static str, Option<std::ffi::OsString>)]) {
+        for (key, value) in saved {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
+
+    /// Exclusive use of [`OWNED_VARS`], restored on drop.
+    ///
+    /// Restored, not cleared. The previous version removed them outright, so a
+    /// developer who had `RUSTYAGENT_DB_PATH` exported in their shell had it
+    /// silently unset for the rest of the test binary — harmless while one test
+    /// reads it, and a fresh mystery the day another does.
+    ///
+    /// The save and restore are free functions rather than methods so the test
+    /// below can exercise them while already holding the lock. Constructing a
+    /// second guard to test the first would deadlock, and a deadlocked test is
+    /// a worse thing to discover than a failing one.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn take() -> Self {
+            // A test that panics while holding this poisons the mutex. The data
+            // is a unit, so there is nothing to be inconsistent about, and
+            // failing every later test with a poison error would hide the one
+            // real failure behind a cascade.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = snapshot();
+            clear();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            restore(&self.saved);
+        }
+    }
+
     /// Every environment case in one test, deliberately.
     ///
-    /// `env::set_var` is process-global, so two tests owning the same variable
-    /// in one binary race — this binary has already been bitten by exactly
-    /// that. The resolution *logic* is covered without touching the
-    /// environment at all in `db::paths`; what is left to check here is only
-    /// that this binary reads the variables it documents, and that is one
-    /// sequential story, not several concurrent ones.
+    /// The resolution *logic* is covered without touching the environment at
+    /// all in `db::paths`; what is left to check here is only that this binary
+    /// reads the variables it documents, and that is one sequential story
+    /// rather than several concurrent ones.
     #[test]
     fn the_binary_reads_the_documented_environment_overrides() {
-        env::remove_var("RUSTYAGENT_DB_PATH");
-        env::remove_var("RUSTYAGENT_DATA_DIR");
+        let _env = EnvGuard::take();
 
         // Unset: the database lands under the bundle identifier. Guards the
         // drift that once pointed this binary at a stale database.
@@ -213,7 +289,7 @@ mod tests {
         assert!(default.db_path.ends_with("rustyagent.db"));
 
         // RUSTYAGENT_DATA_DIR moves the whole directory, database included.
-        env::set_var("RUSTYAGENT_DATA_DIR", "/branch/data");
+        env::set_var(db::paths::DATA_DIR_ENV, "/branch/data");
         let moved = resolve_paths().expect("paths");
         assert_eq!(moved.app_data_dir(), Some(PathBuf::from("/branch/data")));
         assert_eq!(
@@ -223,17 +299,90 @@ mod tests {
 
         // RUSTYAGENT_DB_PATH is the more specific of the two, so it takes the
         // database and leaves the rest of the directory where it was.
-        env::set_var("RUSTYAGENT_DB_PATH", "/tmp/custom.db");
+        env::set_var(db::paths::DB_PATH_ENV, "/tmp/custom.db");
         let split = resolve_paths().expect("paths");
         assert_eq!(split.db_path, PathBuf::from("/tmp/custom.db"));
         assert_eq!(split.app_data_dir(), Some(PathBuf::from("/branch/data")));
 
         // ...and on its own it still points the database wherever it says.
-        env::remove_var("RUSTYAGENT_DATA_DIR");
+        env::remove_var(db::paths::DATA_DIR_ENV);
         let db_only = resolve_paths().expect("paths");
         assert_eq!(db_only.db_path, PathBuf::from("/tmp/custom.db"));
+    }
 
-        env::remove_var("RUSTYAGENT_DB_PATH");
+    /// The guard puts back what it found, including nothing.
+    ///
+    /// Asserted rather than assumed because the failure is invisible: a
+    /// developer's exported variable would vanish, and the next test to read one
+    /// would see an environment nobody set up.
+    ///
+    /// Every mutation here happens under the guard this test holds for its whole
+    /// body. Touching the variables outside it would be the very race the guard
+    /// exists to prevent, written into the test that proves it works.
+    #[test]
+    fn the_environment_guard_restores_what_it_found() {
+        let _env = EnvGuard::take();
+
+        // A value the developer's shell had.
+        env::set_var(db::paths::DB_PATH_ENV, "/tmp/from-the-shell.db");
+        let saved = snapshot();
+
+        clear();
+        assert_eq!(
+            env::var(db::paths::DB_PATH_ENV).ok(),
+            None,
+            "a test must start from a known-empty environment",
+        );
+        env::set_var(db::paths::DB_PATH_ENV, "/tmp/set-by-the-test.db");
+
+        restore(&saved);
+        assert_eq!(
+            env::var(db::paths::DB_PATH_ENV).ok().as_deref(),
+            Some("/tmp/from-the-shell.db"),
+            "the developer's own value was not put back",
+        );
+
+        // And absence is a value too: a variable that was unset must not be
+        // left set by whatever the test did with it.
+        clear();
+        let saved_empty = snapshot();
+        env::set_var(db::paths::DB_PATH_ENV, "/tmp/set-by-the-test.db");
+        restore(&saved_empty);
+        assert_eq!(env::var(db::paths::DB_PATH_ENV).ok(), None);
+    }
+
+    /// A value that is not valid UTF-8 survives the round trip.
+    ///
+    /// `env::var` reports one as though the variable were unset, so a guard
+    /// built on it would read absent, clear, and "restore" to absent — silently
+    /// destroying the value, which is the exact failure this guard exists to
+    /// prevent. Paths are not required to be UTF-8 on either platform this
+    /// ships to, and a database path is the kind of thing that would carry one.
+    #[test]
+    #[cfg(windows)]
+    fn a_value_that_is_not_valid_utf8_is_restored_intact() {
+        use std::os::windows::ffi::{OsStringExt, OsStrExt};
+
+        let _env = EnvGuard::take();
+
+        // An unpaired surrogate: a valid Windows environment value, and not
+        // representable as UTF-8.
+        let awkward = std::ffi::OsString::from_wide(&[0x0044, 0x003A, 0x005C, 0xD800]);
+        assert!(
+            awkward.to_str().is_none(),
+            "this test is pointless if the value round-trips as UTF-8",
+        );
+
+        env::set_var(db::paths::DB_PATH_ENV, &awkward);
+        let saved = snapshot();
+        clear();
+        restore(&saved);
+
+        let restored = env::var_os(db::paths::DB_PATH_ENV).expect("the value was destroyed");
+        assert_eq!(
+            restored.encode_wide().collect::<Vec<u16>>(),
+            awkward.encode_wide().collect::<Vec<u16>>(),
+        );
     }
 }
 
