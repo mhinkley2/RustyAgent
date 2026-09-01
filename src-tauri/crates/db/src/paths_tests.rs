@@ -321,3 +321,69 @@ fn an_uncreatable_db_parent_fails_naming_the_db_path_variable() {
 fn a_bare_relative_db_file_name_has_no_parent_to_create() {
     prepare_db_parent(Path::new("rustyagent.db")).expect("nothing to do");
 }
+
+// ---------------------------------------------------------------------------
+// Which project a client is asking to be confined to
+// ---------------------------------------------------------------------------
+//
+// Pure, taking both candidates as arguments. The environment is process-global
+// and the test harness is not, and this crate has already been bitten by tests
+// racing over `RUSTYAGENT_DB_PATH`; the reader that consults the environment is
+// a one-line wrapper over this.
+
+use crate::paths::{pin_request, PinSource};
+
+#[test]
+fn an_explicit_override_wins_over_the_working_directory() {
+    let request = pin_request(Some("C:/work/asked-for"), Some(PathBuf::from("C:/work/cwd")))
+        .expect("a request");
+
+    assert_eq!(request.path, PathBuf::from("C:/work/asked-for"));
+    assert_eq!(request.source, PinSource::Explicit);
+}
+
+#[test]
+fn the_working_directory_is_the_fallback() {
+    let request = pin_request(None, Some(PathBuf::from("C:/work/cwd"))).expect("a request");
+
+    assert_eq!(request.path, PathBuf::from("C:/work/cwd"));
+    assert_eq!(request.source, PinSource::WorkingDirectory);
+}
+
+#[test]
+fn a_blank_override_is_not_an_override() {
+    // An exported-but-empty variable is how a shell script sets one it did not
+    // have a value for. Treating it as a path would refuse to start over a
+    // variable the user thinks is unset.
+    let request = pin_request(Some("   "), Some(PathBuf::from("C:/work/cwd"))).expect("a request");
+
+    assert_eq!(request.source, PinSource::WorkingDirectory);
+}
+
+#[test]
+fn an_override_is_trimmed_like_every_other_path_here() {
+    let request = pin_request(Some("  C:/work/asked-for  "), None).expect("a request");
+
+    assert_eq!(request.path, PathBuf::from("C:/work/asked-for"));
+}
+
+#[test]
+fn nothing_to_go_on_is_no_request_rather_than_an_error() {
+    // A process with no override and no readable working directory shares the
+    // app's workspace, which is what every client did before this existed.
+    assert_eq!(pin_request(None, None), None);
+}
+
+/// The source is carried so the two failures can be told apart.
+///
+/// An explicit variable naming an unregistered folder is a user mistake and
+/// must be reported. A working directory that matches nothing is the ordinary
+/// case for a client launched outside any project, and must fall through.
+#[test]
+fn the_source_distinguishes_a_request_from_a_guess() {
+    let asked = pin_request(Some("C:/x"), None).expect("a request");
+    let guessed = pin_request(None, Some(PathBuf::from("C:/x"))).expect("a request");
+
+    assert_eq!(asked.path, guessed.path);
+    assert_ne!(asked.source, guessed.source);
+}

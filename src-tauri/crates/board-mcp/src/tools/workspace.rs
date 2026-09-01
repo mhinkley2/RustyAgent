@@ -58,13 +58,27 @@ mcp_tool! {
     pub ListWorkspacesTool,
     name        = "list_workspaces",
     description = "List RustyAgent workspaces the user has opened, most recently used first. \
-                   Use this before switching board scope with use_workspace.",
+                   Use this before switching board scope with use_workspace. A client \
+                   confined to one workspace sees only that one, and cannot switch.",
     schema      = { "type": "object", "properties": {} },
     |input, ctx| {
         let current = ctx.workspace_root.as_deref().map(normalize_path);
         let workspaces = match db::list_workspaces(&ctx.db).await {
             Ok(rows) => rows,
             Err(error) => return ToolOutput::err(format!("Failed to list workspaces: {error}")),
+        };
+
+        // A pinned client sees only the workspace it is confined to. It cannot
+        // switch to any of the others, so listing them would be an inventory of
+        // the user's repositories handed to an agent that has no use for it —
+        // and an invitation to keep trying `use_workspace` and being refused.
+        let workspaces: Vec<_> = if ctx.pinned {
+            workspaces
+                .into_iter()
+                .filter(|workspace| current.as_deref() == Some(workspace.path.as_str()))
+                .collect()
+        } else {
+            workspaces
         };
 
         json_ok(json!({
@@ -109,7 +123,8 @@ mcp_tool! {
     name        = "use_workspace",
     description = "Switch the workspace that all other tools are scoped to. The path must be \
                    a workspace already opened in the RustyAgent app — MCP clients cannot \
-                   register new ones. Use list_workspaces to see the available paths.",
+                   register new ones. Use list_workspaces to see the available paths. \
+                   Refused when this client is confined to a single workspace.",
     mutation    = true,
     schema      = {
         "type": "object",
@@ -119,6 +134,24 @@ mcp_tool! {
         "required": ["path"]
     },
     |input, ctx| {
+        // Refused before the argument is even read: a pinned client has no
+        // valid target, including the workspace it is already on. Accepting
+        // that one would make this a no-op that looks like a success, and the
+        // model would have no way to learn the rule.
+        if ctx.pinned {
+            let current = ctx
+                .workspace_root
+                .as_deref()
+                .map(normalize_path)
+                .unwrap_or_else(|| "its workspace".to_string());
+            return ToolOutput::err(format!(
+                "This client is confined to '{current}' and cannot switch workspaces. It was \
+                 started for that project; open another editor window for another project, or \
+                 unset {} to share the app's workspace.",
+                db::paths::WORKSPACE_ENV
+            ));
+        }
+
         let Some(path) = str_arg(&input, "path") else {
             return ToolOutput::err("Missing required field: path");
         };
