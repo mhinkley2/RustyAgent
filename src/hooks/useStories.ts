@@ -326,8 +326,21 @@ export function useStories(): UseStoriesReturn {
   }, []);
 
   const reorderStories = useCallback(async (updates: { id: string; sortOrder: number }[]): Promise<void> => {
-    // Optimistic local update
+    // Optimistic local update, keeping what it replaced.
+    //
+    // Unlike `updateStory`, which writes first and only then touches state,
+    // this reorders immediately and asks the database afterwards. That makes
+    // the drag feel instant, and it means a rejection has to be undone here:
+    // nothing else holds the previous order, so without this the board keeps
+    // an order the database refused.
+    //
+    // The previous list is captured inside the updater rather than from
+    // `stories`, which this callback closes over as it was on first render.
+    // Under StrictMode the updater runs twice with the same `prev`, so the
+    // capture is idempotent and lands on the same list either way.
+    let previous: Story[] = [];
     setStories(prev => {
+      previous = prev;
       const orderMap = new Map(updates.map(u => [u.id, u.sortOrder]));
       return [...prev].sort((a, b) => {
         const oa = orderMap.get(a.id) ?? a.sortOrder;
@@ -340,6 +353,7 @@ export function useStories(): UseStoriesReturn {
         updates: updates.map(u => ({ id: u.id, sort_order: u.sortOrder })),
       });
     } catch (e) {
+      setStories(previous);
       notifyError("Failed to reorder stories", errorMessage(e), { duration: 7000 });
       throw e;
     }
