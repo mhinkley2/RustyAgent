@@ -8,6 +8,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::toml_profile::AgentToml;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -170,7 +171,7 @@ async fn load_and_upsert(db: &DbPool, path: &Path, scope: &str, workspace_id: Op
     let require_approval = agent.permissions.require_approval_on_write as i64;
 
     sqlx::query(
-        "INSERT INTO agent_profiles (
+        &format!("INSERT INTO agent_profiles (
             id, name, description, system_prompt, provider, model,
             context_strategy, persistent_memory, max_input_tokens, max_output_tokens,
             run_mode, cron_expression, continuous_poll_interval_secs, max_iterations,
@@ -193,7 +194,7 @@ async fn load_and_upsert(db: &DbPool, path: &Path, scope: &str, workspace_id: Op
             scope                         = excluded.scope,
             toml_path                     = excluded.toml_path,
             workspace_id                  = excluded.workspace_id,
-            updated_at                    = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            updated_at                    = {NOW_ISO8601}")
     )
     .bind(&id)
     .bind(name)

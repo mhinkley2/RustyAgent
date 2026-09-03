@@ -3,6 +3,7 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -83,18 +84,18 @@ pub async fn upsert_agent_permissions(
     let to_json = |v: &[String]| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
 
     sqlx::query(
-        "INSERT INTO agent_permissions
+        &format!("INSERT INTO agent_permissions
              (profile_id, allowed_tools, allow_file_read_paths, allow_file_write_paths,
               allow_shell_commands, require_approval_on_write,
               updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         VALUES (?, ?, ?, ?, ?, ?, {NOW_ISO8601})
          ON CONFLICT(profile_id) DO UPDATE SET
              allowed_tools           = excluded.allowed_tools,
              allow_file_read_paths   = excluded.allow_file_read_paths,
              allow_file_write_paths  = excluded.allow_file_write_paths,
              allow_shell_commands    = excluded.allow_shell_commands,
              require_approval_on_write = excluded.require_approval_on_write,
-             updated_at              = excluded.updated_at",
+             updated_at              = excluded.updated_at"),
     )
     .bind(&perms.profile_id)
     .bind(to_json(&perms.allowed_tools))

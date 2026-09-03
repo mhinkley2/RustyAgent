@@ -8,6 +8,7 @@
 use sqlx::sqlite::SqlitePoolOptions;
 
 use crate::DbPool;
+use crate::timestamps::NOW_ISO8601;
 
 /// Open a single-connection in-memory SQLite pool and run all migrations.
 ///
@@ -46,8 +47,8 @@ pub async fn seed_workspace(db: &DbPool, id: &str, path: &str) {
     let normalized = crate::normalize_workspace_path(std::path::Path::new(path));
 
     sqlx::query(
-        "INSERT INTO workspaces (id, path, name, last_opened_at)
-         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        &format!("INSERT INTO workspaces (id, path, name, last_opened_at)
+         VALUES (?, ?, ?, {NOW_ISO8601})"),
     )
     .bind(id)
     .bind(&normalized)

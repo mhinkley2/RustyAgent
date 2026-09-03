@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use tracing::info;
+use crate::timestamps::NOW_ISO8601;
 
 pub type DbPool = SqlitePool;
 
@@ -15,6 +16,9 @@ pub mod paths;
 /// mid-flight, plus the per-process id that makes it safe.
 pub mod recovery;
 pub mod story_status;
+
+/// The one spelling of a timestamp, shared by every crate that writes one.
+pub mod timestamps;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -269,11 +273,11 @@ pub async fn touch_workspace(db: &DbPool, path: &std::path::Path) -> Result<Work
     let workspace_id = uuid::Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO workspaces (id, path, name, last_opened_at)
-         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        &format!("INSERT INTO workspaces (id, path, name, last_opened_at)
+         VALUES (?, ?, ?, {NOW_ISO8601})
          ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
-            last_opened_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            last_opened_at = {NOW_ISO8601}")
     )
     .bind(&workspace_id)
     .bind(&normalized_path)

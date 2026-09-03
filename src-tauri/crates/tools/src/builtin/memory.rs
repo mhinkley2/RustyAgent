@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use sqlx::Row;
 use crate::{Tool, ToolContext, ToolOutput};
+use db::timestamps::NOW_ISO8601;
 
 /// Memory read/write tools backed by the agent_memory SQLite table.
 
@@ -124,9 +125,9 @@ impl Tool for MemoryWriteTool {
         // explicit UPDATE-then-INSERT to achieve correct upsert semantics.
         let update_result = if let Some(ref pid) = opt_pipeline_run_id {
             sqlx::query(
-                "UPDATE agent_memory
-                 SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE scope = 'shared_scratchpad' AND key = ? AND pipeline_run_id = ?",
+                &format!("UPDATE agent_memory
+                 SET value = ?, updated_at = {NOW_ISO8601}
+                 WHERE scope = 'shared_scratchpad' AND key = ? AND pipeline_run_id = ?"),
             )
             .bind(&value)
             .bind(&key)
@@ -135,9 +136,9 @@ impl Tool for MemoryWriteTool {
             .await
         } else {
             sqlx::query(
-                "UPDATE agent_memory
-                 SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE agent_profile_id = ? AND scope = ? AND key = ? AND pipeline_run_id IS NULL",
+                &format!("UPDATE agent_memory
+                 SET value = ?, updated_at = {NOW_ISO8601}
+                 WHERE agent_profile_id = ? AND scope = ? AND key = ? AND pipeline_run_id IS NULL"),
             )
             .bind(&value)
             .bind(&ctx.agent_profile_id)

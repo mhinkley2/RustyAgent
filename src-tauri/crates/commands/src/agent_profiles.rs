@@ -4,6 +4,7 @@ use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -237,13 +238,13 @@ pub async fn update_profile(
     let max_retries        = input.max_retries.unwrap_or(current.max_retries);
 
     sqlx::query(
-        "UPDATE agent_profiles
+        &format!("UPDATE agent_profiles
          SET name = ?, description = ?, system_prompt = ?, provider = ?, model = ?,
              context_strategy = ?, persistent_memory = ?, max_input_tokens = ?,
              max_output_tokens = ?, run_mode = ?, cron_expression = ?,
              continuous_poll_interval_secs = ?, max_iterations = ?, max_retries = ?,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?",
+             updated_at = {NOW_ISO8601}
+         WHERE id = ?"),
     )
     .bind(&name)
     .bind(&description)
@@ -352,7 +353,7 @@ pub async fn save_profile_toml(
     let toml_path_str = toml_file.to_string_lossy().to_string();
 
     // Record the toml_path and scope in the DB.
-    sqlx::query("UPDATE agent_profiles SET toml_path = ?, scope = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+    sqlx::query(&format!("UPDATE agent_profiles SET toml_path = ?, scope = ?, updated_at = {NOW_ISO8601} WHERE id = ?"))
         .bind(&toml_path_str)
         .bind(&scope)
         .bind(&id)

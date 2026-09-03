@@ -4,6 +4,7 @@ use sqlx::Row;
 use std::path::Path;
 use crate::paging::{cap_text_fields, page_envelope_of, page_request};
 use crate::{Tool, ToolContext, ToolOutput};
+use db::timestamps::NOW_ISO8601;
 
 async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
     let root = ctx.workspace_root.as_ref()?;
@@ -26,10 +27,10 @@ async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
         .to_string();
 
     let upserted = sqlx::query(
-        "INSERT INTO workspaces (id, path, name) VALUES (?, ?, ?)
+        &format!("INSERT INTO workspaces (id, path, name) VALUES (?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
-            last_opened_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            last_opened_at = {NOW_ISO8601}")
     )
     .bind(&workspace_id)
     .bind(&normalized)
@@ -588,7 +589,7 @@ impl Tool for UpdateStoryTool {
         let workspace_id = resolve_workspace_id(ctx).await;
 
         match sqlx::query(
-            "UPDATE stories SET
+            &format!("UPDATE stories SET
                  title = ?,
                  description = ?,
                  story_type = ?,
@@ -599,8 +600,8 @@ impl Tool for UpdateStoryTool {
                  track_history = ?,
                  labels = ?,
                  workspace_id = CASE WHEN workspace_id IS NULL THEN ? ELSE workspace_id END,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?"
+                 updated_at = {NOW_ISO8601}
+             WHERE id = ?")
         )
         .bind(&title)
         .bind(&description)
@@ -678,11 +679,11 @@ impl Tool for UpdateStoryStatusTool {
         let workspace_id = resolve_workspace_id(ctx).await;
 
         let result = sqlx::query(
-            "UPDATE stories SET
+            &format!("UPDATE stories SET
                  status = ?,
                  workspace_id = CASE WHEN workspace_id IS NULL THEN ? ELSE workspace_id END,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?"
+                 updated_at = {NOW_ISO8601}
+             WHERE id = ?")
         )
         .bind(&status)
         .bind(&workspace_id)

@@ -4,6 +4,7 @@ use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -345,12 +346,12 @@ pub async fn update_story(
     };
 
     sqlx::query(
-        "UPDATE stories SET
+        &format!("UPDATE stories SET
              title = ?, description = ?, story_type = ?, status = ?, priority = ?,
              assigned_agent_id = ?, requires_approval = ?, track_history = ?, labels = ?,
              workspace_id = CASE WHEN workspace_id IS NULL THEN ? ELSE workspace_id END,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?",
+             updated_at = {NOW_ISO8601}
+         WHERE id = ?"),
     )
     .bind(&title)
     .bind(&description)

@@ -4,6 +4,7 @@ use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tauri::{Emitter};
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Active workspace state (managed by Tauri runtime)
@@ -90,10 +91,10 @@ pub async fn open_workspace(
     let id = uuid::Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO workspaces (id, path, name) VALUES (?, ?, ?)
+        &format!("INSERT INTO workspaces (id, path, name) VALUES (?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            name           = excluded.name,
-           last_opened_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+           last_opened_at = {NOW_ISO8601}")
     )
     .bind(&id)
     .bind(&canonical_str)
