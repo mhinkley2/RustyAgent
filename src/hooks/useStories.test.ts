@@ -477,6 +477,66 @@ describe("useStories — reordering", () => {
       expect.anything(),
     );
   });
+
+  it("restores the previous order when the reorder is rejected", async () => {
+    // The optimistic update is applied before the write is attempted, so a
+    // rejection has to undo it. Nothing else holds the old order: leaving it
+    // means the board keeps an order the database refused, and says so only
+    // in a toast that scrolls away.
+    createStoryBackend([
+      rawStory({ id: "a", sort_order: 0 }),
+      rawStory({ id: "b", sort_order: 1 }),
+      rawStory({ id: "c", sort_order: 2 }),
+    ]);
+    const { result } = await renderLoaded();
+    tauriMock.handle("batch_update_story_order", () => {
+      throw new Error("write conflict");
+    });
+
+    await expect(
+      act(async () => {
+        await result.current.reorderStories([
+          { id: "c", sortOrder: 0 },
+          { id: "a", sortOrder: 1 },
+          { id: "b", sortOrder: 2 },
+        ]);
+      }),
+    ).rejects.toThrow();
+
+    expect(result.current.stories.map((s) => s.id)).toEqual(["a", "b", "c"]);
+    expect(result.current.stories.map((s) => s.sortOrder)).toEqual([0, 1, 2]);
+  });
+
+  it("does not empty the board when the write rejects before the update is flushed", () => {
+    // The rollback snapshot has to come from committed state, read before the
+    // optimistic update is scheduled. Taken from inside the `setStories`
+    // updater instead, it depends on React having run that updater before the
+    // write rejects -- which React does not promise. When it had not, the
+    // snapshot was still its initial empty list and the rollback wiped every
+    // card off the board.
+    return (async () => {
+      createStoryBackend([
+        rawStory({ id: "a", sort_order: 0 }),
+        rawStory({ id: "b", sort_order: 1 }),
+      ]);
+      const { result } = await renderLoaded();
+      tauriMock.handle("batch_update_story_order", () => {
+        throw new Error("write conflict");
+      });
+
+      // Deliberately outside `act`, so the rejection is handled without React
+      // having been given a chance to flush the optimistic update first.
+      const pending = result.current.reorderStories([
+        { id: "b", sortOrder: 0 },
+        { id: "a", sortOrder: 1 },
+      ]);
+      await expect(pending).rejects.toThrow();
+
+      await act(async () => {});
+
+      expect(result.current.stories.map((s) => s.id)).toEqual(["a", "b"]);
+    })();
+  });
 });
 
 describe("useStories — workspace changes", () => {

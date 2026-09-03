@@ -27,6 +27,7 @@
 use sqlx::{Executor, Sqlite};
 
 use crate::DbPool;
+use crate::timestamps::NOW_ISO8601;
 
 /// The key this feature reads out of a workspace's `settings_json`.
 ///
@@ -36,11 +37,6 @@ use crate::DbPool;
 /// established habit is worse than none.
 pub const AUTO_ADVANCE_SETTING: &str = "auto_advance_story_status";
 
-/// An ISO-8601 timestamp in the spelling the schema's own defaults use.
-///
-/// `CURRENT_TIMESTAMP` emits `YYYY-MM-DD HH:MM:SS`, which is not RFC 3339 and
-/// does not parse where the rest of the app parses timestamps.
-const NOW_ISO8601: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 /// Every state a `story_runs.status` may hold.
 pub const RUN_STATUSES: [&str; 4] = ["running", "done", "failed", "cancelled"];

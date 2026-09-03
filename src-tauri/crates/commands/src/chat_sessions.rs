@@ -1,6 +1,7 @@
 use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use db::timestamps::NOW_ISO8601;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSessionSummary {
@@ -189,7 +190,7 @@ pub async fn append_chat_session_message(
     .await
     .map_err(|e| format!("DB error appending chat message: {e}"))?;
 
-    sqlx::query("UPDATE stories SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query(&format!("UPDATE stories SET updated_at = {NOW_ISO8601} WHERE id = ?"))
         .bind(&session_id)
         .execute(db)
         .await

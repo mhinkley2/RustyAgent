@@ -22,7 +22,7 @@ resolver = "2"
 # Tauri stamps onto a bundle — and `version_drift_tests` holds the two in step
 # along with `package.json`.
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -1,10 +1,16 @@
 //! Workspace filesystem — reads only.
 //!
 //! Both tools delegate to `commands::filesystem`, which canonicalizes the path
-//! and verifies it stays inside the active workspace root (resolving symlinks
-//! and Windows junctions first). No write, rename, duplicate, create, or delete
+//! and verifies it stays inside the workspace root (resolving symlinks and
+//! Windows junctions first). No write, rename, duplicate, create, or delete
 //! command is exposed: those are available in the app, and an MCP client has no
 //! need to reach for them.
+//!
+//! The root comes from `ctx.workspace_root` — the scope resolved for *this*
+//! client — and not from the database's active workspace. They are the same
+//! value for a client that named no project, and deliberately different for one
+//! that did: a confined client's reads must stop at the project it named, or
+//! the confinement is a board filter wearing a filesystem guard's clothes.
 //!
 //! Both also cap what they return. `read_file` shares its cap, its 1-based
 //! `offset` / `limit` semantics and its truncation marker with the internal
@@ -36,8 +42,9 @@ const DIR_MAX_LIMIT: usize = 1000;
 mcp_tool! {
     pub ListDirectoryTool,
     name        = "list_directory",
-    description = "List the immediate children of a directory inside the active workspace. \
-                   Directories sort first. Build and VCS directories (.git, node_modules, \
+    description = "List the immediate children of a directory inside the workspace this \
+                   client is scoped to. Directories sort first. Build and VCS \
+                   directories (.git, node_modules, \
                    target, dist, …) are skipped. The reply is paged: it returns at most 200 \
                    entries by default (1000 with an explicit `limit`) and reports `total`, \
                    `complete` and a `next_offset` to continue from.",
@@ -66,7 +73,10 @@ mcp_tool! {
             Ok(request) => request,
             Err(error) => return ToolOutput::err(error),
         };
-        let entries = match commands::filesystem::list_directory(path.clone(), &ctx.db).await {
+        let Some(root) = ctx.workspace_root.as_deref() else {
+            return ToolOutput::err("No workspace is open");
+        };
+        let entries = match commands::filesystem::list_directory_in(path.clone(), root) {
             Ok(entries) => entries,
             Err(error) => return ToolOutput::err(error),
         };
@@ -90,8 +100,9 @@ mcp_tool! {
 mcp_tool! {
     pub ReadFileTool,
     name        = "read_file",
-    description = "Read a UTF-8 text file inside the active workspace. Two separate limits \
-                   apply. Files over 10 MB are refused outright. Below that, the reply is \
+    description = "Read a UTF-8 text file inside the workspace this client is scoped to. \
+                   Two separate limits apply. Files over 10 MB are refused outright. \
+                   Below that, the reply is \
                    capped at 32 KB of file text: when the file is larger, the content ends \
                    with an explicit [read_file TRUNCATED: …] marker giving the file's real \
                    size in bytes and lines, the line range this reply carries, and the \
@@ -142,7 +153,10 @@ mcp_tool! {
         // what keeps this path byte-identical to the internal `file_read` — a
         // second, cleverer range reader here is precisely the drift this story
         // exists to prevent.
-        let content = match commands::filesystem::read_file_text(path.clone(), &ctx.db).await {
+        let Some(root) = ctx.workspace_root.as_deref() else {
+            return ToolOutput::err("No workspace is open");
+        };
+        let content = match commands::filesystem::read_file_text_in(path.clone(), root) {
             Ok(content) => content,
             Err(error) => return ToolOutput::err(error),
         };

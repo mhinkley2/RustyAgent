@@ -22,6 +22,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { Story, StoryStatus } from "../../types/board";
+import { rollbackTarget, type ColMap as RollbackColMap } from "./dragRollback";
 import { KANBAN_COLUMNS } from "../../types/board";
 import { nextUpIds } from "./queue";
 import { StoryCard } from "./StoryCard";
@@ -159,7 +160,9 @@ function KanbanColumn({
 // KanbanView
 // ---------------------------------------------------------------------------
 
-type ColMap = Record<StoryStatus, Story[]>;
+// The board as the columns render it. Defined beside the rollback rule that
+// also reasons over it, so the two cannot drift apart.
+type ColMap = RollbackColMap;
 
 function buildColMap(stories: Story[]): ColMap {
   const colMap = {} as ColMap;
@@ -237,6 +240,17 @@ export function KanbanView({
   const [overColId, setOverColId] = useState<StoryStatus | null>(null);
   // Track the original column at drag-start for cross-column detection
   const originalColRef = useRef<StoryStatus | null>(null);
+  /**
+   * The board exactly as it stood before this drag began.
+   *
+   * `handleDragOver` rearranges `colMap` live as the pointer moves, so by the
+   * time a persist fails there is nothing left that remembers where the card
+   * came from. Without this a rejected write left the card sitting in the
+   * column the write had just failed to put it in: an error toast, and a board
+   * that silently disagrees with the database until something else happens to
+   * change the story list.
+   */
+  const beforeDragRef = useRef<ColMap | null>(null);
 
   // Sync colMap from props whenever not actively dragging
   useEffect(() => {
@@ -262,6 +276,7 @@ export function KanbanView({
     const col = findColOf(active.id, colMap);
     activeIdRef.current = active.id as string;
     originalColRef.current = col;
+    beforeDragRef.current = colMap;
     setActiveId(active.id);
     setOverColId(col);
   }
@@ -304,6 +319,7 @@ export function KanbanView({
     setActiveId(null);
     setOverColId(null);
     originalColRef.current = null;
+    beforeDragRef.current = null;
     // The columns were rearranged live as the pointer moved; put them back.
     setColMap(buildColMap(stories));
   }
@@ -320,10 +336,13 @@ export function KanbanView({
       // Cancelled — restore from props
       setColMap(buildColMap(stories));
       originalColRef.current = null;
+      beforeDragRef.current = null;
       return;
     }
 
     const currentColMap = colMap; // capture before any setColMap
+    const beforeDrag = beforeDragRef.current;
+    beforeDragRef.current = null;
     const currentCol = findColOf(active.id, currentColMap);
     if (!currentCol) {
       originalColRef.current = null;
@@ -345,15 +364,38 @@ export function KanbanView({
     const isCrossColumn = originalColRef.current && originalColRef.current !== currentCol;
     originalColRef.current = null;
 
-    // Persist cross-column status change
-    if (isCrossColumn) {
-      await onMove(active.id as string, currentCol);
+    const crossColumn = Boolean(isCrossColumn);
+    // `activeIdRef` is read at rejection time, not now: it is what says whether
+    // the user has since picked up another card.
+    const rollback = (failed: "move" | "reorder") => {
+      const snapshot = rollbackTarget({
+        failed,
+        crossColumn,
+        beforeDrag,
+        beforeReorder: currentColMap,
+        dragInFlight: Boolean(activeIdRef.current),
+      });
+      if (snapshot) setColMap(snapshot);
+    };
+
+    // Persist the cross-column status change.
+    if (crossColumn) {
+      try {
+        await onMove(active.id as string, currentCol);
+      } catch {
+        rollback("move");
+        return;
+      }
     }
 
-    // Persist column order
+    // Persist the column order.
     if (finalItems.length > 0) {
       const updates = finalItems.map((s, i) => ({ id: s.id, sortOrder: i }));
-      await onReorder(updates);
+      try {
+        await onReorder(updates);
+      } catch {
+        rollback("reorder");
+      }
     }
   }
 

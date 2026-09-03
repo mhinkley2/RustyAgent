@@ -4,10 +4,19 @@
 //! an external MCP client. Two transports share one dispatch and one tool
 //! registry:
 //!
+//! - **HTTP** — runs inside the desktop app, so it can also serve live
+//!   scheduler and pipeline state. Requires a bearer token. **Prefer this.**
 //! - **stdio** (newline-delimited JSON) — a standalone binary that works with
 //!   the desktop app closed. Serves everything backed by the database.
-//! - **HTTP** — runs inside the desktop app, so it can also serve live
-//!   scheduler and pipeline state. Requires a bearer token.
+//!
+//! HTTP is the recommendation because one server serves every client. stdio is
+//! one process per editor window — that is how it scopes a client to a project,
+//! and each of those processes holds an open handle on `rustyagent-board-mcp`
+//! for as long as the editor lives, so a build or an installer cannot replace
+//! the binary until every editor is closed. The HTTP server scopes per request
+//! instead ([`WORKSPACE_HEADER`]), which costs no processes and no locks.
+//!
+//! Reach for stdio when the app is closed, or has to be.
 //!
 //! Tools that depend on the running app declare `requires_host()`. On stdio
 //! they are hidden from `tools/list` and refused by `tools/call`, rather than
@@ -39,13 +48,24 @@ pub mod auth;
 /// local one wins.
 pub use ::tools::paging;
 
-pub use ctx::{HostBridge, McpCtx};
+pub use ctx::{HostBridge, McpCtx, PinScope};
 pub use protocol::{handle_message, handle_message_refreshed, SUPPORTED_PROTOCOL_VERSIONS};
 pub use registry::{McpRegistry, McpTool};
 pub use tools::build_registry;
 
 /// Default port for the HTTP transport.
 pub const DEFAULT_MCP_PORT: u16 = 8765;
+
+/// Names the project an HTTP request is scoped to.
+///
+/// Declared here rather than in the transport because the refusal in
+/// `use_workspace` names it, and that tool compiles with or without the `http`
+/// feature.
+pub const WORKSPACE_HEADER: &str = "X-RustyAgent-Workspace";
+
+/// The same thing as a query parameter, for a client that can template a URL
+/// but not a header value.
+pub const WORKSPACE_QUERY_KEY: &str = "workspace";
 
 /// Port override, read fresh so a restart picks up a change.
 pub fn mcp_port() -> u16 {

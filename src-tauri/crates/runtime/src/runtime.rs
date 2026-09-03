@@ -18,6 +18,7 @@ use memory::MemoryStore;
 use crate::approval_gate::ApprovalGate;
 use crate::context::{self, ContextPolicy, ContextStrategy};
 use crate::{PermissionPolicy, PolicyDecision};
+use db::timestamps::NOW_ISO8601;
 
 /// Output cap for the summarisation call `context_strategy = "summary"` makes.
 ///
@@ -520,11 +521,11 @@ impl ConversationRuntime {
         // `owner_instance_id` stamps the row with this launch of the app, so
         // the startup sweep in `db::recovery` can tell a run this process is
         // executing from one a previous process died holding.
-        sqlx::query(
+        sqlx::query(&format!(
             "INSERT INTO story_runs
                  (id, story_id, agent_profile_id, status, before_sha, started_at, owner_instance_id)
-             VALUES (?, ?, ?, 'running', ?, CURRENT_TIMESTAMP, ?)"
-        )
+             VALUES (?, ?, ?, 'running', ?, {NOW_ISO8601}, ?)"
+        ))
         .bind(&run_id)
         .bind(&story_id)
         .bind(&agent_profile_id)
@@ -1470,10 +1471,10 @@ impl ConversationRuntime {
     /// that made the old timeout so misleading.
     async fn settle_unanswered(&self, approval_id: &str, outcome: ApprovalOutcome) {
         let _ = sqlx::query(
-            "UPDATE approval_requests \
+            &format!("UPDATE approval_requests \
              SET status = ?, rejection_reason = ?, \
-                 decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE id = ? AND status = 'pending'",
+                 decided_at = {NOW_ISO8601} \
+             WHERE id = ? AND status = 'pending'"),
         )
         .bind(outcome.as_str())
         .bind(outcome.explanation())
@@ -1836,15 +1837,15 @@ impl ConversationRuntime {
             );
         }
 
-        let _ = sqlx::query(
+        let _ = sqlx::query(&format!(
             "UPDATE story_runs \
-             SET status = ?, finished_at = CURRENT_TIMESTAMP, \
+             SET status = ?, finished_at = {NOW_ISO8601}, \
                  iteration_count = ?, \
                  input_tokens = ?, output_tokens = ?, \
                  cache_read_input_tokens = ?, cache_creation_input_tokens = ?, \
                  estimated_cost_usd = COALESCE(?, estimated_cost_usd) \
              WHERE id = ?"
-        )
+        ))
         .bind(status)
         .bind(i64::from(iterations))
         .bind(Self::clamp_to_i64(usage.input_tokens))

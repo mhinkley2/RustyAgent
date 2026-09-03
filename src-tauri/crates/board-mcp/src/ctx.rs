@@ -4,6 +4,22 @@ use std::{path::PathBuf, sync::Arc};
 
 use serde_json::Value;
 
+/// How a client asked to be confined to one workspace.
+///
+/// Carried so a refusal can name the thing that would have to change. Both
+/// transports confine for the same reason, but a client can only act on advice
+/// about the mechanism it actually used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinScope {
+    /// Resolved once at startup by the stdio binary — one process per editor
+    /// window — from `RUSTYAGENT_WORKSPACE` or its working directory.
+    Process,
+    /// Named per request by a header, on the one HTTP server the app hosts for
+    /// every client. Per request because that server is stateless: there is no
+    /// session for a scope to live in.
+    Request,
+}
+
 /// Everything an MCP tool is allowed to touch.
 ///
 /// Deliberately free of Tauri types, so the entire tool surface can be tested
@@ -25,18 +41,16 @@ pub struct McpCtx {
     pub app_data_dir: Option<PathBuf>,
     /// Present only when the server is running inside the desktop app.
     pub host: Option<Arc<dyn HostBridge>>,
-    /// This client is confined to `workspace_root` for its whole lifetime.
+    /// This client is confined to `workspace_root`, and how it asked to be.
     ///
-    /// Set once at startup by the stdio binary, which is one process per editor
-    /// window. `refresh_workspace` then leaves the scope alone instead of
-    /// re-reading the database's single most-recently-opened workspace, and
-    /// `use_workspace` refuses — a pin a client can undo on its own is a
-    /// default, not a confinement.
+    /// [`refresh_workspace`](Self::refresh_workspace) then leaves the scope
+    /// alone instead of re-reading the database's single most-recently-opened
+    /// workspace, and `use_workspace` refuses — a pin a client can undo on its
+    /// own is a default, not a confinement.
     ///
-    /// Never set on the HTTP transport: one shared context serves every caller
-    /// there, and following the workspace the app has open is the correct
-    /// behaviour for the window the user is looking at.
-    pub pinned: bool,
+    /// `None` follows the workspace the app has open. That is what the app's
+    /// own webview wants, and what a client that named no project gets.
+    pub pin: Option<PinScope>,
 }
 
 impl McpCtx {
@@ -47,21 +61,26 @@ impl McpCtx {
             workspace_id: None,
             app_data_dir: None,
             host: None,
-            pinned: false,
+            pin: None,
         }
     }
 
-    /// Confine this context to one workspace, resolved at startup.
+    /// Confine this context to one workspace.
     ///
-    /// Both halves are supplied by the caller because only it can do the
-    /// lookup that refuses an unknown path — this must never be able to
-    /// register a workspace, or a client could point itself at any directory
-    /// and then read it through `read_file`.
-    pub fn pinned_to(mut self, root: PathBuf, id: Option<String>) -> Self {
+    /// Both halves of the workspace are supplied by the caller because only it
+    /// can do the lookup that refuses an unknown path — this must never be
+    /// able to register a workspace, or a client could point itself at any
+    /// directory and then read it through `read_file`.
+    pub fn pinned_to(mut self, root: PathBuf, id: Option<String>, scope: PinScope) -> Self {
         self.workspace_root = Some(root);
         self.workspace_id = id;
-        self.pinned = true;
+        self.pin = Some(scope);
         self
+    }
+
+    /// Whether this client is confined to a single workspace.
+    pub fn pinned(&self) -> bool {
+        self.pin.is_some()
     }
 
     pub fn with_app_data_dir(mut self, dir: Option<PathBuf>) -> Self {
@@ -91,7 +110,7 @@ impl McpCtx {
     /// one database, and whichever activated its workspace last would silently
     /// become the scope for both.
     pub async fn refresh_workspace(&mut self) {
-        if self.pinned {
+        if self.pinned() {
             return;
         }
 

@@ -8,6 +8,7 @@
 use sqlx::sqlite::SqlitePoolOptions;
 
 use crate::DbPool;
+use crate::timestamps::NOW_ISO8601;
 
 /// Open a single-connection in-memory SQLite pool and run all migrations.
 ///
@@ -35,13 +36,22 @@ pub async fn make_test_pool() -> DbPool {
 
 /// Insert a workspace row. Several tests need two of them to prove that a
 /// query is scoped to the active workspace rather than returning everything.
+///
+/// Stored through [`normalize_workspace_path`](crate::normalize_workspace_path),
+/// so a seeded row is spelled the way the app would have spelled it. A test
+/// that seeds a real temp directory and then looks it up otherwise depends on
+/// the path surviving canonicalization unchanged — true under `/tmp` on Linux,
+/// false on macOS, where `/var` is a symlink into `/private/var` and every
+/// lookup would miss a row seeded verbatim.
 pub async fn seed_workspace(db: &DbPool, id: &str, path: &str) {
+    let normalized = crate::normalize_workspace_path(std::path::Path::new(path));
+
     sqlx::query(
-        "INSERT INTO workspaces (id, path, name, last_opened_at)
-         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        &format!("INSERT INTO workspaces (id, path, name, last_opened_at)
+         VALUES (?, ?, ?, {NOW_ISO8601})"),
     )
     .bind(id)
-    .bind(path)
+    .bind(&normalized)
     .bind(id)
     .execute(db)
     .await

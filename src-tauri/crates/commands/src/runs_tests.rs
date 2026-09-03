@@ -467,3 +467,119 @@ fn every_filter_field_uses_the_same_convention() {
     assert_eq!(filters.agent_profile_id.as_deref(), Some("a1"));
     assert_eq!(filters.status.as_deref(), Some("done"));
 }
+
+// ---------------------------------------------------------------------------
+// Durations
+// ---------------------------------------------------------------------------
+//
+// A duration is only ever as good as the format the timestamps were stored in.
+// `story_runs` has held two — the schema's RFC 3339 defaults and the
+// `CURRENT_TIMESTAMP` the writers used to emit — and a run stored the second
+// way parsed as nothing, so the column rendered `—` for every finished run.
+// The writers now agree with the schema and a migration normalises what was
+// already written; these pin both halves.
+
+/// Seed a finished run with timestamps spelled exactly as given.
+async fn seed_finished_run(db: &DbPool, id: &str, started: &str, finished: &str) {
+    sqlx::query(
+        "INSERT INTO story_runs (id, story_id, agent_profile_id, status, started_at, finished_at)
+         VALUES (?, ?, ?, 'done', ?, ?)",
+    )
+    .bind(id)
+    .bind(STORY_ID)
+    .bind(PROFILE_ID)
+    .bind(started)
+    .bind(finished)
+    .execute(db)
+    .await
+    .expect("seed a finished run");
+}
+
+#[tokio::test]
+async fn a_finished_run_reports_a_duration() {
+    let f = Fixture::new().await;
+    seed_finished_run(
+        &f.db,
+        "run-duration",
+        "2026-05-22T20:58:30.000Z",
+        "2026-05-22T20:59:12.000Z",
+    )
+    .await;
+
+    let runs = crate::runs::get_runs(None, None, &f.db).await.expect("list runs");
+    let run = runs.iter().find(|r| r.id == "run-duration").expect("the seeded run");
+
+    assert_eq!(run.duration_secs, Some(42.0));
+}
+
+/// The writers wrote this shape for the whole life of the app before the fix.
+/// The read boundary normalises it and the migration rewrites it in place, so
+/// history keeps its durations rather than going permanently blank.
+#[tokio::test]
+async fn a_run_stored_the_old_way_still_reports_a_duration() {
+    let f = Fixture::new().await;
+    seed_finished_run(
+        &f.db,
+        "run-legacy",
+        "2026-05-22 20:58:30",
+        "2026-05-22 20:59:12",
+    )
+    .await;
+
+    let runs = crate::runs::get_runs(None, None, &f.db).await.expect("list runs");
+    let run = runs.iter().find(|r| r.id == "run-legacy").expect("the seeded run");
+
+    assert_eq!(run.duration_secs, Some(42.0));
+}
+
+/// The guard the database cannot provide. What the writers actually emit has
+/// to parse with the function that reads it back, and a `CURRENT_TIMESTAMP`
+/// creeping back into a writer fails here rather than in a blank column.
+#[tokio::test]
+async fn what_the_writers_emit_parses_where_the_reader_parses_it() {
+    let f = Fixture::new().await;
+    sqlx::query(&format!(
+        "INSERT INTO story_runs (id, story_id, agent_profile_id, status, started_at, finished_at)
+         VALUES ('run-written', ?, ?, 'done', {now}, {now})",
+        now = db::timestamps::NOW_ISO8601
+    ))
+    .bind(STORY_ID)
+    .bind(PROFILE_ID)
+    .execute(&f.db)
+    .await
+    .expect("write timestamps the way the writers do");
+
+    let stored: (String, String) =
+        sqlx::query_as("SELECT started_at, finished_at FROM story_runs WHERE id = 'run-written'")
+            .fetch_one(&f.db)
+            .await
+            .expect("read them back");
+
+    assert!(
+        db::timestamps::parses_as_rfc3339(&stored.0),
+        "started_at was stored as {:?}",
+        stored.0
+    );
+    assert!(
+        db::timestamps::parses_as_rfc3339(&stored.1),
+        "finished_at was stored as {:?}",
+        stored.1
+    );
+}
+
+/// Runs sort by `started_at`, which is a lexicographic sort over text. Mixed
+/// formats sort inconsistently against each other because `T` and a space have
+/// different byte values; one format means the order is the real one.
+#[tokio::test]
+async fn runs_sort_by_start_time_across_the_format_boundary() {
+    let f = Fixture::new().await;
+    seed_finished_run(&f.db, "older", "2026-05-22T20:58:30.000Z", "2026-05-22T20:59:12.000Z").await;
+    seed_finished_run(&f.db, "newer", "2026-05-23T09:00:00.000Z", "2026-05-23T09:01:00.000Z").await;
+
+    let runs = crate::runs::get_runs(None, None, &f.db).await.expect("list runs");
+    let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+
+    let newer = ids.iter().position(|id| *id == "newer").expect("newer run");
+    let older = ids.iter().position(|id| *id == "older").expect("older run");
+    assert!(newer < older, "expected newest first, got {ids:?}");
+}

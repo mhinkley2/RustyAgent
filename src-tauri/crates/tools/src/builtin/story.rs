@@ -4,22 +4,19 @@ use sqlx::Row;
 use std::path::Path;
 use crate::paging::{cap_text_fields, page_envelope_of, page_request};
 use crate::{Tool, ToolContext, ToolOutput};
+use db::timestamps::NOW_ISO8601;
 
 async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
     let root = ctx.workspace_root.as_ref()?;
-    let raw = root.to_string_lossy();
-    let normalized = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+    let normalized = db::normalize_workspace_path(root);
 
-    let existing = sqlx::query(
-        "SELECT id FROM workspaces WHERE path = ? ORDER BY last_opened_at DESC LIMIT 1"
-    )
-    .bind(&normalized)
-    .fetch_optional(&ctx.db)
-    .await
-    .ok()?;
-
-    if let Some(row) = existing {
-        return row.try_get::<String, _>("id").ok();
+    // The same lookup the rest of the app uses, rather than a second spelling
+    // of it. This function *inserts* when it misses, so a lookup that is
+    // stricter than the one that wrote the row does not merely fail — it mints
+    // a duplicate workspace, and stories start landing on a board nothing else
+    // reads.
+    if let Some(existing) = db::find_workspace_by_path(&ctx.db, root).await {
+        return Some(existing.id);
     }
 
     let workspace_id = uuid::Uuid::new_v4().to_string();
@@ -30,10 +27,10 @@ async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
         .to_string();
 
     let upserted = sqlx::query(
-        "INSERT INTO workspaces (id, path, name) VALUES (?, ?, ?)
+        &format!("INSERT INTO workspaces (id, path, name) VALUES (?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
-            last_opened_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            last_opened_at = {NOW_ISO8601}")
     )
     .bind(&workspace_id)
     .bind(&normalized)
@@ -592,7 +589,7 @@ impl Tool for UpdateStoryTool {
         let workspace_id = resolve_workspace_id(ctx).await;
 
         match sqlx::query(
-            "UPDATE stories SET
+            &format!("UPDATE stories SET
                  title = ?,
                  description = ?,
                  story_type = ?,
@@ -603,8 +600,8 @@ impl Tool for UpdateStoryTool {
                  track_history = ?,
                  labels = ?,
                  workspace_id = CASE WHEN workspace_id IS NULL THEN ? ELSE workspace_id END,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?"
+                 updated_at = {NOW_ISO8601}
+             WHERE id = ?")
         )
         .bind(&title)
         .bind(&description)
@@ -682,11 +679,11 @@ impl Tool for UpdateStoryStatusTool {
         let workspace_id = resolve_workspace_id(ctx).await;
 
         let result = sqlx::query(
-            "UPDATE stories SET
+            &format!("UPDATE stories SET
                  status = ?,
                  workspace_id = CASE WHEN workspace_id IS NULL THEN ? ELSE workspace_id END,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?"
+                 updated_at = {NOW_ISO8601}
+             WHERE id = ?")
         )
         .bind(&status)
         .bind(&workspace_id)

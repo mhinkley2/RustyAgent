@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use board_mcp::{build_registry, McpCtx};
+use board_mcp::{build_registry, McpCtx, PinScope};
 use serde_json::{json, Value};
 
 /// Two registered projects on one board, with directories that really exist.
@@ -57,7 +57,7 @@ async fn seed_story_in(db: &db::DbPool, id: &str, title: &str, workspace_id: &st
 
 /// A client confined to one project, as the stdio binary builds one.
 fn pinned(db: &db::DbPool, path: &Path, id: &str) -> McpCtx {
-    McpCtx::new(db.clone()).pinned_to(path.to_path_buf(), Some(id.to_string()))
+    McpCtx::new(db.clone()).pinned_to(path.to_path_buf(), Some(id.to_string()), PinScope::Process)
 }
 
 /// Dispatch one tool call and return its structured payload.
@@ -133,6 +133,20 @@ fn story_titles(payload: &Value) -> Vec<String> {
         .iter()
         .map(|s| s["title"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+/// Point the app at one of the two projects, deterministically.
+///
+/// Not by seeding order: `last_opened_at` has millisecond resolution and two
+/// seeds land in the same millisecond often enough to matter, at which point
+/// the ordering tiebreak decides and the test flakes.
+async fn make_active(db: &db::DbPool, id: &str) {
+    sqlx::query("UPDATE workspaces SET last_opened_at = ? WHERE id = ?")
+        .bind("2099-01-01T00:00:00.000Z")
+        .bind(id)
+        .execute(db)
+        .await
+        .expect("promote a workspace");
 }
 
 // ---------------------------------------------------------------------------
@@ -321,4 +335,33 @@ async fn a_pinned_client_lists_its_own_workspaces_agent_profiles() {
         .collect();
 
     assert_eq!(names, ["A's agent"]);
+}
+
+#[tokio::test]
+async fn a_pinned_clients_file_reads_stop_at_its_own_project() {
+    // The pin was a board scope only: `read_file` re-derived its root from the
+    // database's active workspace, so a client confined to A read whatever
+    // project the app had open. The confinement now covers the filesystem too.
+    let p = two_projects().await;
+    std::fs::write(p.a.join("mine.txt"), "a").expect("write a");
+    std::fs::write(p.b.join("theirs.txt"), "b").expect("write b");
+    make_active(&p.db, "ws-b").await;
+
+    let a = pinned(&p.db, &p.a, "ws-a");
+
+    let mine = call(
+        &a,
+        "read_file",
+        json!({ "path": p.a.join("mine.txt").to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(mine["content"], json!("a"));
+
+    let error = call_err(
+        &a,
+        "read_file",
+        json!({ "path": p.b.join("theirs.txt").to_string_lossy() }),
+    )
+    .await;
+    assert!(error.contains("outside the workspace"), "got {error}");
 }

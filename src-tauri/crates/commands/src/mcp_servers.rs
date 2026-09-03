@@ -4,6 +4,7 @@ use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // MCP Server types
@@ -211,11 +212,11 @@ pub async fn update_mcp_server(
     let env_json = serde_json::to_string(&env_vars).unwrap_or_else(|_| "{}".to_string());
 
     sqlx::query(
-        "UPDATE mcp_servers
+        &format!("UPDATE mcp_servers
          SET name = ?, command = ?, args = ?, env_vars = ?,
              auto_restart = ?, max_restart_attempts = ?,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?",
+             updated_at = {NOW_ISO8601}
+         WHERE id = ?"),
     )
     .bind(&name)
     .bind(&command)

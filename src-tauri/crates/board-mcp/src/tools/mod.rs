@@ -5,11 +5,11 @@
 //!
 //! ## Response size
 //!
-//! Every tool here answers into an external agent's context. The five that
-//! could return unbounded text are bounded: `read_file` by the shared
-//! [`tools::read_cap`] cap, and `get_run_events`, `get_chat_session_messages`,
-//! `list_directory` and `list_stories` by [`crate::paging`]. `get_app_logs`
-//! returns a bounded tail by default.
+//! Every tool here answers into an external agent's context. The six that
+//! could return unbounded text are bounded: `read_file` and `get_run_diff` by
+//! the shared [`tools::read_cap`] cap, and `get_run_events`,
+//! `get_chat_session_messages`, `list_directory` and `list_stories` by
+//! [`crate::paging`]. `get_app_logs` returns a bounded tail by default.
 //!
 //! `list_stories` is bounded in the shared agent tool rather than here. The
 //! earlier note treated "capping it changes the internal agent tool too" as the
@@ -17,11 +17,14 @@
 //! the same finite context an agent outside it does, and answering "what
 //! stories exist" with every story's full specification floods both.
 //!
+//! `get_run_diff` caps here rather than in `commands::runs::get_run_diff`,
+//! which also serves the app's own run detail panel: a human reviewing a run
+//! wants the whole diff. Same split as `read_file` versus the editor. Its
+//! marker carries one warning the file read does not need — a diff that was
+//! cut is no longer a patch, and `git apply` on it fails or applies a subset.
+//!
 //! Still unbounded, audited and knowingly left alone rather than overlooked:
 //!
-//! * `get_run_diff` — one `diff_output` blob, which `commands::runs` itself
-//!   notes "can be arbitrarily large". The largest remaining hole on this
-//!   surface.
 //! * `list_runs`, `list_agent_profiles`, `list_workspaces`,
 //!   `list_pending_approvals`, `list_pending_human_requests`,
 //!   `list_custom_tools`, `get_custom_tool_bindings` — fixed-shape rows with no

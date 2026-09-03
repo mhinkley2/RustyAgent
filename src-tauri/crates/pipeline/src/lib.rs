@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 mod story_tests;
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Pipeline configuration — stored as JSON in stories.pipeline_config
@@ -379,9 +380,11 @@ pub async fn start_pipeline(
         // `owner_instance_id` marks the row as belonging to this launch of the
         // app, so the startup sweep in `db::recovery` leaves a live pipeline
         // alone and only reconciles one a previous process died holding.
-        "INSERT INTO story_runs \
-             (id, story_id, agent_profile_id, status, started_at, owner_instance_id) \
-         VALUES (?, ?, ?, 'running', CURRENT_TIMESTAMP, ?)",
+        &format!(
+            "INSERT INTO story_runs \
+                 (id, story_id, agent_profile_id, status, started_at, owner_instance_id) \
+             VALUES (?, ?, ?, 'running', {NOW_ISO8601}, ?)"
+        ),
     )
     .bind(&pipeline_run_id)
     .bind(&story_id)
@@ -469,7 +472,7 @@ pub async fn start_pipeline(
         }
 
         if let Err(e) = sqlx::query(
-            "UPDATE story_runs SET status = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            &format!("UPDATE story_runs SET status = ?, finished_at = {NOW_ISO8601} WHERE id = ?"),
         )
         .bind(final_status)
         .bind(&pid)
@@ -911,14 +914,14 @@ async fn fire_step_run(
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let _ = sqlx::query(
-                "UPDATE story_runs SET status='failed', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?",
+                &format!("UPDATE story_runs SET status='failed', finished_at={NOW_ISO8601} WHERE id=?"),
             )
             .bind(&run_id).execute(&db).await;
             return Err(e);
         }
         Err(e) => {
             let _ = sqlx::query(
-                "UPDATE story_runs SET status='failed', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?",
+                &format!("UPDATE story_runs SET status='failed', finished_at={NOW_ISO8601} WHERE id=?"),
             )
             .bind(&run_id).execute(&db).await;
             return Err(anyhow!("Step task panicked: {e}"));
@@ -1221,17 +1224,17 @@ async fn update_step_status(
 
     let result = if let Some(rid) = run_id {
         sqlx::query(
-            "UPDATE pipeline_step_runs \
-             SET status = ?, run_id = ?, output = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE pipeline_run_id = ? AND step_index = ?",
+            &format!("UPDATE pipeline_step_runs \
+             SET status = ?, run_id = ?, output = ?, updated_at = {NOW_ISO8601} \
+             WHERE pipeline_run_id = ? AND step_index = ?"),
         )
         .bind(status).bind(rid).bind(output).bind(pipeline_run_id).bind(index as i64)
         .execute(db).await
     } else {
         sqlx::query(
-            "UPDATE pipeline_step_runs \
-             SET status = ?, output = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE pipeline_run_id = ? AND step_index = ?",
+            &format!("UPDATE pipeline_step_runs \
+             SET status = ?, output = ?, updated_at = {NOW_ISO8601} \
+             WHERE pipeline_run_id = ? AND step_index = ?"),
         )
         .bind(status).bind(output).bind(pipeline_run_id).bind(index as i64)
         .execute(db).await

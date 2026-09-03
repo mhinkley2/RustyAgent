@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -136,11 +137,11 @@ pub async fn respond_to_human_request(
         .and_then(|r| r.try_get("parent_run_id").ok().flatten());
 
     sqlx::query(
-        "UPDATE stories
+        &format!("UPDATE stories
          SET human_response = ?,
              status = 'done',
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ? AND story_type = 'human'",
+             updated_at = {NOW_ISO8601}
+         WHERE id = ? AND story_type = 'human'"),
     )
     .bind(&response)
     .bind(&story_id)
@@ -299,11 +300,11 @@ pub async fn decide_approval(
     let status = if approved { "approved" } else { "rejected" };
 
     sqlx::query(
-        "UPDATE approval_requests
+        &format!("UPDATE approval_requests
          SET status = ?,
              rejection_reason = ?,
-             decided_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?",
+             decided_at = {NOW_ISO8601}
+         WHERE id = ?"),
     )
     .bind(status)
     .bind(&rejection_reason)

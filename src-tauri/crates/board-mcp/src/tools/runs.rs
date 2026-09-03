@@ -1,6 +1,10 @@
 //! Run history — read only. Runs are started from the app, not over MCP.
 
-use tools::ToolOutput;
+use serde_json::{json, Value};
+use tools::{
+    read_cap::{optional_positive, read_page},
+    ToolOutput,
+};
 
 use crate::{
     mcp_tool,
@@ -132,17 +136,123 @@ mcp_tool! {
     pub GetRunDiffTool,
     name        = "get_run_diff",
     description = "Read the git diff captured for one run — what the agent changed in the \
-                   workspace. Null when the workspace is not a git repository.",
+                   workspace. Null when the workspace is not a git repository. The reply is \
+                   capped at 32 KB of diff text: when the diff is larger, the content ends \
+                   with an explicit [get_run_diff TRUNCATED: …] marker giving the diff's \
+                   real size in bytes and lines, the line range this reply carries, and the \
+                   `offset` to call get_run_diff with to continue. Use the optional 1-based \
+                   `offset` and `limit` parameters to page through a large diff deliberately, \
+                   and the `truncated`, `complete` and `next_offset` fields to do it \
+                   programmatically. A partial diff is for READING ONLY: it is not a valid \
+                   patch and must never be fed to `git apply`, which will either fail or \
+                   apply a subset of the change. `before_sha` is always present; use it to \
+                   obtain the real diff by other means.",
     schema      = {
         "type": "object",
-        "properties": { "run_id": { "type": "string", "description": "UUID of the run" } },
+        "properties": {
+            "run_id": { "type": "string", "description": "UUID of the run" },
+            "offset": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional 1-based line number to start reading from. Defaults to 1."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional maximum number of lines to return. Defaults to the \
+                                rest of the diff, subject to the 32 KB cap."
+            }
+        },
         "required": ["run_id"]
     },
     |input, ctx| {
         let Some(run_id) = str_arg(&input, "run_id") else {
             return ToolOutput::err("Missing required field: run_id");
         };
-        json_result(commands::runs::get_run_diff(run_id, &ctx.db).await)
+        let offset = match optional_positive(&input, "offset") {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::err(error),
+        };
+        let limit = match optional_positive(&input, "limit") {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::err(error),
+        };
+
+        // The cap lives here rather than in `commands::runs::get_run_diff`,
+        // which also serves `RunDetailPanel` through the Tauri command layer.
+        // A human reviewing a run wants the whole diff, and truncating for the
+        // agent must not truncate for them. Same split as `read_file` versus
+        // the editor: the shared function stays unbounded, the agent-facing
+        // wrapper caps.
+        let diff = match commands::runs::get_run_diff(run_id.clone(), &ctx.db).await {
+            Ok(diff) => diff,
+            Err(error) => return ToolOutput::err(error),
+        };
+
+        // A run that changed nothing has no diff. That is an answer, not a
+        // truncated read: report it cleanly rather than paging an empty string.
+        let Some(diff_output) = diff.diff_output else {
+            return json_ok(json!({
+                "run_id": diff.run_id,
+                "before_sha": diff.before_sha,
+                "diff_output": Value::Null,
+                "truncated": false,
+                "complete": true,
+                "next_offset": Value::Null,
+            }));
+        };
+
+        match read_page(&diff_output, offset, limit, "get_run_diff", &format!("run {run_id}")) {
+            Ok(page) => json_ok(json!({
+                "run_id": diff.run_id,
+                // Small, and the one thing that lets a caller fetch the real
+                // diff by other means, so it survives truncation.
+                "before_sha": diff.before_sha,
+                "diff_output": with_patch_warning(page.text, page.partial),
+                "truncated": page.truncated,
+                "complete": !page.partial,
+                "first_line": page.first_line,
+                "last_line": page.last_line,
+                "total_lines": page.total_lines,
+                "total_bytes": page.total_bytes,
+                "next_offset": page.next_offset,
+            })),
+            Err(error) => ToolOutput::err(error),
+        }
+    }
+}
+
+/// Warn, inside a partial diff, that what it holds is not a patch.
+///
+/// `read_page`'s marker says the text is incomplete, which is all a file read
+/// needs: half a file is still quotable. Half a unified diff is not — fed to
+/// `git apply` it fails or, worse, applies a subset of the change — and that
+/// is the one thing this tool must say and cannot inherit.
+///
+/// The warning goes *before* `read_page`'s marker rather than after it, so the
+/// marker stays the final suffix the way it is on every other capped read.
+/// That keeps the trailing "call again with offset N" as the last thing read,
+/// and it keeps working for anything that finds the marker by searching from
+/// the end. If the marker cannot be located the warning is appended instead:
+/// saying it in the wrong place beats not saying it.
+fn with_patch_warning(text: String, partial: bool) -> String {
+    const WARNING: &str = "\n[get_run_diff: this is a PARTIAL diff and is NOT an applicable \
+                           patch. Do not pass it to `git apply` or reconstruct a commit from \
+                           it; it will fail or apply only part of the change. Read it, page \
+                           through it with \"offset\", or use `before_sha` to obtain the real \
+                           diff.]";
+    if !partial {
+        return text;
+    }
+    match text.rfind("\n[get_run_diff ") {
+        Some(at) => {
+            let mut out = String::with_capacity(text.len() + WARNING.len());
+            out.push_str(&text[..at]);
+            out.push_str(WARNING);
+            out.push_str(&text[at..]);
+            out
+        }
+        None => text + WARNING,
     }
 }
 

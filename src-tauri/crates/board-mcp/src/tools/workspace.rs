@@ -6,9 +6,29 @@ use serde_json::json;
 use tools::ToolOutput;
 
 use crate::{
+    ctx::PinScope,
     mcp_tool,
     registry::{json_ok, json_result, str_arg},
 };
+
+/// What a confined client would have to change to stop being confined.
+///
+/// Named per mechanism: telling an HTTP client to unset an environment
+/// variable it never read is advice it cannot act on.
+fn how_to_lift(scope: PinScope) -> String {
+    match scope {
+        PinScope::Process => format!(
+            "unset {} to share the app's workspace",
+            db::paths::WORKSPACE_ENV
+        ),
+        PinScope::Request => format!(
+            "drop the {} header (or the '{}' query parameter) to follow the app's \
+             active workspace",
+            crate::WORKSPACE_HEADER,
+            crate::WORKSPACE_QUERY_KEY
+        ),
+    }
+}
 
 /// Strip the Windows extended-length prefix so paths compare consistently with
 /// what `db::normalize_workspace_path` stores.
@@ -72,7 +92,7 @@ mcp_tool! {
         // switch to any of the others, so listing them would be an inventory of
         // the user's repositories handed to an agent that has no use for it —
         // and an invitation to keep trying `use_workspace` and being refused.
-        let workspaces: Vec<_> = if ctx.pinned {
+        let workspaces: Vec<_> = if ctx.pinned() {
             workspaces
                 .into_iter()
                 .filter(|workspace| current.as_deref() == Some(workspace.path.as_str()))
@@ -138,17 +158,17 @@ mcp_tool! {
         // valid target, including the workspace it is already on. Accepting
         // that one would make this a no-op that looks like a success, and the
         // model would have no way to learn the rule.
-        if ctx.pinned {
+        if let Some(scope) = ctx.pin {
             let current = ctx
                 .workspace_root
                 .as_deref()
                 .map(normalize_path)
                 .unwrap_or_else(|| "its workspace".to_string());
             return ToolOutput::err(format!(
-                "This client is confined to '{current}' and cannot switch workspaces. It was \
-                 started for that project; open another editor window for another project, or \
-                 unset {} to share the app's workspace.",
-                db::paths::WORKSPACE_ENV
+                "This client is confined to '{current}' and cannot switch workspaces. It named \
+                 that project when it connected; connect a separate client for another project, \
+                 or {}.",
+                how_to_lift(scope)
             ));
         }
 

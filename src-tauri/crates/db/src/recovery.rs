@@ -32,6 +32,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 
 use crate::DbPool;
+use crate::timestamps::NOW_ISO8601;
 
 /// The terminal status given to a run that was still `running` when the app
 /// exited.
@@ -69,12 +70,6 @@ pub const INTERRUPTED_TRANSITION_REASON: &str =
 /// The status a `pipeline_step_runs` row is moved to alongside its run.
 const INTERRUPTED_STEP_STATUS: &str = "failed";
 
-/// An ISO-8601 timestamp in the spelling the schema's own defaults use.
-///
-/// Written out rather than `CURRENT_TIMESTAMP`, whose `YYYY-MM-DD HH:MM:SS`
-/// output is not RFC 3339 and so does not parse where the rest of the app
-/// parses timestamps.
-const NOW_ISO8601: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 /// Identifies this launch of the application.
 ///

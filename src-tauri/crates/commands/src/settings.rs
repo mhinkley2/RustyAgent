@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // AppSettings — the on-disk schema
@@ -156,11 +157,11 @@ pub async fn save_workspace_settings(
     let json = serde_json::to_string(&overrides)
         .map_err(|e| format!("Serialize error: {e}"))?;
     sqlx::query(
-        "INSERT INTO workspace_settings (workspace_id, settings_json)
+        &format!("INSERT INTO workspace_settings (workspace_id, settings_json)
          VALUES (?, ?)
          ON CONFLICT(workspace_id) DO UPDATE SET
            settings_json = excluded.settings_json,
-           updated_at    = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+           updated_at    = {NOW_ISO8601}")
     )
     .bind(&workspace_id)
     .bind(&json)

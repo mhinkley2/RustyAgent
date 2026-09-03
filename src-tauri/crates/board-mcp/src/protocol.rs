@@ -47,7 +47,8 @@ pub async fn handle_message(
                     "serverInfo": {
                         "name": SERVER_NAME,
                         "version": env!("CARGO_PKG_VERSION"),
-                    }
+                    },
+                    "instructions": attachment(ctx),
                 }),
             ))
         }
@@ -102,6 +103,33 @@ pub async fn handle_message(
                 ))
             }
         }
+    }
+}
+
+/// Which board this client is attached to, and whether it can change that.
+///
+/// Reported in the `initialize` result because otherwise a client can only
+/// infer its scope from the stories it gets back — and inferring it wrongly is
+/// silent. The stdio binary prints the same answer on stderr, where it proved
+/// immediately useful; a client connecting over HTTP has no stderr to read.
+fn attachment(ctx: &McpCtx) -> String {
+    let Some(root) = ctx.workspace_root.as_deref() else {
+        return "No workspace is open in the RustyAgent app, so the board tools have \
+                nothing to read. Open a folder in the app first."
+            .to_string();
+    };
+
+    let path = root.display();
+    if ctx.pinned() {
+        format!(
+            "Attached to the RustyAgent board for {path}. This client is confined to \
+             that workspace and cannot switch."
+        )
+    } else {
+        format!(
+            "Attached to the RustyAgent board for {path}, following whichever workspace \
+             the app has open. Use use_workspace to switch."
+        )
     }
 }
 

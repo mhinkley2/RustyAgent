@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 use tracing::info;
+use crate::timestamps::NOW_ISO8601;
 
 pub type DbPool = SqlitePool;
 
@@ -15,6 +16,9 @@ pub mod paths;
 /// mid-flight, plus the per-process id that makes it safe.
 pub mod recovery;
 pub mod story_status;
+
+/// The one spelling of a timestamp, shared by every crate that writes one.
+pub mod timestamps;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -36,9 +40,46 @@ pub struct WorkspaceRecord {
     pub created_at: String,
 }
 
-fn normalize_workspace_path(path: &std::path::Path) -> String {
-    let raw = path.to_string_lossy();
-    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+/// The one spelling of a workspace path, for both storing and looking up.
+///
+/// One folder must resolve to one row, and `workspaces.path` is a `UNIQUE`
+/// column compared with SQLite's default `BINARY` collation — so the spelling
+/// *is* the identity. On Windows the filesystem disagrees: `c:\users\...` and
+/// `C:\Users\...` are the same directory, and storing one while looking up the
+/// other silently mints a second board for a project that already has one.
+///
+/// `canonicalize` settles it. It returns the true on-disk casing, so every
+/// spelling of a real folder converges on what the volume actually holds, and
+/// it resolves symlinks, so a project opened through a link and one named
+/// directly land on the same row. It also prepends the `\\?\` extended-length
+/// prefix, which has to come back off: every row already in the database is
+/// stored without it.
+///
+/// A path that is not on disk cannot be canonicalized — an unmounted drive, a
+/// client naming a folder that does not exist, or one of the `/tmp/w` literals
+/// the tests seed. Those keep the raw spelling with the prefix stripped, which
+/// is what this function did before, and still the right answer for a lookup
+/// that is about to miss anyway.
+pub fn normalize_workspace_path(path: &std::path::Path) -> String {
+    let canonical = std::fs::canonicalize(path);
+    let resolved = canonical.as_deref().unwrap_or(path);
+    let raw = resolved.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    trim_trailing_separator(stripped).to_string()
+}
+
+/// Drop a trailing `/` or `\`, so `…\project\` and `…\project` are one row.
+///
+/// Never down to nothing: `/` and `C:\` are directories in their own right,
+/// and trimming them would leave an empty string or a bare drive letter that
+/// no longer names anything.
+fn trim_trailing_separator(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        path
+    } else {
+        trimmed
+    }
 }
 
 /// Initialize the SQLite database pool.
@@ -153,12 +194,59 @@ pub async fn find_workspace_by_path(
 ) -> Option<WorkspaceRecord> {
     let normalized_path = normalize_workspace_path(path);
 
-    sqlx::query_as::<_, (String, String, String, String, String)>(
+    if let Some(found) = select_workspace(db, "WHERE path = ?", &normalized_path).await {
+        return Some(found);
+    }
+
+    // Rows written before paths were canonicalized can differ from the
+    // canonical spelling by case alone, and where the filesystem is
+    // case-insensitive they name the same folder. Refusing those would tell a
+    // user their own project is not a workspace this app has opened, which is
+    // both wrong and unfixable from their side — the row is already there and
+    // nothing re-spells it.
+    //
+    // Only where the filesystem agrees. On a case-sensitive volume
+    // `/srv/Board` and `/srv/board` are two directories, and folding them
+    // together would hand a client the wrong project's board.
+    //
+    // `NOCASE` folds ASCII only, which covers drive letters and ordinary
+    // repository paths. A non-ASCII folder whose stored casing differs still
+    // misses, falling back to the same refusal as before rather than to
+    // something worse.
+    if !CASE_INSENSITIVE_PATHS {
+        return None;
+    }
+
+    select_workspace(
+        db,
+        "WHERE path = ? COLLATE NOCASE ORDER BY last_opened_at DESC",
+        &normalized_path,
+    )
+    .await
+}
+
+/// Whether this platform's filesystem treats two casings as one path.
+///
+/// Windows and macOS ship case-insensitive by default; Linux does not. A
+/// case-sensitive volume mounted on Windows (or a case-sensitive APFS one)
+/// would make this too generous, but only for a path that already failed an
+/// exact match against a workspace the user registered themselves — the
+/// fallback can hand back a different registered board, never an unregistered
+/// directory.
+const CASE_INSENSITIVE_PATHS: bool = cfg!(any(windows, target_os = "macos"));
+
+/// One row of `workspaces`, selected by a fixed clause.
+///
+/// The clause is always a literal from this module — never a caller's string —
+/// so the interpolation carries no input into SQL.
+async fn select_workspace(db: &DbPool, clause: &str, path: &str) -> Option<WorkspaceRecord> {
+    sqlx::query_as::<_, (String, String, String, String, String)>(&format!(
         "SELECT id, name, path, last_opened_at, created_at
          FROM workspaces
-         WHERE path = ?",
-    )
-    .bind(&normalized_path)
+         {clause}
+         LIMIT 1"
+    ))
+    .bind(path)
     .fetch_optional(db)
     .await
     .ok()
@@ -174,7 +262,9 @@ pub async fn find_workspace_by_path(
 
 pub async fn touch_workspace(db: &DbPool, path: &std::path::Path) -> Result<WorkspaceRecord> {
     let normalized_path = normalize_workspace_path(path);
-    let workspace_name = path
+    // Named from the normalized path, not the caller's spelling: the display
+    // name should read the way the folder is actually cased on disk.
+    let workspace_name = std::path::Path::new(&normalized_path)
         .file_name()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
@@ -183,11 +273,11 @@ pub async fn touch_workspace(db: &DbPool, path: &std::path::Path) -> Result<Work
     let workspace_id = uuid::Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO workspaces (id, path, name, last_opened_at)
-         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        &format!("INSERT INTO workspaces (id, path, name, last_opened_at)
+         VALUES (?, ?, ?, {NOW_ISO8601})
          ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
-            last_opened_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+            last_opened_at = {NOW_ISO8601}")
     )
     .bind(&workspace_id)
     .bind(&normalized_path)
@@ -317,6 +407,161 @@ mod tests {
 
         drop(db);
         cleanup(&path);
+    }
+
+    /// A folder named in a different case is the same folder.
+    ///
+    /// The case this exists for: the app stores what `canonicalize` reports,
+    /// and an MCP client hands back whatever its editor templated. On Windows
+    /// those can differ by case and still be one directory. This asserts
+    /// through a real temp directory rather than a string literal, because the
+    /// answer comes from the filesystem.
+    #[tokio::test]
+    async fn a_workspace_is_found_under_a_differently_cased_spelling_of_its_path() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        let root = env::temp_dir().join(format!("RustyAgentCase{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+
+        let stored = touch_workspace(&db, &root).await.expect("touch_workspace");
+
+        let shouted = std::path::PathBuf::from(root.to_string_lossy().to_uppercase());
+        let found = find_workspace_by_path(&db, &shouted).await;
+
+        // Only meaningful where the filesystem itself is case-insensitive; on
+        // a case-sensitive volume the uppercase path is a different folder and
+        // refusing it is the correct answer.
+        if CASE_INSENSITIVE_PATHS {
+            let found = found.expect("the same folder, shouted, is still that workspace");
+            assert_eq!(found.id, stored.id, "must not be a second workspace row");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// A trailing separator is not a different workspace.
+    #[tokio::test]
+    async fn a_trailing_separator_resolves_to_the_same_workspace() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        let root = env::temp_dir().join(format!("rustyagent-slash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+
+        let stored = touch_workspace(&db, &root).await.expect("touch_workspace");
+
+        let with_slash = std::path::PathBuf::from(format!("{}{}", root.display(), "/"));
+        let found = find_workspace_by_path(&db, &with_slash)
+            .await
+            .expect("trailing separator still names the workspace");
+
+        assert_eq!(found.id, stored.id);
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// Rows that predate canonicalization must stay reachable.
+    ///
+    /// Seeded directly, in a casing `canonicalize` would never produce, so it
+    /// stands in for what is already in a user's database. Without the
+    /// case-insensitive fallback the user is told their own project is not a
+    /// workspace this app has opened, and nothing they can do re-spells the
+    /// row.
+    #[tokio::test]
+    async fn a_legacy_row_stored_in_another_case_is_still_found() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        let root = env::temp_dir().join(format!("rustyagent-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create workspace dir");
+
+        let legacy = normalize_workspace_path(&root).to_uppercase();
+        sqlx::query("INSERT INTO workspaces (id, path, name) VALUES ('ws-legacy', ?, 'legacy')")
+            .bind(&legacy)
+            .execute(&db)
+            .await
+            .expect("seed legacy workspace");
+
+        let found = find_workspace_by_path(&db, &root).await;
+
+        if CASE_INSENSITIVE_PATHS {
+            let found = found.expect("the legacy row is still this folder's workspace");
+            assert_eq!(found.id, "ws-legacy");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// An exact match wins over one that differs only by case.
+    ///
+    /// Both spellings can already be in a database. The fallback exists to
+    /// rescue a miss, and must never re-point a path that matched exactly.
+    #[tokio::test]
+    async fn an_exact_match_wins_over_a_case_insensitive_one() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        // Not on disk, so normalization leaves the spelling alone and the two
+        // rows stay distinguishable.
+        for (id, ws_path, opened) in [
+            ("ws-exact", "/tmp/Casing", "2026-01-01T00:00:00.000Z"),
+            ("ws-other", "/tmp/CASING", "2026-06-01T00:00:00.000Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO workspaces (id, path, name, last_opened_at, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(ws_path)
+            .bind(id)
+            .bind(opened)
+            .bind(opened)
+            .execute(&db)
+            .await
+            .expect("seed workspace");
+        }
+
+        let found = find_workspace_by_path(&db, std::path::Path::new("/tmp/Casing"))
+            .await
+            .expect("exact spelling resolves");
+
+        assert_eq!(
+            found.id, "ws-exact",
+            "the more recently opened row must not win over an exact match"
+        );
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// Normalizing must not eat a root directory.
+    #[test]
+    fn a_root_path_survives_normalization() {
+        assert_eq!(trim_trailing_separator("/"), "/");
+        assert_eq!(trim_trailing_separator(r"C:\"), r"C:\");
+        assert_eq!(trim_trailing_separator(r"C:\projects\board\"), r"C:\projects\board");
+        assert_eq!(trim_trailing_separator("/tmp/w"), "/tmp/w");
+    }
+
+    /// A path that is not on disk keeps its spelling.
+    ///
+    /// `canonicalize` fails there, and the fallback must not be an empty
+    /// string or a panic — a lookup for a folder that does not exist should
+    /// simply miss.
+    #[test]
+    fn a_path_that_does_not_exist_normalizes_to_itself() {
+        let missing = env::temp_dir().join(format!("rustyagent-absent-{}", uuid::Uuid::new_v4()));
+        assert_eq!(
+            normalize_workspace_path(&missing),
+            missing.to_string_lossy(),
+        );
     }
 
     /// The three "most recent workspace" queries must name the same row.

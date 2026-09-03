@@ -4,6 +4,7 @@ use db::DbPool;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -171,10 +172,10 @@ pub async fn update_custom_tool(
     let timeout_secs = input.timeout_secs.unwrap_or(current.timeout_secs);
 
     sqlx::query(
-        "UPDATE custom_tools
+        &format!("UPDATE custom_tools
          SET name = ?, description = ?, command = ?, working_dir = ?, timeout_secs = ?,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?",
+             updated_at = {NOW_ISO8601}
+         WHERE id = ?"),
     )
     .bind(&name)
     .bind(&description)

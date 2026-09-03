@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tracing::{info, warn};
 use uuid::Uuid;
+use db::timestamps::NOW_ISO8601;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -80,9 +81,9 @@ impl EpisodicStore {
         // SQLite's UNIQUE constraint treats NULL != NULL so `ON CONFLICT` never fires
         // when pipeline_run_id IS NULL.  Use explicit UPDATE-then-INSERT instead.
         let updated = sqlx::query(
-            "UPDATE agent_memory \
-             SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-             WHERE agent_profile_id = ? AND scope = ? AND key = ? AND pipeline_run_id IS NULL",
+            &format!("UPDATE agent_memory \
+             SET value = ?, updated_at = {NOW_ISO8601} \
+             WHERE agent_profile_id = ? AND scope = ? AND key = ? AND pipeline_run_id IS NULL"),
         )
         .bind(value)
         .bind(&self.agent_profile_id)

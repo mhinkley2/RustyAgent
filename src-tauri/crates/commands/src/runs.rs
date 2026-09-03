@@ -92,8 +92,24 @@ fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> StoryRun {
     let started_at: String = row.try_get("started_at").unwrap_or_default();
     let finished_at: Option<String> = row.try_get("finished_at").ok().flatten();
     let duration_secs: Option<f64> = finished_at.as_deref().and_then(|end| {
-        let start = chrono::DateTime::parse_from_rfc3339(&started_at).ok()?;
-        let finish = chrono::DateTime::parse_from_rfc3339(end).ok()?;
+        // Log rather than discard. A stored timestamp the reader cannot parse
+        // used to surface only as a blank Duration column, which reads as a
+        // feature that was never built instead of as the bug it is.
+        let parse = |what: &str, value: &str| match chrono::DateTime::parse_from_rfc3339(value) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::debug!(
+                    run_id = %row.try_get::<String, _>("id").unwrap_or_default(),
+                    field = what,
+                    value = value,
+                    error = %e,
+                    "Stored timestamp is not RFC 3339; run duration unavailable"
+                );
+                None
+            }
+        };
+        let start = parse("started_at", &started_at)?;
+        let finish = parse("finished_at", end)?;
         Some((finish - start).num_milliseconds() as f64 / 1000.0)
     });
     StoryRun {
@@ -140,16 +156,19 @@ fn row_to_event(row: &sqlx::sqlite::SqliteRow) -> RunEvent {
 
 /// Emit a timestamp column as RFC 3339, whatever shape it is stored in.
 ///
-/// `story_runs` timestamps are written two ways: `CURRENT_TIMESTAMP`, which
-/// yields `YYYY-MM-DD HH:MM:SS`, and an explicit `strftime` producing
+/// `story_runs` timestamps used to be written two ways: `CURRENT_TIMESTAMP`,
+/// which yields `YYYY-MM-DD HH:MM:SS`, and an explicit `strftime` producing
 /// `...T...Z`. Both are UTC, but only the second parses — as RFC 3339 in Rust,
 /// and as anything other than *local* time in JavaScript, where the
 /// space-separated form silently comes out shifted by the reader's UTC offset.
 ///
-/// This normalises at the read boundary so every consumer sees one shape. It
-/// does not fix what is *stored* — that is story `7b74f638`, and until it lands
-/// this is what keeps a duration from being `None` and a card from claiming a
-/// run finished four hours in the future.
+/// Every writer now uses `db::timestamps::NOW_ISO8601` and a migration has
+/// normalised the rows written before that, so nothing should reach here in the
+/// old shape. This stays as the read-boundary guarantee anyway: it costs a
+/// `strftime` per row and it is the difference between a writer regression
+/// showing up as a slightly odd value and it showing up as a blank Duration
+/// column nobody reads as a bug. The test that actually catches such a
+/// regression is in `runs_tests`, not here.
 const SELECT_RUNS: &str = "
     SELECT r.id, r.story_id, s.title AS story_title,
            r.agent_profile_id, a.name AS agent_name,
