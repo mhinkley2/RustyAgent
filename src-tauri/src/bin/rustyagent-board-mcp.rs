@@ -14,7 +14,7 @@ use std::{
     path::PathBuf,
 };
 
-use board_mcp::{transport::stdio, McpCtx};
+use board_mcp::{transport::stdio, McpCtx, PinScope};
 
 /// The app's Tauri config, embedded at compile time.
 ///
@@ -471,7 +471,7 @@ async fn run() -> Result<(), String> {
     // No host bridge: this process is not the desktop app.
     let ctx = McpCtx::new(db).with_app_data_dir(app_data_dir);
     let ctx = match pin {
-        Some((root, id)) => ctx.pinned_to(root, id),
+        Some((root, id)) => ctx.pinned_to(root, id, PinScope::Process),
         None => ctx,
     };
     let registry = board_mcp::build_registry();

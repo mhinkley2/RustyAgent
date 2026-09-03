@@ -90,7 +90,21 @@ pub async fn list_directory(
         .await
         .ok_or("No workspace is open")?;
 
-    let dir = safe_path(&path, &workspace_root)?;
+    list_directory_in(path, &workspace_root)
+}
+
+/// [`list_directory`] against a root the caller already knows.
+///
+/// For a caller whose workspace is not the app's active one. An MCP client
+/// confined to a project carries its root on the request context; re-deriving
+/// the root from the database here would hand it the listing of whichever
+/// project the app happens to have open instead, which is the confinement
+/// silently not applying.
+pub fn list_directory_in(
+    path: String,
+    workspace_root: &std::path::Path,
+) -> Result<Vec<FileEntry>, String> {
+    let dir = safe_path(&path, workspace_root)?;
     list_directory_at(&dir, &path)
 }
 
@@ -169,7 +183,18 @@ pub async fn read_file_text(
         .await
         .ok_or("No workspace is open")?;
 
-    let file_path = safe_path(&path, &workspace_root)?;
+    read_file_text_in(path, &workspace_root)
+}
+
+/// [`read_file_text`] against a root the caller already knows.
+///
+/// See [`list_directory_in`] for why this exists: a confined MCP client's
+/// reads must stop at the project it named, not at the one the app has open.
+pub fn read_file_text_in(
+    path: String,
+    workspace_root: &std::path::Path,
+) -> Result<String, String> {
+    let file_path = safe_path(&path, workspace_root)?;
 
     if file_path.is_dir() {
         return Err("Path is a directory, not a file".into());

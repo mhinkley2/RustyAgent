@@ -41,8 +41,13 @@ instead of rolling your own:
 
 - `db::testing::make_test_pool()` — in-memory SQLite with migrations applied.
   Foreign-key enforcement is deliberately off so a test can seed only the rows it
-  cares about.
-- `runtime::testing` — a recording `EventSink` for asserting on emitted events.
+  cares about. The same module seeds (`seed_workspace`, `seed_profile`,
+  `seed_story`, `seed_run`, `seed_run_owned`) and reads back (`run_status`,
+  `run_events`, `run_usage`, `run_iteration_count`). Read it before you write a raw
+  `INSERT` or a hand-rolled query in a test.
+- `runtime::testing` — `RecordingSink`, an `EventSink` that captures emitted events
+  for assertion (`payloads`, `kinds`, `text`, `count`), and `RecordingNotifier` for
+  notifications, including a `refusing()` constructor for the delivery-failure path.
 
 **Substantial test bodies live in a sibling module,** not in a thousand-line inline
 `#[cfg(test)] mod tests` block. Precedent: `api/src/contract_tests.rs` and

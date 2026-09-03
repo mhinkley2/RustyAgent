@@ -7,19 +7,15 @@ use crate::{Tool, ToolContext, ToolOutput};
 
 async fn resolve_workspace_id(ctx: &ToolContext) -> Option<String> {
     let root = ctx.workspace_root.as_ref()?;
-    let raw = root.to_string_lossy();
-    let normalized = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+    let normalized = db::normalize_workspace_path(root);
 
-    let existing = sqlx::query(
-        "SELECT id FROM workspaces WHERE path = ? ORDER BY last_opened_at DESC LIMIT 1"
-    )
-    .bind(&normalized)
-    .fetch_optional(&ctx.db)
-    .await
-    .ok()?;
-
-    if let Some(row) = existing {
-        return row.try_get::<String, _>("id").ok();
+    // The same lookup the rest of the app uses, rather than a second spelling
+    // of it. This function *inserts* when it misses, so a lookup that is
+    // stricter than the one that wrote the row does not merely fail — it mints
+    // a duplicate workspace, and stories start landing on a board nothing else
+    // reads.
+    if let Some(existing) = db::find_workspace_by_path(&ctx.db, root).await {
+        return Some(existing.id);
     }
 
     let workspace_id = uuid::Uuid::new_v4().to_string();

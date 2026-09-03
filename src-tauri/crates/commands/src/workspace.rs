@@ -77,9 +77,9 @@ pub async fn open_workspace(
     if !canonical.is_dir() {
         return Err("Path is not a directory".into());
     }
-    // Strip the Windows extended-length path prefix (\\?\) that canonicalize adds.
-    let raw_str = canonical.to_string_lossy();
-    let canonical_str = raw_str.strip_prefix(r"\\?\").unwrap_or(&raw_str).to_string();
+    // Spelled by the shared normalizer, so the row this writes is the row every
+    // lookup elsewhere resolves to.
+    let canonical_str = db::normalize_workspace_path(&canonical);
 
     let name = canonical
         .file_name()

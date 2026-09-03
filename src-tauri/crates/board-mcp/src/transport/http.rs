@@ -1,6 +1,6 @@
 //! Streamable-HTTP transport (POST only — no SSE, so the server is stateless).
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -9,7 +9,7 @@ use hyper::{
     header::{ALLOW, AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN, WWW_AUTHENTICATE},
     server::conn::http1,
     service::service_fn,
-    Method, Request, Response, StatusCode,
+    HeaderMap, Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
@@ -18,11 +18,14 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthConfig,
-    ctx::McpCtx,
-    jsonrpc::{error_response, FORBIDDEN, INVALID_REQUEST, PARSE_ERROR, UNAUTHORIZED},
+    ctx::{McpCtx, PinScope},
+    jsonrpc::{
+        error_response, FORBIDDEN, INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR, UNAUTHORIZED,
+    },
     protocol::handle_message_refreshed,
     registry::McpRegistry,
     tools::build_registry,
+    WORKSPACE_HEADER, WORKSPACE_QUERY_KEY,
 };
 
 pub const MCP_ENDPOINT_PATH: &str = "/mcp";
@@ -30,6 +33,14 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Give up on the accept loop only after sustained failure.
 const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 64;
 
+/// One server, every client.
+///
+/// `ctx` is the *unscoped* context — the app's active workspace, which is what
+/// a client that names no project gets. A client that does name one is served a
+/// clone confined to it, resolved per request in [`scope_for`]. Nothing
+/// per-client is stored here, which is what lets one process replace the
+/// one-stdio-process-per-editor-window arrangement without growing a session
+/// table to leak.
 pub struct HttpState {
     pub ctx: McpCtx,
     pub registry: McpRegistry,
@@ -176,7 +187,7 @@ async fn respond(request: Request<Incoming>, state: Arc<HttpState>) -> Response<
         Err(_) => return too_large(),
     };
 
-    dispatch_body(&collected, &state).await
+    dispatch_body(&collected, &parts.headers, parts.uri.query(), &state).await
 }
 
 /// Authentication and origin checks. `Some(response)` means "rejected".
@@ -233,8 +244,85 @@ fn check_route(method: &Method, path: &str) -> Option<Response<Full<Bytes>>> {
     None
 }
 
+/// The project a request named, before it is checked against the database.
+///
+/// The header wins; the query parameter is there for a client that can
+/// template a URL but not a header value. Both are read because which one a
+/// given editor can produce is a property of that editor, not of this server.
+///
+/// A present-but-unreadable header is an `Err` rather than a shrug. Ignoring it
+/// would attach that client to whatever project the app happens to have open,
+/// which is the exact failure the header exists to prevent — and it would do so
+/// silently, which is worse than refusing.
+fn requested_workspace(headers: &HeaderMap, query: Option<&str>) -> Result<Option<String>, String> {
+    if let Some(value) = headers.get(WORKSPACE_HEADER) {
+        let text = value.to_str().map_err(|_| {
+            format!(
+                "{WORKSPACE_HEADER} is not readable as text. Send the workspace path as \
+                 ASCII, or name it with the '{WORKSPACE_QUERY_KEY}' query parameter instead."
+            )
+        })?;
+        // Blank is absent: a client that templated a variable which resolved to
+        // nothing meant "no scope", not "the workspace named empty string".
+        if !text.trim().is_empty() {
+            return Ok(Some(text.trim().to_string()));
+        }
+    }
+
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    Ok(form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == WORKSPACE_QUERY_KEY)
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+/// Confine this request to the project it named, if it named one.
+///
+/// Resolved against workspaces the user has already opened and never
+/// registering a new one — the same rule the stdio pin follows, and for the
+/// same reason: a client that could register could point itself at any
+/// directory and then read it through `read_file`.
+///
+/// `db::find_workspace_by_path` normalizes the Windows extended-length prefix
+/// before it matches, so a client sending the `\\?\` form resolves to the same
+/// row as one sending the plain path. Getting that wrong would silently hand a
+/// client a different board.
+async fn scope_for(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    state: &HttpState,
+) -> Result<McpCtx, String> {
+    let requested = requested_workspace(headers, query)?;
+    let Some(requested) = requested else {
+        // No project named: follow the app's active workspace, which is what
+        // the app's own webview wants and what every pre-existing config gets.
+        return Ok(state.ctx.clone());
+    };
+
+    match db::find_workspace_by_path(&state.ctx.db, &PathBuf::from(&requested)).await {
+        Some(workspace) => Ok(state.ctx.clone().pinned_to(
+            PathBuf::from(&workspace.path),
+            Some(workspace.id),
+            PinScope::Request,
+        )),
+        // Refused on this request only. The server is already running for every
+        // other client, so it cannot refuse at startup the way the stdio binary
+        // does — the failure has to land on the request that carried the bad
+        // value, and nowhere else.
+        None => Err(format!(
+            "'{requested}' is not a workspace this RustyAgent has opened. Open the folder \
+             in the app once to register it, or drop {WORKSPACE_HEADER} to follow the \
+             app's active workspace."
+        )),
+    }
+}
+
 async fn dispatch_body(
     collected: &[u8],
+    headers: &HeaderMap,
+    query: Option<&str>,
     state: &HttpState,
 ) -> Response<Full<Bytes>> {
     let message: Value = match serde_json::from_slice(collected) {
@@ -272,7 +360,21 @@ async fn dispatch_body(
         );
     }
 
-    match handle_message_refreshed(&state.ctx, &state.registry, &message).await {
+    // After the body is parsed, so the refusal can echo the request's id. A
+    // notification carrying a bad scope is still answered: silently dropping it
+    // would leave the client believing it wrote to a board it never reached.
+    let ctx = match scope_for(headers, query, state).await {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            return json_body(
+                StatusCode::BAD_REQUEST,
+                error_response(id, INVALID_PARAMS, error),
+            );
+        }
+    };
+
+    match handle_message_refreshed(&ctx, &state.registry, &message).await {
         // A notification gets an empty 202, not a JSON-RPC envelope.
         None => empty(StatusCode::ACCEPTED),
         Some(response) => json_body(StatusCode::OK, response),
@@ -332,6 +434,7 @@ mod tests {
     use crate::McpCtx;
     use hyper::header::{AUTHORIZATION, HOST, ORIGIN};
     use hyper::HeaderMap;
+    use std::path::PathBuf;
 
     const TOKEN: &str = "test-token-value";
 
@@ -552,7 +655,7 @@ mod tests {
         let state = http_state().await;
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
 
-        let response = dispatch_body(body, &state).await;
+        let response = dispatch_body(body, &HeaderMap::new(), None, &state).await;
 
         let (status, value) = parts(response).await;
         assert_eq!(status, StatusCode::OK);
@@ -565,7 +668,7 @@ mod tests {
         let state = http_state().await;
         let body = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 
-        let response = dispatch_body(body, &state).await;
+        let response = dispatch_body(body, &HeaderMap::new(), None, &state).await;
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
@@ -574,7 +677,7 @@ mod tests {
     async fn malformed_json_is_a_parse_error_with_400() {
         let state = http_state().await;
 
-        let response = dispatch_body(b"{not json}", &state).await;
+        let response = dispatch_body(b"{not json}", &HeaderMap::new(), None, &state).await;
 
         let (status, value) = parts(response).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -585,7 +688,13 @@ mod tests {
     async fn a_batch_request_is_rejected_with_an_explanation() {
         let state = http_state().await;
 
-        let response = dispatch_body(b"[{\"jsonrpc\":\"2.0\",\"id\":1}]", &state).await;
+        let response = dispatch_body(
+            b"[{\"jsonrpc\":\"2.0\",\"id\":1}]",
+            &HeaderMap::new(),
+            None,
+            &state,
+        )
+        .await;
 
         let (status, value) = parts(response).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -603,8 +712,369 @@ mod tests {
     async fn a_non_object_body_is_rejected() {
         let state = http_state().await;
 
-        let response = dispatch_body(b"\"just a string\"", &state).await;
+        let response = dispatch_body(b"\"just a string\"", &HeaderMap::new(), None, &state).await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -- per-request workspace scope ---------------------------------------------
+
+    // These drive two clients through one `HttpState`, which is the whole claim
+    // of this transport: one process, one port, one context, and still a
+    // different board per caller.
+
+    /// Two registered projects on one board, with directories that exist.
+    struct TwoProjects {
+        state: HttpState,
+        a: PathBuf,
+        b: PathBuf,
+        _root: tempfile::TempDir,
+    }
+
+    async fn two_projects() -> TwoProjects {
+        let root = tempfile::tempdir().expect("temp dir");
+        let a = root.path().join("project-a");
+        let b = root.path().join("project-b");
+        std::fs::create_dir_all(&a).expect("create project-a");
+        std::fs::create_dir_all(&b).expect("create project-b");
+
+        let db = db::testing::make_test_pool().await;
+        db::testing::seed_workspace(&db, "ws-a", &a.to_string_lossy()).await;
+        db::testing::seed_workspace(&db, "ws-b", &b.to_string_lossy()).await;
+
+        let state = state(
+            McpCtx::new(db),
+            AuthConfig {
+                token: Some(TOKEN.to_string()),
+                port: 8765,
+            },
+        );
+
+        TwoProjects {
+            state,
+            a,
+            b,
+            _root: root,
+        }
+    }
+
+    fn workspace_header(value: &str) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        map.insert(
+            hyper::header::HeaderName::from_static("x-rustyagent-workspace"),
+            value.parse().expect("valid header"),
+        );
+        map
+    }
+
+    fn scoped(path: &std::path::Path) -> HeaderMap {
+        workspace_header(&path.to_string_lossy())
+    }
+
+    /// The structured payload of one `tools/call`, through the full body path.
+    async fn call_tool(
+        state: &HttpState,
+        headers: &HeaderMap,
+        query: Option<&str>,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        })
+        .to_string();
+
+        let (status, value) =
+            parts(dispatch_body(body.as_bytes(), headers, query, state).await).await;
+        assert_eq!(status, StatusCode::OK, "got {value}");
+        value
+    }
+
+    /// The JSON a tool answered with, decoded out of the MCP text envelope.
+    fn payload_of(response: &Value) -> Value {
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+
+    async fn active_workspace(
+        state: &HttpState,
+        headers: &HeaderMap,
+        query: Option<&str>,
+    ) -> Value {
+        payload_of(&call_tool(state, headers, query, "get_active_workspace", json!({})).await)
+    }
+
+    #[tokio::test]
+    async fn two_clients_on_one_server_read_their_own_boards() {
+        let p = two_projects().await;
+
+        let a = active_workspace(&p.state, &scoped(&p.a), None).await;
+        let b = active_workspace(&p.state, &scoped(&p.b), None).await;
+
+        assert_eq!(a["workspace"]["id"], json!("ws-a"));
+        assert_eq!(b["workspace"]["id"], json!("ws-b"));
+    }
+
+    /// Make one project the app's active workspace, deterministically.
+    ///
+    /// Not by seeding order: `last_opened_at` has millisecond resolution and
+    /// two seeds land in the same millisecond often enough to matter, at which
+    /// point the ordering tiebreak decides and the test flakes.
+    async fn make_active(db: &db::DbPool, id: &str) {
+        sqlx::query("UPDATE workspaces SET last_opened_at = ? WHERE id = ?")
+            .bind("2099-01-01T00:00:00.000Z")
+            .bind(id)
+            .execute(db)
+            .await
+            .expect("promote a workspace");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_names_no_workspace_follows_the_app() {
+        // The pre-existing behaviour, and what the app's own webview needs.
+        let p = two_projects().await;
+        make_active(&p.state.ctx.db, "ws-b").await;
+
+        let payload = active_workspace(&p.state, &HeaderMap::new(), None).await;
+
+        assert_eq!(payload["workspace"]["id"], json!("ws-b"));
+    }
+
+    #[tokio::test]
+    async fn a_scoped_client_does_not_follow_another_clients_switch() {
+        let p = two_projects().await;
+
+        // An unscoped client moves the app to project A...
+        let switched = call_tool(
+            &p.state,
+            &HeaderMap::new(),
+            None,
+            "use_workspace",
+            json!({ "path": p.a.to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(payload_of(&switched)["workspace"]["id"], json!("ws-a"));
+
+        // ...and the client scoped to B is unmoved.
+        let payload = active_workspace(&p.state, &scoped(&p.b), None).await;
+
+        assert_eq!(payload["workspace"]["id"], json!("ws-b"));
+    }
+
+    #[tokio::test]
+    async fn a_scoped_client_cannot_switch_workspaces() {
+        let p = two_projects().await;
+
+        let response = call_tool(
+            &p.state,
+            &scoped(&p.a),
+            None,
+            "use_workspace",
+            json!({ "path": p.b.to_string_lossy() }),
+        )
+        .await;
+
+        assert!(
+            response["result"]["isError"].as_bool().unwrap_or(false),
+            "got {response}"
+        );
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("cannot switch workspaces"), "got {text}");
+        // Named per mechanism: an HTTP client cannot act on advice about an
+        // environment variable it never read.
+        assert!(
+            text.contains(WORKSPACE_HEADER),
+            "the refusal should name the header: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_client_sees_only_its_own_workspace() {
+        let p = two_projects().await;
+
+        let response = call_tool(&p.state, &scoped(&p.a), None, "list_workspaces", json!({})).await;
+
+        let listed = payload_of(&response);
+        let listed = listed["workspaces"].as_array().expect("array");
+        assert_eq!(listed.len(), 1, "a confined client has no use for the others");
+        assert_eq!(listed[0]["id"], json!("ws-a"));
+    }
+
+    #[tokio::test]
+    async fn a_scoped_clients_file_tools_stop_at_its_own_project() {
+        // The scope is not only a board filter: `read_file` resolves against
+        // the same `workspace_root`, so a client scoped to A cannot read B.
+        let p = two_projects().await;
+        std::fs::write(p.a.join("mine.txt"), "a").expect("write a");
+        std::fs::write(p.b.join("theirs.txt"), "b").expect("write b");
+        // The app is looking at B, so a root re-derived from the database
+        // would be B's — which is the bug this asserts against.
+        make_active(&p.state.ctx.db, "ws-b").await;
+
+        let mine = call_tool(
+            &p.state,
+            &scoped(&p.a),
+            None,
+            "read_file",
+            json!({ "path": p.a.join("mine.txt").to_string_lossy() }),
+        )
+        .await;
+        assert!(
+            !mine["result"]["isError"].as_bool().unwrap_or(false),
+            "a scoped client must still read its own files: {mine}"
+        );
+
+        let theirs = call_tool(
+            &p.state,
+            &scoped(&p.a),
+            None,
+            "read_file",
+            json!({ "path": p.b.join("theirs.txt").to_string_lossy() }),
+        )
+        .await;
+        assert!(
+            theirs["result"]["isError"].as_bool().unwrap_or(false),
+            "the other project's file should be out of reach: {theirs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_client_still_reaches_the_live_state_tools() {
+        // The reason to prefer this transport at all: these are hidden on stdio,
+        // and scoping must not cost a client access to them.
+        let p = two_projects().await;
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+        let (_, value) = parts(dispatch_body(body, &scoped(&p.a), None, &p.state).await).await;
+
+        // No `HostBridge` in this fixture, so the host-only tools are absent —
+        // what matters is that the scope does not change the answer.
+        let (_, unscoped) =
+            parts(dispatch_body(body, &HeaderMap::new(), None, &p.state).await).await;
+        assert_eq!(value["result"]["tools"], unscoped["result"]["tools"]);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_workspace_is_refused_on_that_request_alone() {
+        let p = two_projects().await;
+        let stranger = p.a.parent().expect("parent").join("not-a-workspace");
+
+        let body = br#"{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}"#;
+        let (status, value) =
+            parts(dispatch_body(body, &scoped(&stranger), None, &p.state).await).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value["error"]["code"], json!(-32602));
+        assert_eq!(
+            value["id"],
+            json!(7),
+            "the refusal should echo the request id"
+        );
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&stranger.to_string_lossy().to_string()),
+            "the refusal should name the folder: {message}"
+        );
+
+        // And only that request: the server is still serving everyone else.
+        let other = active_workspace(&p.state, &scoped(&p.b), None).await;
+        assert_eq!(other["workspace"]["id"], json!("ws-b"));
+    }
+
+    #[tokio::test]
+    async fn the_query_parameter_scopes_a_client_that_cannot_template_a_header() {
+        let p = two_projects().await;
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair(WORKSPACE_QUERY_KEY, &p.a.to_string_lossy())
+            .finish();
+
+        let payload = active_workspace(&p.state, &HeaderMap::new(), Some(&query)).await;
+
+        assert_eq!(payload["workspace"]["id"], json!("ws-a"));
+    }
+
+    #[tokio::test]
+    async fn initialize_names_the_board_the_client_is_attached_to() {
+        let p = two_projects().await;
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
+        let (_, value) = parts(dispatch_body(body, &scoped(&p.a), None, &p.state).await).await;
+
+        let instructions = value["result"]["instructions"].as_str().unwrap_or_default();
+        assert!(
+            instructions.contains(&p.a.to_string_lossy().to_string()),
+            "got {instructions}"
+        );
+        assert!(instructions.contains("confined"), "got {instructions}");
+    }
+
+    /// The header names the right folder in the wrong case, and still lands.
+    ///
+    /// This is the shape of the real report: `${workspaceFolder}` is whatever
+    /// casing the editor holds, the row is whatever casing the app canonicalized
+    /// when the user opened the folder, and on Windows those can differ while
+    /// naming one directory. Refusing that told the user their own open project
+    /// was not a workspace this RustyAgent had opened.
+    #[tokio::test]
+    async fn a_header_that_shouts_the_path_still_finds_the_project() {
+        let p = two_projects().await;
+
+        let shouted = workspace_header(&p.a.to_string_lossy().to_uppercase());
+        let payload = active_workspace(&p.state, &shouted, None).await;
+
+        // On a case-sensitive filesystem the shouted path is a different
+        // directory, and the refusal it gets there is the correct answer.
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(payload["workspace"]["id"], json!("ws-a"), "got {payload}");
+        }
+    }
+
+    /// A templated path that arrives with a trailing separator still lands.
+    #[tokio::test]
+    async fn a_trailing_separator_in_the_header_still_finds_the_project() {
+        let p = two_projects().await;
+
+        let with_slash = workspace_header(&format!("{}/", p.b.to_string_lossy()));
+        let payload = active_workspace(&p.state, &with_slash, None).await;
+
+        assert_eq!(payload["workspace"]["id"], json!("ws-b"), "got {payload}");
+    }
+
+    #[test]
+    fn the_header_wins_over_the_query_parameter() {
+        // Both present is a misconfiguration rather than an attack, but it needs
+        // one defined answer, and the header is the documented mechanism.
+        let headers = workspace_header("C:/from-the-header");
+
+        let requested = requested_workspace(&headers, Some("workspace=C%3A%2Ffrom-the-query"));
+
+        assert_eq!(requested, Ok(Some("C:/from-the-header".to_string())));
+    }
+
+    #[test]
+    fn a_blank_header_reads_as_absent() {
+        // A client templating a variable that resolved to nothing meant "no
+        // scope", not "the workspace named empty string".
+        assert_eq!(requested_workspace(&workspace_header("   "), None), Ok(None));
+    }
+
+    #[test]
+    fn a_percent_encoded_windows_path_survives_the_query() {
+        // Why this parses the query rather than reading it raw: a real path
+        // carries a drive colon, backslashes, and often a space.
+        let requested = requested_workspace(
+            &HeaderMap::new(),
+            Some("workspace=C%3A%5CUsers%5Cmitch%5CMy%20Projects%5Cboard"),
+        );
+
+        assert_eq!(
+            requested,
+            Ok(Some(r"C:\Users\mitch\My Projects\board".to_string()))
+        );
     }
 }

@@ -249,6 +249,7 @@ the behaviour that should need no configuration.
 
 RustyAgent exposes its board, run history, agent configuration, and workspace
 files to an external MCP client (Claude Code, VS Code, …) over two transports.
+**Prefer HTTP.** Reach for stdio when the app is closed, or has to be.
 
 | | HTTP | stdio |
 |---|---|---|
@@ -256,10 +257,18 @@ files to an external MCP client (Claude Code, VS Code, …) over two transports.
 | Needs the app running | yes | no |
 | Authentication | bearer token | none needed (child process) |
 | Tools | 35 | 31 |
+| Processes | one, for every client | one per editor window |
+| Scoped to a project by | a header, per request | the process's own working directory |
 
 The four extra tools on HTTP read live scheduler and pipeline state, which only
 exists inside the running app. On stdio they are hidden from `tools/list` and
 refused by `tools/call` — an explicit error rather than a stale `"idle"`.
+
+The process count is the reason for the recommendation. Each stdio server holds
+an open handle on `rustyagent-board-mcp.exe` for as long as its editor lives, so
+`npm run tauri build` fails with `Access is denied (os error 5)` — and the
+installer cannot replace `C:\Program Files\RustyAgent\rustyagent-board-mcp.exe`
+— until every editor window is closed. The HTTP server holds no such lock.
 
 ### Connecting
 
@@ -289,6 +298,52 @@ For the standalone binary, no token is required:
 ```bash
 claude mcp add rustyagent-board-stdio --   cargo run --manifest-path src-tauri/Cargo.toml --bin rustyagent-board-mcp
 ```
+
+### Scoping a client to one project
+
+The board is per workspace, and by default every client follows whichever
+workspace the app has open. Two editor windows on two projects therefore share
+one scope, and whichever activated its workspace last silently becomes the scope
+for both.
+
+Name the project in the `X-RustyAgent-Workspace` header and that client reads,
+writes, and searches files in only that workspace — and cannot switch away from
+it, exactly as the stdio server cannot. In `.vscode/mcp.json`, where
+`${workspaceFolder}` is substituted per window:
+
+```json
+{
+  "servers": {
+    "rustyagent-board": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:RUSTYAGENT_MCP_TOKEN}",
+        "X-RustyAgent-Workspace": "${workspaceFolder}"
+      }
+    }
+  }
+}
+```
+
+A client that cannot template a header value can name the project in the URL
+instead — `http://127.0.0.1:8765/mcp?workspace=C%3A%5Cprojects%5Cboard`. The
+header wins if both are sent.
+
+The folder must be one already opened in the RustyAgent app; a request naming
+anything else is refused, on that request alone, with a message naming the
+folder. MCP clients cannot register workspaces — one that could would be able to
+point itself at any directory on the machine and then read it through
+`read_file`.
+
+Omit the header and the client follows the app's active workspace, which is the
+behaviour every pre-existing configuration keeps. Either way the `initialize`
+response says which board the client ended up attached to, so it never has to
+infer that from the stories it gets back.
+
+The stdio server scopes itself from its own working directory, or from
+`RUSTYAGENT_WORKSPACE`, and refuses to start if that names a folder the app has
+never opened.
 
 ### Authentication
 

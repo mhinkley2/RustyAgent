@@ -22,13 +22,17 @@ async-trait = "0.1"
 
 # HTTP transport only.
 bytes = { version = "1", optional = true }
+# Query-string parsing for the workspace scope parameter: percent-decoding a
+# Windows path by hand is the kind of thing that works until a space or a
+# non-ASCII folder name shows up.
+form_urlencoded = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 
 [features]
 default = []
-http = ["dep:bytes", "dep:http-body-util", "dep:hyper", "dep:hyper-util"]
+http = ["dep:bytes", "dep:form_urlencoded", "dep:http-body-util", "dep:hyper", "dep:hyper-util"]
 
 [dev-dependencies]
 db = { path = "../db", features = ["testing"] }
