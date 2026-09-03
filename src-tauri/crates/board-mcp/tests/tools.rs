@@ -982,6 +982,52 @@ async fn a_truncated_diff_says_it_is_not_an_applicable_patch() {
 
     assert!(text.contains("NOT an applicable"), "got {text:?}");
     assert!(text.contains("git apply"), "got {text:?}");
+
+    // The warning goes before `read_page`'s marker, not after it, so the
+    // marker stays the final suffix the way it is on every other capped read
+    // and the trailing "call again with offset N" is the last thing read.
+    let warning = text.find("[get_run_diff: this is a PARTIAL").expect("the warning");
+    let marker = text.find("[get_run_diff TRUNCATED:").expect("the marker");
+    assert!(warning < marker, "the marker must come last:
+{text}");
+    assert!(text.trim_end().ends_with(']'), "got {text:?}");
+}
+
+/// A tool description is prose an agent reads. Rust's `\`-newline escape eats
+/// the indentation of a wrapped string literal, so a continuation written
+/// without it leaves runs of spaces in the middle of a sentence -- invisible
+/// in the source and plainly visible in `tools/list`.
+#[tokio::test]
+async fn the_run_diff_description_and_markers_carry_no_stray_whitespace() {
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+
+    let response = send(&ctx, &registry, request(json!(1), "tools/list", json!({}))).await;
+    let listed = response["result"]["tools"].as_array().expect("tools").clone();
+    let tool = listed
+        .iter()
+        .find(|tool| tool["name"] == json!("get_run_diff"))
+        .expect("get_run_diff listed");
+
+    let description = tool["description"].as_str().unwrap_or_default();
+    assert!(!description.contains("  "), "double spaces in: {description:?}");
+    assert!(!description.contains('\n'), "a newline in: {description:?}");
+
+    let limit = tool["inputSchema"]["properties"]["limit"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!limit.is_empty(), "the limit parameter must be documented");
+    assert!(!limit.contains("  "), "double spaces in: {limit:?}");
+
+    // The same for the warning the payload carries.
+    seed_run_with_diff(&ctx, "run-big", Some(&padded_diff(600))).await;
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-big" })).await;
+    let text = structured["diff_output"].as_str().expect("diff_output");
+    let warning_start = text.find("[get_run_diff: this is a PARTIAL").expect("the warning");
+    let warning_end = text[warning_start..].find(']').expect("the warning ends") + warning_start;
+    let warning = &text[warning_start..=warning_end];
+    assert!(!warning.contains("  "), "double spaces in: {warning:?}");
 }
 
 #[tokio::test]

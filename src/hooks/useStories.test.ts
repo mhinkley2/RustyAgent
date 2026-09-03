@@ -506,6 +506,37 @@ describe("useStories — reordering", () => {
     expect(result.current.stories.map((s) => s.id)).toEqual(["a", "b", "c"]);
     expect(result.current.stories.map((s) => s.sortOrder)).toEqual([0, 1, 2]);
   });
+
+  it("does not empty the board when the write rejects before the update is flushed", () => {
+    // The rollback snapshot has to come from committed state, read before the
+    // optimistic update is scheduled. Taken from inside the `setStories`
+    // updater instead, it depends on React having run that updater before the
+    // write rejects -- which React does not promise. When it had not, the
+    // snapshot was still its initial empty list and the rollback wiped every
+    // card off the board.
+    return (async () => {
+      createStoryBackend([
+        rawStory({ id: "a", sort_order: 0 }),
+        rawStory({ id: "b", sort_order: 1 }),
+      ]);
+      const { result } = await renderLoaded();
+      tauriMock.handle("batch_update_story_order", () => {
+        throw new Error("write conflict");
+      });
+
+      // Deliberately outside `act`, so the rejection is handled without React
+      // having been given a chance to flush the optimistic update first.
+      const pending = result.current.reorderStories([
+        { id: "b", sortOrder: 0 },
+        { id: "a", sortOrder: 1 },
+      ]);
+      await expect(pending).rejects.toThrow();
+
+      await act(async () => {});
+
+      expect(result.current.stories.map((s) => s.id)).toEqual(["a", "b"]);
+    })();
+  });
 });
 
 describe("useStories — workspace changes", () => {

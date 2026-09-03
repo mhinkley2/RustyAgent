@@ -166,6 +166,17 @@ export function useStories(): UseStoriesReturn {
   const [error, setError] = useState<string | null>(null);
 
   const [lastFetchedAt, setLastFetchedAt] = useState<Date | null>(null);
+  /**
+   * The board as it was last committed, for undoing an optimistic write.
+   *
+   * Read *before* an optimistic update, never after: once React commits the
+   * optimistic list this ref holds that, not what preceded it. Capturing from
+   * inside a `setStories` updater instead would be a side effect in a function
+   * React may defer, re-run, or drop — leaving the rollback holding an empty
+   * list and wiping the board on a failed write.
+   */
+  const committedRef = useRef<Story[]>([]);
+
   // While a card is being dragged, a refetch would fight the optimistic order.
   const pausedRef = useRef(false);
   // A refresh that arrived while paused, to be honoured on resume.
@@ -325,6 +336,12 @@ export function useStories(): UseStoriesReturn {
     }
   }, []);
 
+  // Runs after every commit, so the ref trails state by exactly one render and
+  // holds what an optimistic update taken in the next event handler replaces.
+  useEffect(() => {
+    committedRef.current = stories;
+  }, [stories]);
+
   const reorderStories = useCallback(async (updates: { id: string; sortOrder: number }[]): Promise<void> => {
     // Optimistic local update, keeping what it replaced.
     //
@@ -334,13 +351,11 @@ export function useStories(): UseStoriesReturn {
     // nothing else holds the previous order, so without this the board keeps
     // an order the database refused.
     //
-    // The previous list is captured inside the updater rather than from
-    // `stories`, which this callback closes over as it was on first render.
-    // Under StrictMode the updater runs twice with the same `prev`, so the
-    // capture is idempotent and lands on the same list either way.
-    let previous: Story[] = [];
+    // Read now, before the update below is scheduled. React does not promise
+    // to run an updater synchronously, so a snapshot taken inside one can
+    // still be unset when the write rejects a moment later.
+    const previous = committedRef.current;
     setStories(prev => {
-      previous = prev;
       const orderMap = new Map(updates.map(u => [u.id, u.sortOrder]));
       return [...prev].sort((a, b) => {
         const oa = orderMap.get(a.id) ?? a.sortOrder;
