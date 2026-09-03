@@ -868,7 +868,17 @@ async fn the_read_tool_descriptions_advertise_their_caps_and_paging() {
     assert!(read_file.contains("TRUNCATED"), "got {read_file}");
     assert!(read_file.contains("offset") && read_file.contains("limit"), "got {read_file}");
 
-    for name in ["get_run_events", "get_chat_session_messages", "list_directory"] {
+    // The diff read carries one thing the file read does not: a diff that was
+    // cut is no longer a patch, and an agent that does not know that will try
+    // to apply it.
+    let run_diff = describe("get_run_diff");
+    assert!(run_diff.contains("32 KB"), "the cap must be advertised: {run_diff}");
+    assert!(run_diff.contains("TRUNCATED"), "got {run_diff}");
+    assert!(run_diff.contains("git apply"), "the patch warning must be advertised: {run_diff}");
+
+    for name in
+        ["get_run_events", "get_chat_session_messages", "list_directory", "get_run_diff"]
+    {
         let description = describe(name);
         assert!(
             description.contains("offset") && description.contains("limit"),
@@ -885,4 +895,182 @@ async fn the_read_tool_descriptions_advertise_their_caps_and_paging() {
         assert!(schema.get("offset").is_some(), "{name} has no offset parameter");
         assert!(schema.get("limit").is_some(), "{name} has no limit parameter");
     }
+}
+
+// -- get_run_diff cap -------------------------------------------------------
+//
+// The last uncapped read on the MCP surface. Run isolation means every run now
+// records a diff, and a large refactor's diff went straight into an external
+// agent's context window. These reuse `tools::read_cap`, so what they pin is
+// this tool's wiring into it, plus the one thing a diff needs that a file read
+// does not: that a truncated diff is not a patch.
+
+/// Seed a run carrying `diff` as its captured output.
+async fn seed_run_with_diff(ctx: &board_mcp::McpCtx, run_id: &str, diff: Option<&str>) {
+    db::testing::seed_profile(&ctx.db, "agent-1", "Agent").await;
+    db::testing::seed_story(&ctx.db, "story-1", "Story", "done").await;
+    sqlx::query(
+        "INSERT INTO story_runs (id, story_id, agent_profile_id, status, before_sha, diff_output)
+         VALUES (?, 'story-1', 'agent-1', 'done', 'abc123', ?)",
+    )
+    .bind(run_id)
+    .bind(diff)
+    .execute(&ctx.db)
+    .await
+    .expect("seed a run with a diff");
+}
+
+/// A diff of `count` lines, each exactly 64 bytes, so the cap lands where the
+/// assertions can name it.
+fn padded_diff(count: usize) -> String {
+    (0..count).map(|i| format!("+line {i:04} {}\n", "-".repeat(52))).collect()
+}
+
+#[tokio::test]
+async fn get_run_diff_under_the_cap_returns_the_diff_verbatim_and_says_it_is_complete() {
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    let diff = padded_diff(100);
+    seed_run_with_diff(&ctx, "run-small", Some(&diff)).await;
+
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-small" })).await;
+
+    assert_eq!(structured["diff_output"], json!(diff));
+    assert_eq!(structured["truncated"], json!(false));
+    assert_eq!(structured["complete"], json!(true));
+    assert_eq!(structured["next_offset"], serde_json::Value::Null);
+    assert_eq!(structured["before_sha"], json!("abc123"));
+}
+
+#[tokio::test]
+async fn get_run_diff_over_the_cap_truncates_and_states_the_real_size_and_resume_line() {
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    // 600 * 64 = 38400 bytes, comfortably past the 32 KB cap.
+    let diff = padded_diff(600);
+    seed_run_with_diff(&ctx, "run-big", Some(&diff)).await;
+
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-big" })).await;
+
+    let text = structured["diff_output"].as_str().expect("diff_output");
+    assert!(text.starts_with(&diff[..CAP]), "the head was not returned verbatim");
+    assert!(text.contains("[get_run_diff TRUNCATED:"), "no marker in {text:?}");
+    assert!(text.contains("38400 bytes / 600 lines"), "got {text:?}");
+    assert!(text.contains("lines 1-512"), "got {text:?}");
+    assert!(text.contains("Call get_run_diff again with \"offset\": 513"), "got {text:?}");
+    assert_eq!(structured["truncated"], json!(true));
+    assert_eq!(structured["complete"], json!(false));
+    assert_eq!(structured["next_offset"], json!(513));
+    assert_eq!(structured["total_bytes"], json!(38400));
+    assert_eq!(structured["total_lines"], json!(600));
+}
+
+#[tokio::test]
+async fn a_truncated_diff_says_it_is_not_an_applicable_patch() {
+    // The one warning this tool does not inherit from the file read. Half a
+    // file is still quotable; half a unified diff fed to `git apply` fails or,
+    // worse, applies a subset of the change.
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    seed_run_with_diff(&ctx, "run-big", Some(&padded_diff(600))).await;
+
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-big" })).await;
+    let text = structured["diff_output"].as_str().expect("diff_output");
+
+    assert!(text.contains("NOT an applicable"), "got {text:?}");
+    assert!(text.contains("git apply"), "got {text:?}");
+}
+
+#[tokio::test]
+async fn paging_with_next_offset_retrieves_the_rest_of_the_diff() {
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    let diff = padded_diff(600);
+    seed_run_with_diff(&ctx, "run-big", Some(&diff)).await;
+
+    let first = call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-big" })).await;
+    let next = first["next_offset"].as_u64().expect("a next_offset");
+
+    let second = call_ok(
+        &ctx,
+        &registry,
+        "get_run_diff",
+        json!({ "run_id": "run-big", "offset": next }),
+    )
+    .await;
+
+    let tail = second["diff_output"].as_str().expect("diff_output");
+    // Line 513 onwards, byte-exact, and this time it is the end.
+    assert!(tail.starts_with(&diff[CAP..]), "the tail was not returned verbatim");
+    assert_eq!(second["truncated"], json!(false));
+    assert_eq!(second["next_offset"], serde_json::Value::Null);
+    assert_eq!(second["before_sha"], json!("abc123"));
+}
+
+#[tokio::test]
+async fn a_run_that_changed_nothing_returns_cleanly_rather_than_reporting_truncation() {
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    seed_run_with_diff(&ctx, "run-empty", None).await;
+
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-empty" })).await;
+
+    assert_eq!(structured["diff_output"], serde_json::Value::Null);
+    assert_eq!(structured["truncated"], json!(false));
+    assert_eq!(structured["complete"], json!(true));
+    assert_eq!(structured["before_sha"], json!("abc123"));
+}
+
+#[tokio::test]
+async fn truncation_is_char_boundary_safe_on_a_diff_of_multibyte_text() {
+    // A diff of a file with non-ASCII content. Slicing at a fixed byte offset
+    // would panic mid-codepoint; the cut must retreat to a boundary.
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    let diff: String = (0..800).map(|_| format!("+{}\n", "\u{20AC}".repeat(20))).collect();
+    seed_run_with_diff(&ctx, "run-utf8", Some(&diff)).await;
+
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-utf8" })).await;
+
+    let text = structured["diff_output"].as_str().expect("diff_output");
+    assert_eq!(structured["truncated"], json!(true));
+    // The head is a byte-exact prefix, so every character survived intact.
+    let body = text.split("\n[get_run_diff").next().expect("body");
+    assert!(diff.starts_with(body), "the head was not a verbatim prefix");
+}
+
+#[tokio::test]
+async fn get_run_diff_rejects_a_zero_offset_the_way_every_other_paged_read_does() {
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    seed_run_with_diff(&ctx, "run-small", Some(&padded_diff(10))).await;
+
+    let response = send(
+        &ctx,
+        &registry,
+        call("get_run_diff", json!({ "run_id": "run-small", "offset": 0 })),
+    )
+    .await;
+
+    assert_eq!(response["result"]["isError"], json!(true), "got {response:?}");
+}
+
+#[tokio::test]
+async fn before_sha_survives_truncation() {
+    // It is what lets a caller fetch the real diff by other means, so it is the
+    // one field the cap must not take with it.
+    let (_dir, ctx) = workspace_ctx().await;
+    let registry = registry();
+    seed_run_with_diff(&ctx, "run-big", Some(&padded_diff(600))).await;
+
+    let structured =
+        call_ok(&ctx, &registry, "get_run_diff", json!({ "run_id": "run-big" })).await;
+
+    assert_eq!(structured["truncated"], json!(true));
+    assert_eq!(structured["before_sha"], json!("abc123"));
 }

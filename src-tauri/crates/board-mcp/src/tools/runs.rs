@@ -1,6 +1,10 @@
 //! Run history — read only. Runs are started from the app, not over MCP.
 
-use tools::ToolOutput;
+use serde_json::{json, Value};
+use tools::{
+    read_cap::{optional_positive, read_page},
+    ToolOutput,
+};
 
 use crate::{
     mcp_tool,
@@ -132,17 +136,92 @@ mcp_tool! {
     pub GetRunDiffTool,
     name        = "get_run_diff",
     description = "Read the git diff captured for one run — what the agent changed in the \
-                   workspace. Null when the workspace is not a git repository.",
+                   workspace. Null when the workspace is not a git repository. The reply is                    capped at 32 KB of diff text: when the diff is larger, the content ends                    with an explicit [get_run_diff TRUNCATED: ...] marker giving the diff's                    real size in bytes and lines, the line range this reply carries, and the                    `offset` to call get_run_diff with to continue. Use the optional 1-based                    `offset` and `limit` parameters to page through a large diff deliberately,                    and the `truncated`, `complete` and `next_offset` fields to do it                    programmatically. A truncated diff is for READING ONLY - a partial unified                    diff is not a valid patch and must never be fed to `git apply`, which will                    either fail or apply a subset of the change. `before_sha` is always                    present; use it to obtain the real diff by other means.",
     schema      = {
         "type": "object",
-        "properties": { "run_id": { "type": "string", "description": "UUID of the run" } },
+        "properties": {
+            "run_id": { "type": "string", "description": "UUID of the run" },
+            "offset": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional 1-based line number to start reading from. Defaults to 1."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional maximum number of lines to return. Defaults to the rest                                 of the diff, subject to the 32 KB cap."
+            }
+        },
         "required": ["run_id"]
     },
     |input, ctx| {
         let Some(run_id) = str_arg(&input, "run_id") else {
             return ToolOutput::err("Missing required field: run_id");
         };
-        json_result(commands::runs::get_run_diff(run_id, &ctx.db).await)
+        let offset = match optional_positive(&input, "offset") {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::err(error),
+        };
+        let limit = match optional_positive(&input, "limit") {
+            Ok(value) => value,
+            Err(error) => return ToolOutput::err(error),
+        };
+
+        // The cap lives here rather than in `commands::runs::get_run_diff`,
+        // which also serves `RunDetailPanel` through the Tauri command layer.
+        // A human reviewing a run wants the whole diff, and truncating for the
+        // agent must not truncate for them. Same split as `read_file` versus
+        // the editor: the shared function stays unbounded, the agent-facing
+        // wrapper caps.
+        let diff = match commands::runs::get_run_diff(run_id.clone(), &ctx.db).await {
+            Ok(diff) => diff,
+            Err(error) => return ToolOutput::err(error),
+        };
+
+        // A run that changed nothing has no diff. That is an answer, not a
+        // truncated read: report it cleanly rather than paging an empty string.
+        let Some(diff_output) = diff.diff_output else {
+            return json_ok(json!({
+                "run_id": diff.run_id,
+                "before_sha": diff.before_sha,
+                "diff_output": Value::Null,
+                "truncated": false,
+                "complete": true,
+                "next_offset": Value::Null,
+            }));
+        };
+
+        match read_page(&diff_output, offset, limit, "get_run_diff", &format!("run {run_id}")) {
+            Ok(page) => {
+                // `read_page`'s marker says the text is incomplete. It cannot
+                // say the thing specific to a diff: that the payload is no
+                // longer a patch. A half-read file is still quotable; half a
+                // unified diff fed to `git apply` fails, or worse applies part
+                // of a change. Say so where the model is already reading.
+                let mut text = page.text;
+                if page.partial {
+                    text.push_str(
+                        "
+[get_run_diff: this is a PARTIAL diff and is NOT an applicable                          patch. Do not pass it to `git apply` or reconstruct a commit from                          it; it will fail or apply only part of the change. Read it, page                          through it with \"offset\", or use `before_sha` to obtain the real                          diff.]",
+                    );
+                }
+                json_ok(json!({
+                    "run_id": diff.run_id,
+                    // Small, and the one thing that lets a caller fetch the
+                    // real diff by other means, so it survives truncation.
+                    "before_sha": diff.before_sha,
+                    "diff_output": text,
+                    "truncated": page.truncated,
+                    "complete": !page.partial,
+                    "first_line": page.first_line,
+                    "last_line": page.last_line,
+                    "total_lines": page.total_lines,
+                    "total_bytes": page.total_bytes,
+                    "next_offset": page.next_offset,
+                }))
+            }
+            Err(error) => ToolOutput::err(error),
+        }
     }
 }
 
