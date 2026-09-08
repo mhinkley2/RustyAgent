@@ -1025,12 +1025,26 @@ mod tests {
         let p = two_projects().await;
 
         let shouted = workspace_header(&p.a.to_string_lossy().to_uppercase());
-        let payload = active_workspace(&p.state, &shouted, None).await;
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "get_active_workspace", "arguments": {} },
+        })
+        .to_string();
+        let (status, value) =
+            parts(dispatch_body(body.as_bytes(), &shouted, None, &p.state).await).await;
 
-        // On a case-sensitive filesystem the shouted path is a different
-        // directory, and the refusal it gets there is the correct answer.
+        // Dispatched here rather than through `call_tool`, which asserts a 200:
+        // on a case-sensitive filesystem the shouted path names a directory
+        // that does not exist, and the refusal it gets there is the correct
+        // answer. Both outcomes are asserted, so neither platform is only
+        // running the test vacuously.
         if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(status, StatusCode::OK, "got {value}");
+            let payload = payload_of(&value);
             assert_eq!(payload["workspace"]["id"], json!("ws-a"), "got {payload}");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "got {value}");
+            assert_eq!(value["error"]["code"], json!(INVALID_PARAMS), "got {value}");
         }
     }
 
