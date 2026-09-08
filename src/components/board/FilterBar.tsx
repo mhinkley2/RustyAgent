@@ -1,5 +1,7 @@
-import { useState } from "react";
-import type { StoryPriority, StoryType } from "../../types/board";
+import { useEffect, useState } from "react";
+import { Search, X } from "lucide-react";
+import type { StoryPriority, StoryStatus, StoryType } from "../../types/board";
+import { KANBAN_COLUMNS } from "../../types/board";
 
 // ---------------------------------------------------------------------------
 // Filter state type — passed up to parent (BoardPage)
@@ -11,6 +13,17 @@ export interface BoardFilters {
   priorities: StoryPriority[];
   types: StoryType[];
   labels: string[];
+  /** Free text over title and description. Empty means no text filter. */
+  search: string;
+  /**
+   * Statuses to show. Empty means all of them.
+   *
+   * Most useful in List view, which has no other way to ask for one status.
+   * The Kanban applies it by drawing only those columns, so the filter and the
+   * column layout say the same thing rather than leaving five columns of
+   * "Nothing here".
+   */
+  statuses: StoryStatus[];
 }
 
 export const DEFAULT_FILTERS: BoardFilters = {
@@ -18,7 +31,12 @@ export const DEFAULT_FILTERS: BoardFilters = {
   priorities: [],
   types: [],
   labels: [],
+  search: "",
+  statuses: [],
 };
+
+/** How long typing settles before the board re-filters. */
+const SEARCH_DEBOUNCE_MS = 200;
 
 // ---------------------------------------------------------------------------
 // FilterBar
@@ -48,16 +66,79 @@ function toggleInList<T>(list: T[], value: T): T[] {
   return list.includes(value) ? list.filter(x => x !== value) : [...list, value];
 }
 
-function activeCount(f: BoardFilters): number {
-  return (f.quick !== "all" ? 1 : 0) + f.priorities.length + f.types.length + f.labels.length;
+export function activeCount(f: BoardFilters): number {
+  return (
+    (f.quick !== "all" ? 1 : 0) +
+    f.priorities.length +
+    f.types.length +
+    f.labels.length +
+    f.statuses.length +
+    (f.search.trim() ? 1 : 0)
+  );
 }
 
 export function FilterBar({ filters, onChange, availableLabels = [] }: FilterBarProps) {
   const count = activeCount(filters);
   const [labelsOpen, setLabelsOpen] = useState(filters.labels.length > 0);
 
+  /**
+   * What the box shows, held locally so a keystroke is never waiting on a
+   * re-filter of the whole board.
+   *
+   * Seeded from the prop and resynced when the prop changes to something the
+   * box is not already showing — that is what makes "Clear filters" empty the
+   * input rather than leaving stale text over an unfiltered board.
+   */
+  const [draft, setDraft] = useState(filters.search);
+  useEffect(() => {
+    setDraft(current => (current === filters.search ? current : filters.search));
+  }, [filters.search]);
+
+  useEffect(() => {
+    if (draft === filters.search) return;
+    const timer = setTimeout(() => onChange({ ...filters, search: draft }), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [draft, filters, onChange]);
+
   return (
     <div className="filter-bar" role="toolbar" aria-label="Filter stories">
+      {/* ── Search ──────────────────────────────────────────────────── */}
+      <div className="filter-bar__search">
+        <Search size={13} className="filter-bar__search-icon" aria-hidden />
+        <input
+          type="search"
+          className="filter-bar__search-input"
+          placeholder="Search stories…"
+          aria-label="Search stories by title and description"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => {
+            // Escape clears rather than blurring: the box is inside a toolbar
+            // with no other way back to an unfiltered board without reaching
+            // for the mouse.
+            if (e.key === "Escape") {
+              setDraft("");
+              onChange({ ...filters, search: "" });
+            }
+          }}
+        />
+        {draft && (
+          <button
+            type="button"
+            className="filter-bar__search-clear"
+            aria-label="Clear search"
+            onClick={() => {
+              setDraft("");
+              onChange({ ...filters, search: "" });
+            }}
+          >
+            <X size={12} />
+          </button>
+        )}
+      </div>
+
+      <div className="filter-bar__divider" />
+
       {/* ── Quick pills ─────────────────────────────────────────────── */}
       <div className="filter-bar__pills">
         {(["all", "mine", "unassigned"] as const).map(q => (
@@ -115,6 +196,27 @@ export function FilterBar({ filters, onChange, availableLabels = [] }: FilterBar
         </div>
       </div>
 
+      {/* ── Status ─────────────────────────────────────────────────── */}
+      <div className="filter-bar__group">
+        <span className="filter-bar__group-label">
+          Status{filters.statuses.length > 0 ? ` (${filters.statuses.length})` : ""}
+        </span>
+        <div className="filter-bar__check-group">
+          {KANBAN_COLUMNS.map(({ status, label }) => (
+            <label key={status} className="filter-bar__check-label">
+              <input
+                type="checkbox"
+                checked={filters.statuses.includes(status)}
+                onChange={() =>
+                  onChange({ ...filters, statuses: toggleInList(filters.statuses, status) })
+                }
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+      </div>
+
       {/* ── Labels ─────────────────────────────────────────────────── */}
       {availableLabels.length > 0 && (
         <div className="filter-bar__group">
@@ -154,9 +256,13 @@ export function FilterBar({ filters, onChange, availableLabels = [] }: FilterBar
       {count > 0 && (
         <button
           className="filter-bar__clear"
-          onClick={() =>
-            onChange({ quick: "all", priorities: [], types: [], labels: [] })
-          }
+          onClick={() => {
+            // The box is uncontrolled between keystrokes, so clearing the
+            // state is not enough — the draft has to go with it or the input
+            // keeps showing a query that is no longer filtering anything.
+            setDraft("");
+            onChange(DEFAULT_FILTERS);
+          }}
         >
           Clear {count} filter{count !== 1 ? "s" : ""}
         </button>

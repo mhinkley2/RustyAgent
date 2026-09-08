@@ -21,10 +21,13 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import type { Story, StoryStatus } from "../../types/board";
 import { rollbackTarget, type ColMap as RollbackColMap } from "./dragRollback";
 import { KANBAN_COLUMNS } from "../../types/board";
 import { nextUpIds } from "./queue";
+import { placeInFullColumn } from "./reorder";
+import { useCollapsedColumns } from "./collapsedColumns";
 import { StoryCard } from "./StoryCard";
 import type { StoryAttention } from "./attention";
 import type { AgentProfile } from "../../types/agent";
@@ -99,6 +102,10 @@ interface KanbanColumnProps {
   onAttention?: (attention: StoryAttention) => void;
   agents?: AgentProfile[];
   onAssign?: (storyId: string, agentId: string | null) => Promise<void> | void;
+  /** Render at most this many cards until the user asks for the rest. */
+  cardLimit?: number;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
 }
 
 function KanbanColumn({
@@ -112,9 +119,30 @@ function KanbanColumn({
   onAttention,
   agents,
   onAssign,
+  cardLimit,
+  collapsed,
+  onToggleCollapsed,
 }: KanbanColumnProps) {
   const { setNodeRef } = useDroppable({ id: status });
-  const ids = stories.map(s => s.id);
+
+  /**
+   * Whether the column is showing everything it holds.
+   *
+   * Reset whenever the cap stops applying, so a column that shrinks back under
+   * the limit does not keep an expander with nothing behind it.
+   */
+  const [expanded, setExpanded] = useState(false);
+  const overLimit = cardLimit !== undefined && stories.length > cardLimit;
+  useEffect(() => {
+    if (!overLimit) setExpanded(false);
+  }, [overLimit]);
+
+  const visible = overLimit && !expanded ? stories.slice(0, cardLimit) : stories;
+  const hiddenCount = stories.length - visible.length;
+
+  // Only the rendered cards, or dnd-kit is tracking sortables that have no
+  // node — the cap is a rendering limit, not a change to what the column holds.
+  const ids = visible.map(s => s.id);
 
   // Only Ready is a queue. A card in Backlog or Review is not next for
   // anybody, and marking one would say something untrue.
@@ -123,12 +151,37 @@ function KanbanColumn({
     [status, stories],
   );
 
+  const headerToggle = (
+    <button
+      type="button"
+      className="kb-col__collapse"
+      aria-expanded={!collapsed}
+      aria-label={`${collapsed ? "Expand" : "Collapse"} ${label} column`}
+      onClick={onToggleCollapsed}
+    >
+      {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+    </button>
+  );
+
+  if (collapsed) {
+    return (
+      <div className="kb-col kb-col--collapsed" data-status={status}>
+        <div className="kb-col__header">
+          {headerToggle}
+          <span className="kb-col__label">{label}</span>
+          <span className="kb-col__count">{stories.length}</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`kb-col${isDragOver ? " kb-col--drag-over" : ""}`}
       data-status={status}
     >
       <div className="kb-col__header">
+        {headerToggle}
         <span className="kb-col__label">{label}</span>
         <span className="kb-col__count">{stories.length}</span>
       </div>
@@ -137,7 +190,7 @@ function KanbanColumn({
           {stories.length === 0 ? (
             <div className="kb-col__empty" aria-hidden>{emptyMessage ?? "Drop here"}</div>
           ) : (
-            stories.map(s => (
+            visible.map(s => (
               <SortableCard
                 key={s.id}
                 story={s}
@@ -151,6 +204,16 @@ function KanbanColumn({
             ))
           )}
         </SortableContext>
+        {hiddenCount > 0 && (
+          <button type="button" className="kb-col__more" onClick={() => setExpanded(true)}>
+            Show {hiddenCount} more
+          </button>
+        )}
+        {expanded && overLimit && (
+          <button type="button" className="kb-col__more" onClick={() => setExpanded(false)}>
+            Show fewer
+          </button>
+        )}
       </div>
     </div>
   );
@@ -209,7 +272,34 @@ interface KanbanViewProps {
   agents?: AgentProfile[];
   /** Assign a story from its card. Absent leaves the assignee read-only. */
   onAssign?: (storyId: string, agentId: string | null) => Promise<void> | void;
+  /**
+   * Every story on the board, before filtering — used only to persist order.
+   *
+   * `stories` is what the columns draw, and with a filter active that is a
+   * subset. Numbering the drawn column `0..n` would give a hidden card and a
+   * visible card the same `sortOrder`, so the column comes back scrambled once
+   * the filter clears. Absent, or equal to `stories`, this changes nothing.
+   */
+  allStories?: Story[];
+  /**
+   * Which columns to draw. Absent means all of them.
+   *
+   * Fed by the status filter so the filter and the column layout agree, rather
+   * than leaving five columns saying "Nothing here" because the user asked for
+   * one status.
+   */
+  visibleStatuses?: StoryStatus[];
 }
+
+/**
+ * How many Done cards render before the column offers the rest.
+ *
+ * Done only grows, and it is already the tallest thing on the board. Capping
+ * it in the UI leaves the query alone — if board *load* ever gets slow the cap
+ * belongs in `get_stories` instead, and it should move rather than be
+ * duplicated, or there are two limits to keep in agreement.
+ */
+const DONE_CARD_LIMIT = 10;
 
 const EMPTY_MESSAGES: Record<StoryStatus, string> = {
   backlog:     "No backlog stories",
@@ -232,9 +322,19 @@ export function KanbanView({
   onAttention,
   agents,
   onAssign,
+  allStories,
+  visibleStatuses,
 }: KanbanViewProps) {
   // Local column map — drives rendering during and after drags
   const [colMap, setColMap] = useState<ColMap>(() => buildColMap(stories));
+  const { collapsed, toggle: toggleCollapsed } = useCollapsedColumns();
+  const columns = useMemo(
+    () =>
+      visibleStatuses && visibleStatuses.length > 0
+        ? KANBAN_COLUMNS.filter(c => visibleStatuses.includes(c.status))
+        : KANBAN_COLUMNS,
+    [visibleStatuses],
+  );
   const activeIdRef = useRef<string | null>(null);
   const [activeId, setActiveId] = useState<UniqueIdentifier | null>(null);
   const [overColId, setOverColId] = useState<StoryStatus | null>(null);
@@ -389,8 +489,18 @@ export function KanbanView({
     }
 
     // Persist the column order.
-    if (finalItems.length > 0) {
-      const updates = finalItems.map((s, i) => ({ id: s.id, sortOrder: i }));
+    //
+    // Over the *unfiltered* column: `finalItems` is only what the filter left
+    // visible, and numbering that `0..n` would collide with the `sortOrder` of
+    // every card the filter hid. `placeInFullColumn` is a no-op when nothing
+    // is hidden.
+    const fullColumn = allStories
+      ? allStories.filter(s => s.status === currentCol && s.type !== "human")
+      : finalItems;
+    const persisted = placeInFullColumn(fullColumn, finalItems, active.id as string);
+
+    if (persisted.length > 0) {
+      const updates = persisted.map((s, i) => ({ id: s.id, sortOrder: i }));
       try {
         await onReorder(updates);
       } catch {
@@ -418,7 +528,7 @@ export function KanbanView({
       <div className="kb">
         {/* Main columns */}
         <div className="kb__board">
-          {KANBAN_COLUMNS.map(({ status, label }) => (
+          {columns.map(({ status, label }) => (
             <KanbanColumn
               key={status}
               status={status}
@@ -431,6 +541,9 @@ export function KanbanView({
               onAttention={onAttention}
               agents={agents}
               onAssign={onAssign}
+              cardLimit={status === "done" ? DONE_CARD_LIMIT : undefined}
+              collapsed={collapsed.has(status)}
+              onToggleCollapsed={() => toggleCollapsed(status)}
             />
           ))}
         </div>

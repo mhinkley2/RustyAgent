@@ -9,6 +9,7 @@ import { StoryForm } from "../components/board/StoryForm";
 import { PageHeader } from "../components/board/PageHeader";
 import { FilterBar, DEFAULT_FILTERS } from "../components/board/FilterBar";
 import { attentionByStory, type StoryAttention } from "../components/board/attention";
+import { matchesSearch } from "../components/board/search";
 import { assignmentInput } from "../components/board/assignment";
 import {
   activeRequests,
@@ -188,6 +189,8 @@ export default function BoardPage() {
       if (filters.priorities.length > 0 && !filters.priorities.includes(s.priority)) return false;
       if (filters.types.length > 0 && !filters.types.includes(s.type)) return false;
       if (filters.labels.length > 0 && !filters.labels.some(l => s.labels.includes(l))) return false;
+      if (filters.statuses.length > 0 && !filters.statuses.includes(s.status)) return false;
+      if (!matchesSearch(s, filters.search)) return false;
       return true;
     });
   }, [stories, filters]);
@@ -359,6 +362,8 @@ export default function BoardPage() {
             onAttention={handleAttention}
             agents={agents}
             onAssign={handleAssign}
+            allStories={stories}
+            visibleStatuses={filters.statuses}
           />
         ) : (
           <ListView
