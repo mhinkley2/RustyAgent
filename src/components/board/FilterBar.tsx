@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import type { StoryPriority, StoryStatus, StoryType } from "../../types/board";
 import { KANBAN_COLUMNS } from "../../types/board";
@@ -94,11 +94,27 @@ export function FilterBar({ filters, onChange, availableLabels = [] }: FilterBar
     setDraft(current => (current === filters.search ? current : filters.search));
   }, [filters.search]);
 
+  /**
+   * The debounce depends on the draft and nothing else.
+   *
+   * Depending on `filters` and `onChange` directly would clear and restart the
+   * timer on every identity change in either — safe only while the parent
+   * happens to pass a stable `onChange` and hold `filters` in state. A caller
+   * passing an inline arrow, on a page that re-renders on a timer, would get a
+   * debounce that never fires and a search box that silently does nothing.
+   * Read them through a ref instead, so what restarts the timer is typing.
+   */
+  const latest = useRef({ filters, onChange });
+  latest.current = { filters, onChange };
+
   useEffect(() => {
-    if (draft === filters.search) return;
-    const timer = setTimeout(() => onChange({ ...filters, search: draft }), SEARCH_DEBOUNCE_MS);
+    if (draft === latest.current.filters.search) return;
+    const timer = setTimeout(() => {
+      const { filters: current, onChange: fire } = latest.current;
+      fire({ ...current, search: draft });
+    }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [draft, filters, onChange]);
+  }, [draft]);
 
   return (
     <div className="filter-bar" role="toolbar" aria-label="Filter stories">
@@ -117,6 +133,10 @@ export function FilterBar({ filters, onChange, availableLabels = [] }: FilterBar
             // with no other way back to an unfiltered board without reaching
             // for the mouse.
             if (e.key === "Escape") {
+              // Stopped here, or the same keypress reaches the window listeners
+              // behind `ModalContext` and `SlidePanel` and closes an open story
+              // panel as well. One Escape, one thing.
+              e.stopPropagation();
               setDraft("");
               onChange({ ...filters, search: "" });
             }

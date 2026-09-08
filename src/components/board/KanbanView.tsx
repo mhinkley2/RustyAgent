@@ -106,6 +106,8 @@ interface KanbanColumnProps {
   cardLimit?: number;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** The card currently being dragged, anywhere on the board. */
+  activeId: UniqueIdentifier | null;
 }
 
 function KanbanColumn({
@@ -122,6 +124,7 @@ function KanbanColumn({
   cardLimit,
   collapsed,
   onToggleCollapsed,
+  activeId,
 }: KanbanColumnProps) {
   const { setNodeRef } = useDroppable({ id: status });
 
@@ -137,7 +140,23 @@ function KanbanColumn({
     if (!overLimit) setExpanded(false);
   }, [overLimit]);
 
-  const visible = overLimit && !expanded ? stories.slice(0, cardLimit) : stories;
+  const capped = overLimit && !expanded ? stories.slice(0, cardLimit) : stories;
+
+  /**
+   * The cap never hides the card being dragged.
+   *
+   * `handleDragOver` appends a card entering a column at the end of the list,
+   * which for a capped column is past the cap — so the card the pointer is
+   * holding would unmount, leaving nothing rendered where the drop is about to
+   * land and no placeholder to aim at. It reappears at the top on the next
+   * refetch, because Done reads most-recent-first, but the drag itself looked
+   * like the card had been swallowed.
+   */
+  const visible =
+    activeId !== null && !capped.some(s => s.id === activeId)
+      ? [...capped, ...stories.filter(s => s.id === activeId)]
+      : capped;
+
   const hiddenCount = stories.length - visible.length;
 
   // Only the rendered cards, or dnd-kit is tracking sortables that have no
@@ -236,10 +255,37 @@ function KanbanColumn({
 // also reasons over it, so the two cannot drift apart.
 type ColMap = RollbackColMap;
 
+/**
+ * One column's cards, in the order that column should read in.
+ *
+ * Every column arrives in board order — `db::story_status::queue_order_sql`,
+ * which is `priority_rank ASC, sort_order ASC, created_at ASC`. That is the
+ * right order for a queue: priority outranks manual position, and the drag
+ * settles ties within a band.
+ *
+ * Done is not a queue. Nothing schedules from it, so its `sort_order` is
+ * inert, and board order there means "highest priority, then oldest" — so the
+ * story you just finished sorts *below* every ancient `critical` one. Capping
+ * that list would hide a completion the moment it happened, which is the
+ * opposite of what a capped Done column is for.
+ *
+ * So Done reads most-recently-touched first, and the cap takes the front of
+ * that. `updated_at` is bumped by every write including the status change
+ * (`commands::stories`, `updated_at = {NOW_ISO8601}`), so a card lands at the
+ * top of Done at the moment it is dropped there.
+ */
+function columnOrder(status: StoryStatus, stories: Story[]): Story[] {
+  if (status !== "done") return stories;
+  return [...stories].sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+}
+
 function buildColMap(stories: Story[]): ColMap {
   const colMap = {} as ColMap;
   for (const { status } of KANBAN_COLUMNS) {
-    colMap[status] = stories.filter(s => s.status === status && s.type !== "human");
+    colMap[status] = columnOrder(
+      status,
+      stories.filter(s => s.status === status && s.type !== "human"),
+    );
   }
   return colMap;
 }
@@ -504,7 +550,10 @@ export function KanbanView({
     // every card the filter hid. `placeInFullColumn` is a no-op when nothing
     // is hidden.
     const fullColumn = allStories
-      ? allStories.filter(s => s.status === currentCol && s.type !== "human")
+      ? columnOrder(
+          currentCol,
+          allStories.filter(s => s.status === currentCol && s.type !== "human"),
+        )
       : finalItems;
     const persisted = placeInFullColumn(fullColumn, finalItems, active.id as string);
 
@@ -553,6 +602,7 @@ export function KanbanView({
               cardLimit={status === "done" ? DONE_CARD_LIMIT : undefined}
               collapsed={collapsed.has(status)}
               onToggleCollapsed={() => toggleCollapsed(status)}
+              activeId={activeId}
             />
           ))}
         </div>

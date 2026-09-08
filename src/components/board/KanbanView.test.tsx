@@ -32,7 +32,12 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
   };
 });
 
-function story(id: string, status: StoryStatus, title = `Story ${id}`): Story {
+function story(
+  id: string,
+  status: StoryStatus,
+  title = `Story ${id}`,
+  overrides: Partial<Story> = {},
+): Story {
   return {
     id,
     key: `#${id}`,
@@ -46,11 +51,24 @@ function story(id: string, status: StoryStatus, title = `Story ${id}`): Story {
     sortOrder: 0,
     createdAt: new Date("2026-08-31T00:00:00Z"),
     updatedAt: new Date("2026-08-31T00:00:00Z"),
+    ...overrides,
   };
 }
 
+/**
+ * `n` done cards, oldest first, as the backend hands them over.
+ *
+ * Board order is `priority_rank, sort_order, created_at` — priority first,
+ * then oldest — so a list arriving in that order has the *least* recent work
+ * at the front. Cards numbered ascending by age is what makes a cap that
+ * slices the front visibly wrong.
+ */
 const done = (n: number) =>
-  Array.from({ length: n }, (_, i) => story(`d${i}`, "done", `Done ${i}`));
+  Array.from({ length: n }, (_, i) =>
+    story(`d${i}`, "done", `Done ${i}`, {
+      updatedAt: new Date(Date.UTC(2026, 0, 1 + i)),
+    }),
+  );
 
 function view(stories: Story[], props: Partial<Parameters<typeof KanbanView>[0]> = {}) {
   return render(
@@ -90,6 +108,12 @@ describe("KanbanView Done column", () => {
     expect(within(column("done")).getAllByText(/^Done \d+$/)).toHaveLength(10);
     // The count in the header is the whole column, not what fits.
     expect(within(column("done")).getByText("14")).toBeInTheDocument();
+
+    // *Which* ten. Board order puts the oldest work first, so slicing the
+    // front of the list as it arrives would show `Done 0`-`Done 9` and hide
+    // the four most recent completions — the opposite of the point.
+    expect(within(column("done")).queryByText("Done 13")).toBeInTheDocument();
+    expect(within(column("done")).queryByText("Done 0")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Show 4 more" }));
     expect(within(column("done")).getAllByText(/^Done \d+$/)).toHaveLength(14);
@@ -168,11 +192,73 @@ describe("KanbanView column collapse", () => {
     expect(screen.getByText("In review")).toBeInTheDocument();
   });
 
-  it("ignores a stored column this build no longer draws", () => {
-    localStorage.setItem("rustyagent.board.collapsedColumns", '["archived"]');
+  // The previous version of this seeded `["archived"]` and asserted the Review
+  // column still showed its card — which it would whatever the parse did,
+  // since "archived" is not "review". Seed the column actually under test.
+  it("restores a stored collapse for a column this build draws", () => {
+    localStorage.setItem("rustyagent.board.collapsedColumns", '["review"]');
     view([story("a", "review", "In review")]);
 
-    expect(screen.getByText("In review")).toBeInTheDocument();
+    expect(screen.queryByText("In review")).toBeNull();
+    expect(screen.getByRole("button", { name: /expand review column/i })).toBeInTheDocument();
+  });
+
+  it("ignores a stored column this build no longer draws", () => {
+    localStorage.setItem("rustyagent.board.collapsedColumns", '["archived","review"]');
+    view([story("a", "review", "In review")]);
+
+    // "review" still applies; "archived" is dropped rather than throwing the
+    // whole stored value away with it.
+    expect(screen.queryByText("In review")).toBeNull();
+    expect(document.querySelectorAll(".kb-col")).toHaveLength(6);
+  });
+});
+
+describe("KanbanView Done ordering", () => {
+  // Done is an archive, not a queue: board order there is "highest priority,
+  // then oldest", so the story you just finished sorts below every ancient
+  // critical one and a cap on the front of that list hides it on arrival.
+  it("reads most-recently-touched first, whatever priority says", () => {
+    view([
+      story("old", "done", "Ancient critical", {
+        priority: "critical",
+        updatedAt: new Date(Date.UTC(2020, 0, 1)),
+      }),
+      story("new", "done", "Just finished", {
+        priority: "low",
+        updatedAt: new Date(Date.UTC(2026, 8, 8)),
+      }),
+    ]);
+
+    const titles = within(column("done"))
+      .getAllByText(/Ancient critical|Just finished/)
+      .map(el => el.textContent);
+    expect(titles).toEqual(["Just finished", "Ancient critical"]);
+  });
+
+  it("keeps a just-finished card inside the cap", () => {
+    view([
+      ...done(20),
+      story("fresh", "done", "Just finished", {
+        priority: "low",
+        updatedAt: new Date(Date.UTC(2030, 0, 1)),
+      }),
+    ]);
+
+    expect(within(column("done")).getByText("Just finished")).toBeInTheDocument();
+  });
+
+  // Only Done. Every other column is a queue and its order is the backend's.
+  it("leaves the other columns in the order they arrived", () => {
+    view([
+      story("a", "ready", "First", { updatedAt: new Date(Date.UTC(2020, 0, 1)) }),
+      story("b", "ready", "Second", { updatedAt: new Date(Date.UTC(2030, 0, 1)) }),
+    ]);
+
+    const titles = within(column("ready"))
+      .getAllByText(/First|Second/)
+      .map(el => el.textContent);
+    expect(titles).toEqual(["First", "Second"]);
   });
 });
 

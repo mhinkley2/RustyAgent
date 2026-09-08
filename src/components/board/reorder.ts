@@ -5,8 +5,10 @@
  * a subset of what it holds. Numbering the rendered column `0..n` — which is
  * what persisting the visible order does — hands a hidden card and a visible
  * card the same `sortOrder`, and the column comes back scrambled the moment
- * the filter clears. On the Ready column that is not cosmetic: its order is
- * what decides which story an agent picks up next.
+ * the filter clears. On the Ready column that is not cosmetic: `sort_order` is
+ * what settles the order agents pick in, within a priority band
+ * (`db::story_status::queue_order_sql` sorts by priority first, then
+ * `sort_order`). Colliding it reshuffles the band.
  *
  * The rule here is the narrowest one that matches what the drag actually
  * expressed: **one card moved, and everything else stayed put.** The moved

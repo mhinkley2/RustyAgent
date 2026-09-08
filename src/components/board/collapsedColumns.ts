@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { StoryStatus } from "../../types/board";
 import { KANBAN_COLUMNS } from "../../types/board";
 
@@ -52,12 +52,25 @@ function write(collapsed: Set<StoryStatus>) {
 export function useCollapsedColumns() {
   const [collapsed, setCollapsed] = useState<Set<StoryStatus>>(read);
 
+  // The updater stays pure. Writing to storage inside it happens to be
+  // idempotent under StrictMode's double invocation today, and stops being so
+  // the moment two toggles are batched — a reducer is the wrong place to
+  // notice that.
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      // Nothing to persist on mount: this is the value that was just read back.
+      first.current = false;
+      return;
+    }
+    write(collapsed);
+  }, [collapsed]);
+
   const toggle = useCallback((status: StoryStatus) => {
     setCollapsed(prev => {
       const next = new Set(prev);
       if (next.has(status)) next.delete(status);
       else next.add(status);
-      write(next);
       return next;
     });
   }, []);

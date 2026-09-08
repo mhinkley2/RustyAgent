@@ -111,24 +111,42 @@ describe("FilterBar search", () => {
 
   // Escape is the reflex, and the box is inside a toolbar with no other way
   // back to an unfiltered board without reaching for the mouse.
-  it("clears on Escape", async () => {
-    const user = userEvent.setup();
-    render(<Harness />);
+  it("clears on Escape without waiting for the debounce", async () => {
+    vi.useFakeTimers();
+    const onChange = vi.fn();
+    render(<Harness onChange={onChange} />);
 
-    await user.type(searchBox(), "cap");
-    await user.keyboard("{Escape}");
+    fireEvent.change(searchBox(), { target: { value: "cap" } });
+    fireEvent.keyDown(searchBox(), { key: "Escape" });
 
+    // Asserted before any timer runs: `setDraft("")` alone would empty the box
+    // and let the pending debounce commit "cap" 200ms later, so checking the
+    // input's value is not enough to pin this.
     expect(searchBox()).toHaveValue("");
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ search: "" }));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ search: "" }));
   });
 
   // The box holds its own draft between keystrokes, so clearing the state is
   // not enough on its own — this is the case that regresses.
   it("empties the box when the bar's clear-all is pressed", async () => {
-    const user = userEvent.setup();
+    vi.useFakeTimers();
     render(<Harness />);
 
-    await user.type(searchBox(), "cap");
-    await user.click(await screen.findByRole("button", { name: /clear 1 filter/i }));
+    fireEvent.change(searchBox(), { target: { value: "cap" } });
+    // Drive the debounce rather than letting `findByRole` poll for it: the
+    // button only appears once the search reaches the filter state, and
+    // waiting on the wall clock for that is how a suite gets flaky on a
+    // loaded runner.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /clear 1 filter/i }));
 
     expect(searchBox()).toHaveValue("");
     expect(screen.queryByRole("button", { name: /clear \d+ filter/i })).toBeNull();
