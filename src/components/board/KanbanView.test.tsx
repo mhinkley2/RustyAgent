@@ -5,6 +5,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KanbanView } from "./KanbanView";
 import type { Story, StoryStatus } from "../../types/board";
 
+/**
+ * Which element, if any, each column handed to dnd-kit as its drop target.
+ *
+ * dnd-kit registers a droppable through a ref callback and leaves no mark in
+ * the DOM, so a column that forgets to attach it looks identical to one that
+ * did. This records the calls, which is the only way to assert the difference
+ * without simulating a drag jsdom cannot measure.
+ */
+const droppableNodes = vi.hoisted(() => new Map<string, HTMLElement | null>());
+
+vi.mock("@dnd-kit/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@dnd-kit/core")>();
+  return {
+    ...actual,
+    useDroppable: (args: Parameters<typeof actual.useDroppable>[0]) => {
+      const real = actual.useDroppable(args);
+      return {
+        ...real,
+        setNodeRef: (el: HTMLElement | null) => {
+          droppableNodes.set(String(args.id), el);
+          real.setNodeRef(el);
+        },
+      };
+    },
+  };
+});
+
 function story(id: string, status: StoryStatus, title = `Story ${id}`): Story {
   return {
     id,
@@ -46,6 +73,7 @@ function column(status: StoryStatus): HTMLElement {
 
 beforeEach(() => {
   localStorage.clear();
+  droppableNodes.clear();
 });
 
 afterEach(() => {
@@ -115,6 +143,19 @@ describe("KanbanView column collapse", () => {
     view(stories);
     expect(screen.queryByText("In review")).toBeNull();
     expect(screen.getByRole("button", { name: /expand review column/i })).toBeInTheDocument();
+  });
+
+  // Collapsing Done to get it out of the way and then being unable to drop a
+  // finished card into it is exactly the workflow the collapse is for.
+  it("stays a drop target while collapsed", async () => {
+    const user = userEvent.setup();
+    view([story("a", "review", "In review")]);
+
+    await user.click(screen.getByRole("button", { name: /collapse review column/i }));
+
+    const node = droppableNodes.get("review");
+    expect(node).toBeTruthy();
+    expect(column("review").contains(node!)).toBe(true);
   });
 
   it("expands again", async () => {

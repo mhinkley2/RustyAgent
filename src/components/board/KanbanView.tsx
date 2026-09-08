@@ -165,8 +165,17 @@ function KanbanColumn({
 
   if (collapsed) {
     return (
-      <div className="kb-col kb-col--collapsed" data-status={status}>
-        <div className="kb-col__header">
+      <div
+        className={`kb-col kb-col--collapsed${isDragOver ? " kb-col--drag-over" : ""}`}
+        data-status={status}
+      >
+        {/*
+          Still a drop target. Collapsing Done to get it out of the way and
+          then being unable to drop a finished card into it is exactly the
+          workflow the collapse is for, so the droppable ref goes on the
+          collapsed body too — there is just no card list under it.
+        */}
+        <div className="kb-col__header" ref={setNodeRef}>
           {headerToggle}
           <span className="kb-col__label">{label}</span>
           <span className="kb-col__count">{stories.length}</span>
