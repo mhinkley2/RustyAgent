@@ -482,6 +482,8 @@ fn finish_tool_call(acc: ToolAccum) -> StreamEvent {
 
 #[async_trait]
 impl LlmProvider for AnthropicClient {
+    fn provider_id(&self) -> &'static str { "anthropic" }
+
     async fn stream_completion(
         &self,
         messages: Vec<ChatMessage>,

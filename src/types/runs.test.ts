@@ -45,6 +45,12 @@ describe("formatCost", () => {
     expect(formatCost(0)).toBe("$0.00");
   });
 
+  // `null` is "nobody can say", which is a different claim from "$0.00" and
+  // has to look different.
+  it("renders an unknown cost as a dash rather than as zero", () => {
+    expect(formatCost(null)).toBe("—");
+  });
+
   it("uses four decimals below one cent so sub-cent runs are not all $0.00", () => {
     expect(formatCost(0.004)).toBe("$0.0040");
     expect(formatCost(0.0001)).toBe("$0.0001");
@@ -161,12 +167,22 @@ describe("formatEstimatedCost", () => {
     expect(formatEstimatedCost(r)).toBe("$0.0012");
   });
 
-  it("shows a dash, not $0.00, when tokens were spent but no price is known", () => {
-    // An unpriced model records real tokens against no cost; rendering that as
-    // $0.00 would assert a number the app does not have.
-    const r = run({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: 0 });
+  it("shows a dash, not $0.00, when no price is known", () => {
+    // An unpriced model on a charging provider records real tokens against no
+    // cost; rendering that as $0.00 would assert a number the app does not
+    // have.
+    const r = run({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: null });
 
     expect(formatEstimatedCost(r)).toBe("—");
+  });
+
+  // This is the case the old heuristic got wrong. It inferred "unknown" from
+  // zero-cost-with-tokens, which is exactly what a local Ollama run looks
+  // like — so a genuinely free run was reported as unpriced.
+  it("shows $0.00 for a free provider that really did spend tokens", () => {
+    const r = run({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: 0 });
+
+    expect(formatEstimatedCost(r)).toBe("$0.00");
   });
 
   it("still shows $0.00 for a run that never spent a token", () => {

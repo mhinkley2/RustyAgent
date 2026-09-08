@@ -54,8 +54,15 @@ export interface StoryRun {
   cacheReadTokens: number;
   /** Input tokens written into the provider's prompt cache. */
   cacheCreationTokens: number;
-  /** Estimate from the per-model price table; 0 when the model is unpriced. */
-  estimatedCostUsd: number;
+  /**
+   * An estimate from the per-model price table, not a bill — or `null` when
+   * nobody can say.
+   *
+   * Three states, and the last two are different claims: a number, `0` for a
+   * provider that genuinely charges nothing (Ollama runs locally), and `null`
+   * for tokens spent on a model the app has no rates for.
+   */
+  estimatedCostUsd: number | null;
   iterationCount: number;
   startedAt: Date;
   finishedAt: Date | null;
@@ -153,7 +160,10 @@ export interface RunFilters {
 // Helpers
 // ---------------------------------------------------------------------------
 
-export function formatCost(usd: number): string {
+export function formatCost(usd: number | null): string {
+  // An em dash for "not knowable", matching what the Runs list already does
+  // for a duration it cannot parse.
+  if (usd == null) return "—";
   if (usd === 0) return "$0.00";
   if (usd < 0.01) return `$${usd.toFixed(4)}`;
   return `$${usd.toFixed(2)}`;
@@ -176,12 +186,13 @@ export function totalTokens(run: StoryRun): number {
 /**
  * Cost for display, distinguishing "free" from "not priced".
  *
- * A run on a model missing from the price table records real tokens against no
- * cost. Rendering that as $0.00 would state a number the app does not know, so
- * it shows an em dash instead.
+ * This used to infer the difference — zero against non-zero tokens was read as
+ * "not priced" — because the column could not hold it. That guess was wrong in
+ * one direction: an Ollama run really is free, and it spends tokens doing it,
+ * so it was reported as unknown. The backend now says which it means and this
+ * only formats the answer.
  */
 export function formatEstimatedCost(run: StoryRun): string {
-  if (run.estimatedCostUsd === 0 && totalTokens(run) > 0) return "—";
   return formatCost(run.estimatedCostUsd);
 }
 

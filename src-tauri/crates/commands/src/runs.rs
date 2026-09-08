@@ -24,9 +24,14 @@ pub struct StoryRun {
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
-    /// An estimate from the per-model price table, not a bill. Stays 0.0 when
-    /// the model is not in the table.
-    pub estimated_cost_usd: f64,
+    /// An estimate from the per-model price table, not a bill — or `None`
+    /// when nobody can say.
+    ///
+    /// `Some(0.0)` and `None` are different answers: a local Ollama run really
+    /// was free, while a DeepSeek run spent money the app has no rates for.
+    /// Collapsing them was the defect — the column reported every unpriced run
+    /// as costing nothing.
+    pub estimated_cost_usd: Option<f64>,
     pub iteration_count: i64,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -123,7 +128,10 @@ fn row_to_run(row: &sqlx::sqlite::SqliteRow) -> StoryRun {
         output_tokens:       row.try_get("output_tokens").unwrap_or(0),
         cache_read_input_tokens:     row.try_get("cache_read_input_tokens").unwrap_or(0),
         cache_creation_input_tokens: row.try_get("cache_creation_input_tokens").unwrap_or(0),
-        estimated_cost_usd:  row.try_get("estimated_cost_usd").unwrap_or(0.0),
+        // `unwrap_or(None)`, not `unwrap_or(0.0)`: a column that fails to read
+        // is unknown, and the whole point of this field is that unknown and
+        // zero are not the same claim.
+        estimated_cost_usd:  row.try_get("estimated_cost_usd").unwrap_or(None),
         iteration_count:     row.try_get("iteration_count").unwrap_or(0),
         started_at,
         finished_at,

@@ -94,11 +94,22 @@ describe("RunDetailPanel token accounting", () => {
 
   it("declines to quote $0.00 for a run on an unpriced model", async () => {
     // Real tokens, no price-table entry: the app does not know the cost and
-    // must not claim it was free.
-    renderPanel(makeRun({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: 0 }));
+    // must not claim it was free. The backend now says so with a null rather
+    // than leaving the reader to infer it from a zero.
+    renderPanel(makeRun({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: null }));
 
     await waitFor(async () => {
       expect(await statValue("Est. cost")).toBe("—");
+    });
+  });
+
+  // The case the old zero-means-unknown heuristic got backwards: a local
+  // Ollama run spends tokens and really is free.
+  it("quotes $0.00 for a free provider that spent tokens", async () => {
+    renderPanel(makeRun({ inputTokens: 5000, outputTokens: 500, estimatedCostUsd: 0 }));
+
+    await waitFor(async () => {
+      expect(await statValue("Est. cost")).toBe("$0.00");
     });
   });
 });

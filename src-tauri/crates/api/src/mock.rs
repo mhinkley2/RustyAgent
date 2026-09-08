@@ -97,6 +97,7 @@ pub struct MockLlmProvider {
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     available_models: Vec<String>,
     usage: Option<Usage>,
+    provider_id: &'static str,
 }
 
 impl MockLlmProvider {
@@ -106,7 +107,18 @@ impl MockLlmProvider {
             calls: Arc::new(Mutex::new(Vec::new())),
             available_models: vec!["mock-model".to_string()],
             usage: Some(DEFAULT_MOCK_USAGE),
+            provider_id: "anthropic",
         }
+    }
+
+    /// Stand in for a specific provider.
+    ///
+    /// Cost accounting asks the provider who it is, so a test about a free
+    /// provider (`ollama`) or one the app has no rates for (`deepseek`) has to
+    /// be able to say which it is pretending to be.
+    pub fn as_provider(mut self, provider_id: &'static str) -> Self {
+        self.provider_id = provider_id;
+        self
     }
 
     pub fn with_models(mut self, models: Vec<String>) -> Self {
@@ -150,6 +162,11 @@ impl MockLlmProvider {
 
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
+    /// `anthropic` unless a test said otherwise with
+    /// [`MockLlmProvider::as_provider`], so runs price like the real thing by
+    /// default.
+    fn provider_id(&self) -> &'static str { self.provider_id }
+
     async fn stream_completion(
         &self,
         messages: Vec<ChatMessage>,

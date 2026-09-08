@@ -97,6 +97,8 @@ impl OpenRouterClient {
 
 #[async_trait]
 impl LlmProvider for OpenRouterClient {
+    fn provider_id(&self) -> &'static str { "openrouter" }
+
     async fn stream_completion(
         &self,
         messages: Vec<ChatMessage>,

@@ -404,7 +404,7 @@ async fn the_tokens_an_interrupted_run_spent_survive_reconciliation() {
     assert_eq!(usage.output_tokens, 340);
     assert_eq!(usage.cache_read_input_tokens, 800);
     assert_eq!(usage.cache_creation_input_tokens, 64);
-    assert_eq!(usage.estimated_cost_usd, 0.25);
+    assert_eq!(usage.estimated_cost_usd, Some(0.25));
     // And the iterations it got through before it was cut off.
     assert_eq!(run_iteration_count(&db, "run-1").await, 7);
 }

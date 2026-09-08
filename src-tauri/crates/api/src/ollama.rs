@@ -173,6 +173,8 @@ struct OllamaModel {
 
 #[async_trait]
 impl LlmProvider for OllamaClient {
+    fn provider_id(&self) -> &'static str { "ollama" }
+
     async fn stream_completion(
         &self,
         messages: Vec<ChatMessage>,

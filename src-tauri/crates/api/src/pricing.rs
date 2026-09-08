@@ -148,6 +148,70 @@ pub fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     lookup(model).map(|price| price.cost_usd(usage))
 }
 
+/// Providers that charge nothing, whatever model they are asked for.
+///
+/// Only Ollama, which runs the model on the user's own machine. This is not
+/// "we have no rates for it" — it is a rate, and the rate is zero.
+const FREE_PROVIDERS: &[&str] = &["ollama"];
+
+/// Providers whose own rates are in [`PRICES`].
+///
+/// Anthropic alone. The table holds *Anthropic's published list prices*, and
+/// that is the one thing it can be trusted to say — which makes this list the
+/// scope of what those numbers may be applied to, not a bookkeeping detail.
+const PRICED_PROVIDERS: &[&str] = &["anthropic"];
+
+/// Case-insensitive membership, without allocating to ask.
+///
+/// These run once per run completion, which is not hot — but building a
+/// `String` to compare four bytes is the kind of thing that gets copied into
+/// somewhere that is.
+fn contains_ignoring_case(table: &[&str], provider: &str) -> bool {
+    let provider = provider.trim();
+    table.iter().any(|known| known.eq_ignore_ascii_case(provider))
+}
+
+/// Whether a provider's runs are free by construction rather than unpriced.
+pub fn is_free_provider(provider: &str) -> bool {
+    contains_ignoring_case(FREE_PROVIDERS, provider)
+}
+
+/// Whether [`PRICES`] holds this provider's own rates.
+pub fn is_priced_provider(provider: &str) -> bool {
+    contains_ignoring_case(PRICED_PROVIDERS, provider)
+}
+
+/// What `usage` cost, or `None` when nobody can say.
+///
+/// Three outcomes, and the difference between the last two is the whole point:
+///
+///   * `Some(n)` — a model in [`PRICES`], costed at its published rates.
+///   * `Some(0.0)` — a provider in [`FREE_PROVIDERS`]. It really was free.
+///   * `None` — a model no table knows, on a provider that does charge. The
+///     tokens are real and the price is not knowable, so quoting `$0.00` would
+///     invent a number rather than report one.
+///
+/// The provider decides, and the model only refines. Pricing by model alone
+/// cannot tell a free run from an unpriced one — a local Ollama build is as
+/// absent from [`PRICES`] as a DeepSeek model — and, less obviously, it cannot
+/// tell a model from a *reseller's* price for that model.
+///
+/// That second case is why an unlisted provider is refused outright rather
+/// than fed to [`estimate_cost_usd`]. OpenRouter serves `anthropic/claude-*`,
+/// which [`normalize`] reduces to an id [`PRICES`] knows, so pricing by model
+/// would quote Anthropic's direct list price for a run bought through a
+/// reseller that sets its own margin. A confidently wrong invoice is worse
+/// than an absent one, which is the rule this module is built on.
+pub fn cost_usd_for(provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+    if is_free_provider(provider) {
+        return Some(0.0);
+    }
+    if !is_priced_provider(provider) {
+        return None;
+    }
+    estimate_cost_usd(model, usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +316,61 @@ mod tests {
         // guessing a window too large is what sends the oversized request.
         let known = context_window("claude-haiku-4-5").expect("haiku 4.5");
         assert!(DEFAULT_CONTEXT_WINDOW < known);
+    }
+
+    #[test]
+    fn a_local_provider_costs_nothing_rather_than_costing_an_unknown_amount() {
+        let usage = Usage::new(1_000_000, 1_000_000);
+
+        // The model is not in `PRICES` and never will be, but the run was free.
+        assert_eq!(cost_usd_for("ollama", "llama3:8b", &usage), Some(0.0));
+        assert!(is_free_provider("Ollama"), "the check is case-insensitive");
+    }
+
+    #[test]
+    fn a_charging_provider_with_no_rates_declines_to_quote_rather_than_saying_free() {
+        // The distinction this whole column exists for: DeepSeek bills for
+        // these tokens and the app cannot say how much. Zero would be a lie in
+        // a way that `None` is not.
+        assert_eq!(
+            cost_usd_for("deepseek", "deepseek-chat", &Usage::new(1_000_000, 1_000_000)),
+            None,
+        );
+        assert!(!is_free_provider("deepseek"));
+    }
+
+    #[test]
+    fn a_reseller_serving_a_known_model_is_not_quoted_the_direct_price() {
+        let usage = Usage::new(1_000_000, 1_000_000);
+
+        // `normalize` reduces this to `claude-opus-5`, which the table prices —
+        // so pricing by model alone would hand back Anthropic's direct list
+        // price for tokens bought through OpenRouter at its own margin. The
+        // number would look authoritative and be wrong.
+        assert!(estimate_cost_usd("anthropic/claude-opus-5", &usage).is_some());
+        assert_eq!(cost_usd_for("openrouter", "anthropic/claude-opus-5", &usage), None);
+    }
+
+    #[test]
+    fn the_provider_whose_rates_the_table_holds_is_priced_by_model() {
+        let usage = Usage::new(1_000_000, 1_000_000);
+
+        assert_eq!(
+            cost_usd_for("anthropic", "claude-opus-5", &usage),
+            estimate_cost_usd("claude-opus-5", &usage),
+        );
+        // ...and only for models it actually knows.
+        assert_eq!(cost_usd_for("anthropic", "some-unlisted-model", &usage), None);
+    }
+
+    #[test]
+    fn free_outranks_unpriced_so_a_local_run_is_not_refused() {
+        // Ollama is in neither `PRICES` nor `PRICED_PROVIDERS`; the free check
+        // has to come first or every local run would report "unknown".
+        assert_eq!(
+            cost_usd_for("ollama", "llama3:8b", &Usage::new(10, 10)),
+            Some(0.0),
+        );
     }
 
     #[test]

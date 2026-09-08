@@ -110,6 +110,8 @@ impl DeepSeekClient {
 
 #[async_trait]
 impl LlmProvider for DeepSeekClient {
+    fn provider_id(&self) -> &'static str { "deepseek" }
+
     async fn stream_completion(
         &self,
         messages: Vec<ChatMessage>,
