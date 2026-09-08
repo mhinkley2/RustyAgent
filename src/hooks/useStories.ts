@@ -22,7 +22,8 @@ interface RawLatestRun {
   iteration_count: number;
   input_tokens: number;
   output_tokens: number;
-  estimated_cost_usd: number;
+  /** `null` when the run's cost is not knowable. */
+  estimated_cost_usd: number | null;
 }
 
 interface RawStory {

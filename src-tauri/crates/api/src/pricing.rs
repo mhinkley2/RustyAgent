@@ -161,14 +161,24 @@ const FREE_PROVIDERS: &[&str] = &["ollama"];
 /// scope of what those numbers may be applied to, not a bookkeeping detail.
 const PRICED_PROVIDERS: &[&str] = &["anthropic"];
 
+/// Case-insensitive membership, without allocating to ask.
+///
+/// These run once per run completion, which is not hot — but building a
+/// `String` to compare four bytes is the kind of thing that gets copied into
+/// somewhere that is.
+fn contains_ignoring_case(table: &[&str], provider: &str) -> bool {
+    let provider = provider.trim();
+    table.iter().any(|known| known.eq_ignore_ascii_case(provider))
+}
+
 /// Whether a provider's runs are free by construction rather than unpriced.
 pub fn is_free_provider(provider: &str) -> bool {
-    FREE_PROVIDERS.contains(&provider.trim().to_ascii_lowercase().as_str())
+    contains_ignoring_case(FREE_PROVIDERS, provider)
 }
 
 /// Whether [`PRICES`] holds this provider's own rates.
 pub fn is_priced_provider(provider: &str) -> bool {
-    PRICED_PROVIDERS.contains(&provider.trim().to_ascii_lowercase().as_str())
+    contains_ignoring_case(PRICED_PROVIDERS, provider)
 }
 
 /// What `usage` cost, or `None` when nobody can say.
