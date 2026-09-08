@@ -15,14 +15,34 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
-      // A ratchet, not a target. Set just below what the first wave of tests
-      // achieved so a regression fails the build; raise it as more of the app
+      // Count every source file, not only the ones a test happens to import.
+      //
+      // Without this the denominator is import-driven, which inverts the
+      // incentive for integration tests: `BoardPage.test.tsx` transitively
+      // pulls in `RunPanel`, `ListView` and `StoryForm`, so writing it *added*
+      // ~2,000 uncounted statements and dropped every threshold below its
+      // floor. A test that caught the bug it was written for could not be
+      // merged, and deleting it restored a green build. It was deleted.
+      //
+      // (In Vitest 4 this is `include`. The older `all: true` spelling is
+      // accepted silently and does nothing, which is worth knowing before
+      // trusting a number that did not move.)
+      include: ["src/**/*.{ts,tsx}"],
+      // A ratchet, not a target. Set just below what the suite actually
+      // achieves so a regression fails the build; raise it as more of the app
       // comes under test. Deliberately untested areas are listed in `exclude`.
+      //
+      // These numbers dropped by roughly half when `include` was added, and
+      // that is not a regression — nothing got worse, the denominator stopped
+      // hiding the files nothing tests. 69% was 1474/2126 of the imported
+      // files; 37% is 1643/4402 of the app. The second is the honest one, and
+      // large untested modules (`RunPanel.tsx`, `ChatPage.tsx`) now dominate
+      // it, which is the point.
       thresholds: {
-        statements: 65,
-        branches: 55,
-        functions: 65,
-        lines: 65,
+        statements: 36,
+        branches: 33,
+        functions: 34,
+        lines: 37,
       },
       // Keep the percentage honest: exclude what we deliberately do not test.
       // See the "Non-goals" section of the coverage plan.
