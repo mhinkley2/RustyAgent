@@ -231,6 +231,12 @@ struct ProviderHandle(Arc<MockLlmProvider>);
 
 #[async_trait]
 impl api::LlmProvider for ProviderHandle {
+    /// Delegates, so a test that wants a free or an unpriced provider says so
+    /// on the mock rather than needing a second handle type.
+    fn provider_id(&self) -> &'static str {
+        self.0.provider_id()
+    }
+
     async fn stream_completion(
         &self,
         messages: Vec<ChatMessage>,
@@ -1832,7 +1838,11 @@ async fn a_known_model_gets_a_non_zero_cost_from_the_price_table() {
 
     let run_id = h.run().await;
 
-    let cost = h.usage(&run_id).await.estimated_cost_usd;
+    let cost = h
+        .usage(&run_id)
+        .await
+        .estimated_cost_usd
+        .expect("a priced model must produce a cost, not withhold one");
     assert!(cost > 0.0, "a priced model must produce a cost, got {cost}");
     assert!(
         (cost - ONE_CALL_COST).abs() < 1e-9,
@@ -1851,9 +1861,49 @@ async fn an_unknown_model_records_real_tokens_and_no_fabricated_cost() {
     assert_eq!(usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64);
     assert_eq!(usage.output_tokens, DEFAULT_MOCK_USAGE.output_tokens as i64);
     assert_eq!(
-        usage.estimated_cost_usd, 0.0,
-        "an unpriced model must not be quoted at some other model's rate"
+        usage.estimated_cost_usd, None,
+        "an unpriced model on a charging provider records no cost at all —          zero would claim the run was free, which is a different and false answer"
     );
+}
+
+#[tokio::test]
+async fn a_free_provider_records_zero_rather_than_declining_to_answer() {
+    // Ollama runs locally. Its models are as absent from the price table as
+    // DeepSeek's, and the run really did cost nothing — so this is the one
+    // case where zero is the honest number.
+    let h = Harness::with_provider(
+        MockLlmProvider::script(vec![MockResponse::text("done")]).as_provider("ollama"),
+    )
+    .await;
+
+    let run_id = h.run().await;
+
+    let usage = h.usage(&run_id).await;
+    assert_eq!(usage.estimated_cost_usd, Some(0.0));
+    assert!(
+        usage.input_tokens > 0,
+        "it spent tokens; what it did not spend is money"
+    );
+}
+
+#[tokio::test]
+async fn a_charging_provider_with_no_rates_is_told_apart_from_a_free_one() {
+    // The distinction the column was rebuilt to hold. Same absent model, same
+    // tokens, different answer — and before this the two were both `0.0`.
+    let deepseek = Harness::with_provider(
+        MockLlmProvider::script(vec![MockResponse::text("done")]).as_provider("deepseek"),
+    )
+    .await;
+    let deepseek_run = deepseek.run().await;
+
+    let ollama = Harness::with_provider(
+        MockLlmProvider::script(vec![MockResponse::text("done")]).as_provider("ollama"),
+    )
+    .await;
+    let ollama_run = ollama.run().await;
+
+    assert_eq!(deepseek.usage(&deepseek_run).await.estimated_cost_usd, None);
+    assert_eq!(ollama.usage(&ollama_run).await.estimated_cost_usd, Some(0.0));
 }
 
 #[tokio::test]
@@ -1877,10 +1927,10 @@ async fn a_multi_iteration_run_reports_the_sum_of_every_call_not_the_last_one() 
         usage.cache_read_input_tokens,
         2 * DEFAULT_MOCK_USAGE.cache_read_input_tokens as i64
     );
+    let cost = usage.estimated_cost_usd.expect("a priced model is costed");
     assert!(
-        (usage.estimated_cost_usd - 2.0 * ONE_CALL_COST).abs() < 1e-9,
-        "cost should double with the second call, got {}",
-        usage.estimated_cost_usd
+        (cost - 2.0 * ONE_CALL_COST).abs() < 1e-9,
+        "cost should double with the second call, got {cost}"
     );
 }
 
@@ -1907,7 +1957,7 @@ async fn a_run_that_fails_mid_way_still_persists_what_it_already_spent() {
         usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64,
         "the completed first call still cost what it cost"
     );
-    assert!(usage.estimated_cost_usd > 0.0);
+    assert!(usage.estimated_cost_usd.is_some_and(|c| c > 0.0));
 }
 
 #[tokio::test]
@@ -1928,7 +1978,10 @@ async fn a_cancelled_run_still_persists_what_it_already_spent() {
     let usage = h.usage(&run_id).await;
     assert_eq!(usage.input_tokens, DEFAULT_MOCK_USAGE.input_tokens as i64);
     assert_eq!(usage.output_tokens, DEFAULT_MOCK_USAGE.output_tokens as i64);
-    assert!(usage.estimated_cost_usd > 0.0, "cancelled work is still billed");
+    assert!(
+        usage.estimated_cost_usd.is_some_and(|c| c > 0.0),
+        "cancelled work is still billed"
+    );
 }
 
 #[tokio::test]
@@ -1942,7 +1995,9 @@ async fn a_run_cancelled_before_its_first_call_records_nothing() {
     let usage = h.usage(&run_id).await;
     assert_eq!(usage.input_tokens, 0);
     assert_eq!(usage.output_tokens, 0);
-    assert_eq!(usage.estimated_cost_usd, 0.0);
+    // A real zero, not a withheld price: the model is priced and nothing was
+    // spent on it.
+    assert_eq!(usage.estimated_cost_usd, Some(0.0));
 }
 
 #[tokio::test]
@@ -1961,7 +2016,9 @@ async fn a_provider_that_reports_no_usage_leaves_the_counts_at_zero() {
     let usage = h.usage(&run_id).await;
     assert_eq!(usage.input_tokens, 0);
     assert_eq!(usage.output_tokens, 0);
-    assert_eq!(usage.estimated_cost_usd, 0.0);
+    // A real zero, not a withheld price: the model is priced and nothing was
+    // spent on it.
+    assert_eq!(usage.estimated_cost_usd, Some(0.0));
 }
 
 #[tokio::test]

@@ -1825,15 +1825,26 @@ impl ConversationRuntime {
     /// figure can never disagree with the status it was recorded against.
     async fn finish_run(&self, status: &str, iterations: u32) {
         let usage = self.usage_total;
-        // `None` for a model the price table does not know. COALESCE then
-        // leaves the column at its default rather than asserting $0.00 — the
-        // token counts are still recorded, only the price is withheld.
-        let cost = api::pricing::estimate_cost_usd(&self.config.model, &usage);
+        // Three answers, and the column can now hold all three: a price, a
+        // genuine zero from a local provider, or NULL for tokens nobody can
+        // put a number on.
+        //
+        // This used to be `estimate_cost_usd` under a COALESCE, whose comment
+        // claimed it left the price withheld. It did not: the column was
+        // `NOT NULL DEFAULT 0.0`, so withholding a price and quoting $0.00
+        // wrote the same value, and every DeepSeek and OpenRouter run has
+        // reported free ever since.
+        let cost = api::pricing::cost_usd_for(
+            self.provider.provider_id(),
+            &self.config.model,
+            &usage,
+        );
         if cost.is_none() && !usage.is_zero() {
             debug!(
                 run_id = %self.run_id,
                 model = %self.config.model,
-                "No price table entry; recording tokens without a cost estimate"
+                provider = %self.provider.provider_id(),
+                "No price table entry; recording tokens with no cost"
             );
         }
 
@@ -1843,7 +1854,7 @@ impl ConversationRuntime {
                  iteration_count = ?, \
                  input_tokens = ?, output_tokens = ?, \
                  cache_read_input_tokens = ?, cache_creation_input_tokens = ?, \
-                 estimated_cost_usd = COALESCE(?, estimated_cost_usd) \
+                 estimated_cost_usd = ? \
              WHERE id = ?"
         ))
         .bind(status)

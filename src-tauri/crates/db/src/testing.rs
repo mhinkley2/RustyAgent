@@ -153,7 +153,10 @@ pub struct RunUsage {
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
-    pub estimated_cost_usd: f64,
+    /// `None` when the run's cost is not knowable — an unpriced model on a
+    /// provider that charges. Distinct from `Some(0.0)`, which is a local
+    /// provider that really was free.
+    pub estimated_cost_usd: Option<f64>,
 }
 
 /// Read the token and cost columns of one `story_runs` row.

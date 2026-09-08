@@ -92,7 +92,8 @@ export interface StoryLatestRun {
   iterationCount: number;
   inputTokens: number;
   outputTokens: number;
-  estimatedCostUsd: number;
+  /** `null` when the run's cost is not knowable. See `types/runs.ts`. */
+  estimatedCostUsd: number | null;
 }
 
 export const KANBAN_COLUMNS: { status: StoryStatus; label: string }[] = [

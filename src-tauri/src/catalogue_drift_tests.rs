@@ -60,6 +60,32 @@ fn frontend_models(source: &str, provider: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every provider the frontend's `Provider` union names.
+///
+/// Parses the union rather than `PROVIDER_MODELS` on purpose: the union is
+/// what the profile editor will accept, so a provider added there and nowhere
+/// else is still a provider whose runs need a cost story. Same narrowness as
+/// [`frontend_models`] — an unparsed shape yields nothing, and the caller
+/// compares against a non-empty list, so silence fails.
+fn frontend_providers(source: &str) -> Vec<&'static str> {
+    let Some((_, rest)) = source.split_once("export type Provider =") else {
+        return Vec::new();
+    };
+    let line = rest.split(';').next().unwrap_or("");
+
+    // Leaked so the result borrows for `'static` and compares directly against
+    // the `&'static str` bucket constants. This is a test binary; one small
+    // leak per run is cheaper than threading lifetimes through the assertion.
+    line.match_indices('"')
+        .step_by(2)
+        .filter_map(|(at, _)| {
+            let after = &line[at + 1..];
+            let close = after.find('"')?;
+            Some(&*Box::leak(after[..close].to_string().into_boxed_str()))
+        })
+        .collect()
+}
+
 fn agent_ts() -> String {
     let path = repo_root().join("src").join("types").join("agent.ts");
     std::fs::read_to_string(&path)
@@ -153,14 +179,25 @@ fn the_offline_fallback_offers_the_same_models_as_the_editor() {
 /// wrong invoice.
 const PRICED_PROVIDERS: [&str; 1] = ["anthropic"];
 
-/// Providers whose runs currently report no cost at all.
+/// Providers that charge, and whose models the app has no rates for.
+///
+/// Their runs record no cost — `NULL`, which the UI renders as an em dash.
+/// That is the honest answer, and it is not the same as free.
 const UNPRICED_PROVIDERS: [&str; 2] = ["deepseek", "openrouter"];
+
+/// Providers that charge nothing, whatever model they are asked for.
+///
+/// Ollama runs on the user's own machine. Its models are absent from `PRICES`
+/// exactly like DeepSeek's, and its runs still cost zero — so it is priced,
+/// at zero, rather than unpriced. Keeping it in a list of its own is what
+/// stops the third state being rediscovered as a bug.
+const FREE_PROVIDERS: [&str; 1] = ["ollama"];
 
 #[test]
 fn the_providers_the_app_cannot_price_are_the_ones_recorded_here() {
-    // This is a gap, written down. Every DeepSeek and OpenRouter run records
-    // zero cost today — not an estimate, zero — and nothing in the app says so
-    // except the editor's warning, which relies on `pricing` genuinely not
+    // This is a gap, written down. DeepSeek and OpenRouter runs record no cost
+    // — `NULL` now rather than the zero they used to claim — and the editor
+    // warns about their models, which relies on `pricing` genuinely not
     // knowing them.
     //
     // It is asserted in both directions on purpose. Adding rates for one of
@@ -194,4 +231,33 @@ fn the_providers_the_app_cannot_price_are_the_ones_recorded_here() {
             "{provider} now has rates for {priced:?}. Move it to PRICED_PROVIDERS — its runs              will start reporting real costs, and the editor will stop warning about them.",
         );
     }
+
+    for provider in FREE_PROVIDERS {
+        assert!(
+            api::pricing::is_free_provider(provider),
+            "{provider} is listed here as free but `pricing::is_free_provider` disagrees",
+        );
+    }
+
+    // Every provider the app offers lands in exactly one bucket. Without this
+    // a new provider is silently neither priced, unpriced, nor free — which is
+    // how Ollama sat outside all of this while its runs reported a cost the
+    // app had never reasoned about.
+    let mut classified: Vec<&str> = PRICED_PROVIDERS
+        .iter()
+        .chain(UNPRICED_PROVIDERS.iter())
+        .chain(FREE_PROVIDERS.iter())
+        .copied()
+        .collect();
+    classified.sort_unstable();
+    let before = classified.len();
+    classified.dedup();
+    assert_eq!(before, classified.len(), "a provider is in two buckets: {classified:?}");
+
+    let mut offered = frontend_providers(&source);
+    offered.sort_unstable();
+    assert_eq!(
+        offered, classified,
+        "every provider the agent editor offers needs a cost bucket",
+    );
 }

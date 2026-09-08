@@ -148,6 +148,37 @@ pub fn estimate_cost_usd(model: &str, usage: &Usage) -> Option<f64> {
     lookup(model).map(|price| price.cost_usd(usage))
 }
 
+/// Providers that charge nothing, whatever model they are asked for.
+///
+/// Only Ollama, which runs the model on the user's own machine. This is not
+/// "we have no rates for it" — it is a rate, and the rate is zero.
+const FREE_PROVIDERS: &[&str] = &["ollama"];
+
+/// Whether a provider's runs are free by construction rather than unpriced.
+pub fn is_free_provider(provider: &str) -> bool {
+    FREE_PROVIDERS.contains(&provider.trim().to_ascii_lowercase().as_str())
+}
+
+/// What `usage` cost, or `None` when nobody can say.
+///
+/// Three outcomes, and the difference between the last two is the whole point:
+///
+///   * `Some(n)` — a model in [`PRICES`], costed at its published rates.
+///   * `Some(0.0)` — a provider in [`FREE_PROVIDERS`]. It really was free.
+///   * `None` — a model no table knows, on a provider that does charge. The
+///     tokens are real and the price is not knowable, so quoting `$0.00` would
+///     invent a number rather than report one.
+///
+/// The provider is checked first. A local Ollama build is as absent from
+/// [`PRICES`] as a DeepSeek model, and pricing by model alone cannot tell a
+/// free run from an unpriced one.
+pub fn cost_usd_for(provider: &str, model: &str, usage: &Usage) -> Option<f64> {
+    if is_free_provider(provider) {
+        return Some(0.0);
+    }
+    estimate_cost_usd(model, usage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +283,38 @@ mod tests {
         // guessing a window too large is what sends the oversized request.
         let known = context_window("claude-haiku-4-5").expect("haiku 4.5");
         assert!(DEFAULT_CONTEXT_WINDOW < known);
+    }
+
+    #[test]
+    fn a_local_provider_costs_nothing_rather_than_costing_an_unknown_amount() {
+        let usage = Usage::new(1_000_000, 1_000_000);
+
+        // The model is not in `PRICES` and never will be, but the run was free.
+        assert_eq!(cost_usd_for("ollama", "llama3:8b", &usage), Some(0.0));
+        assert!(is_free_provider("Ollama"), "the check is case-insensitive");
+    }
+
+    #[test]
+    fn a_charging_provider_with_no_rates_declines_to_quote_rather_than_saying_free() {
+        // The distinction this whole column exists for: DeepSeek bills for
+        // these tokens and the app cannot say how much. Zero would be a lie in
+        // a way that `None` is not.
+        assert_eq!(
+            cost_usd_for("deepseek", "deepseek-chat", &Usage::new(1_000_000, 1_000_000)),
+            None,
+        );
+        assert!(!is_free_provider("deepseek"));
+    }
+
+    #[test]
+    fn a_priced_model_is_costed_the_same_whichever_provider_served_it() {
+        let usage = Usage::new(1_000_000, 1_000_000);
+
+        assert_eq!(
+            cost_usd_for("openrouter", "anthropic/claude-opus-5", &usage),
+            estimate_cost_usd("claude-opus-5", &usage),
+            "OpenRouter reselling a model the table knows is still priced",
+        );
     }
 
     #[test]
