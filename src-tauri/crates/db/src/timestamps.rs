@@ -25,14 +25,6 @@
 /// the column entirely; this is for the writes that must name it.
 pub const NOW_ISO8601: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
-/// The same instant, in the same spelling, produced in Rust.
-///
-/// For a value that has to exist before the statement runs. Kept beside
-/// [`NOW_ISO8601`] so the two cannot drift apart unnoticed.
-pub fn now_iso8601() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
-}
-
 /// Whether a stored timestamp is in the format every reader parses.
 ///
 /// The guard the database cannot provide. A writer that reaches for
@@ -45,15 +37,6 @@ pub fn parses_as_rfc3339(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rust_side_timestamp_round_trips_through_the_parser_that_reads_it() {
-        let now = now_iso8601();
-        assert!(
-            parses_as_rfc3339(&now),
-            "now_iso8601 produced {now:?}, which the reader cannot parse"
-        );
-    }
 
     #[test]
     fn current_timestamp_is_what_this_module_exists_to_avoid() {
@@ -75,24 +58,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_two_spellings_agree_to_the_second() {
-        // They are written by different mechanisms; a divergence here means
-        // one of them changed and the other did not.
-        let pool = crate::testing::make_test_pool().await;
-        let sql: String = sqlx::query_scalar(&format!("SELECT {NOW_ISO8601}"))
-            .fetch_one(&pool)
-            .await
-            .expect("evaluate the timestamp expression");
-        let rust = now_iso8601();
-
-        let sql = chrono::DateTime::parse_from_rfc3339(&sql).expect("SQL side parses");
-        let rust = chrono::DateTime::parse_from_rfc3339(&rust).expect("Rust side parses");
-        assert!(
-            (sql - rust).num_seconds().abs() <= 5,
-            "SQL gave {sql} and Rust gave {rust}; they are not the same clock"
-        );
-    }
 
     /// The migration rewrites what the old writers left behind. Running its
     /// statements twice must not append a second suffix — a user upgrading
