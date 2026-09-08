@@ -27,13 +27,13 @@ import BoardPage from "./BoardPage";
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function rawStory(id: string, title: string, status = "in_progress") {
+function rawStory(id: string, title: string) {
   return {
     id,
     title,
     description: null,
     story_type: "task",
-    status,
+    status: "in_progress",
     priority: "medium",
     assigned_agent_id: null,
     assigned_agent_name: null,
@@ -67,7 +67,7 @@ function rawApproval(id: string, storyId: string | null) {
     run_id: `run-${id}`,
     story_id: storyId,
     story_title: "Wants a tool",
-    tool_name: "write_file",
+    tool_name: "file_write",
     tool_input: '{"path":"x"}',
     status: "pending",
     created_at: "2026-08-31T00:00:00Z",
@@ -86,7 +86,6 @@ function renderBoard({ stories = [], humans = [], approvals = [] }: BoardFixture
     get_profiles: () => [],
     get_pending_human_requests: () => humans,
     get_pending_approvals: () => approvals,
-    respond_to_human_request: () => null,
     decide_approval: () => null,
   });
 
@@ -99,26 +98,30 @@ function renderBoard({ stories = [], humans = [], approvals = [] }: BoardFixture
   );
 }
 
+/**
+ * A card's "waiting on you" marker.
+ *
+ * The card is found by exact accessible name rather than by a regex built from
+ * the title — a fixture titled `Fix (again)` would otherwise throw a
+ * `SyntaxError` out of this helper instead of failing legibly.
+ */
 const marker = (title: string) =>
-  within(screen.getByLabelText(new RegExp(`: ${title}$`))).getByRole("button", {
-    name: /waiting on you/i,
-  });
+  within(
+    screen.getByLabelText((label: string) => label.endsWith(`: ${title}`)),
+  ).getByRole("button", { name: /waiting on you/i });
 
 const inputDialog = () => screen.queryByRole("dialog", { name: /asking for input/i });
 const approvalDialog = () => screen.queryByRole("dialog", { name: /approve tool execution/i });
 
 /**
- * A banner's own action button.
+ * A banner's own action button, by its accessible name.
  *
- * Scoped to the banner rather than looked up globally: "Review" is also the
- * name of a Kanban column, whose collapse control is a button too.
+ * Exact names rather than `/review/i`: the Review column's collapse control is
+ * also a button, and a loose pattern matches its "Collapse Review column" too.
+ * An exact name does not, so there is no need to reach for the banner's class.
  */
 function bannerButton(kind: "input" | "approval") {
-  const banner = document.querySelector(
-    kind === "input" ? ".hitl-banner--input" : ".hitl-banner--approval",
-  );
-  if (!banner) throw new Error(`no ${kind} banner rendered`);
-  return within(banner as HTMLElement).getByRole("button");
+  return screen.getByRole("button", { name: kind === "input" ? "Respond" : "Review" });
 }
 
 // ---------------------------------------------------------------------------
@@ -135,9 +138,9 @@ describe("BoardPage attention markers", () => {
 
     // The card that is not waiting carries no marker.
     expect(
-      within(screen.getByLabelText(/: Fine$/)).queryByRole("button", {
-        name: /waiting on you/i,
-      }),
+      within(
+        screen.getByLabelText((label: string) => label.endsWith(": Fine")),
+      ).queryByRole("button", { name: /waiting on you/i }),
     ).toBeNull();
   });
 
@@ -174,22 +177,28 @@ describe("BoardPage attention markers", () => {
     expect(inputDialog()).toBeNull();
   });
 
-  // The two dialogs never stack, so a story with both pending must resolve to
-  // one of them — and the marker must open the one the board will actually
-  // show. Opening the approval and being handed the input dialog would be its
-  // own small lie.
-  it("resolves a story with both kinds pending to the dialog the board renders", async () => {
+  // A story with both kinds pending resolves to its input request, and the
+  // marker has to open *that* one rather than whatever is first — with an
+  // older question on another card, the default fallback would answer
+  // differently, which is what makes this about the wiring rather than about
+  // the precedence rule `attention.test.ts` already pins.
+  it("opens this card's question when the story has both kinds pending", async () => {
     const user = userEvent.setup();
     renderBoard({
-      stories: [rawStory("s1", "Both at once")],
-      humans: [rawHuman("h1", "s1", "Answer me")],
-      approvals: [rawApproval("a1", "s1")],
+      stories: [rawStory("s1", "Asked first"), rawStory("s2", "Both at once")],
+      humans: [
+        rawHuman("h1", "s1", "The older question"),
+        rawHuman("h2", "s2", "Answer me"),
+      ],
+      approvals: [rawApproval("a1", "s2")],
     });
 
     await screen.findByText("Both at once");
     await user.click(marker("Both at once"));
 
     expect(inputDialog()).toBeInTheDocument();
+    expect(screen.getByText("Answer me")).toBeInTheDocument();
+    expect(screen.queryByText("The older question")).toBeNull();
     expect(approvalDialog()).toBeNull();
   });
 
@@ -204,11 +213,14 @@ describe("BoardPage attention markers", () => {
 
     await screen.findByText("Unrelated");
     expect(
-      within(screen.getByLabelText(/: Unrelated$/)).queryByRole("button", {
-        name: /waiting on you/i,
-      }),
+      within(
+        screen.getByLabelText((label: string) => label.endsWith(": Unrelated")),
+      ).queryByRole("button", { name: /waiting on you/i }),
     ).toBeNull();
-    expect(bannerButton("input")).toHaveTextContent(/respond/i);
+    // The banner is the only route to it, so it has to actually open it.
+    await userEvent.setup().click(bannerButton("input"));
+    expect(inputDialog()).toBeInTheDocument();
+    expect(screen.getByText("Which one?")).toBeInTheDocument();
   });
 });
 
@@ -302,6 +314,81 @@ describe("BoardPage banners reach a dismissed request", () => {
     // run was blocked forever.
     await user.click(bannerButton("approval"));
     expect(approvalDialog()).toBeInTheDocument();
+  });
+});
+
+describe("BoardPage decides an approval", () => {
+  it("sends the decision through and names the tool it approved", async () => {
+    const user = userEvent.setup();
+    let pending = [rawApproval("a1", "s1")];
+    renderBoard({
+      stories: [rawStory("s1", "Wants to write")],
+      approvals: pending,
+    });
+    tauriMock.handleAll({
+      get_pending_approvals: () => pending,
+      decide_approval: () => {
+        pending = [];
+        return null;
+      },
+    });
+
+    await screen.findByText("Wants to write");
+    await user.click(marker("Wants to write"));
+
+    // The dialog is the only place the tool being approved is shown, so a
+    // decision made against a blank or wrong name is a decision made blind.
+    expect(within(approvalDialog()!).getByText("file_write")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /approve/i }));
+
+    await waitFor(() => expect(approvalDialog()).toBeNull());
+    expect(tauriMock.calls("decide_approval")).toEqual([
+      { id: "a1", approved: true, rejectionReason: null },
+    ]);
+  });
+});
+
+describe("BoardPage keeps a failed answer on screen", () => {
+  /**
+   * A send that fails must leave the dialog up, because the dialog is where
+   * the error is rendered.
+   *
+   * `HumanInputDialog` catches and calls its own `setError`. `onSubmit` closes
+   * the focus *before* awaiting, so once the request is also sitting in
+   * `dismissedHumanIds` there is nothing left for `activeRequests` to return —
+   * the dialog unmounts mid-flight, the error goes with it, and the run is
+   * blocked again with no UI. Clearing the dismissal on open is what keeps the
+   * fallback alive across the await.
+   *
+   * This is why `undismiss` in `openRequest` is not the dead code it looks
+   * like: every path that reaches a request through *focus* alone survives
+   * removing it, and this one does not.
+   */
+  it("shows the error rather than unmounting, on a request that was dismissed", async () => {
+    const user = userEvent.setup();
+    renderBoard({
+      stories: [rawStory("s1", "Blocked work")],
+      humans: [rawHuman("h1", "s1", "Still waiting")],
+    });
+    tauriMock.handle("respond_to_human_request", () => {
+      throw new Error("backend exploded");
+    });
+
+    await screen.findByText("Blocked work");
+
+    // Dismiss it, then come back through the banner — the path that only
+    // works because dismissal is cleared on open.
+    await user.click(marker("Blocked work"));
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
+    await user.click(bannerButton("input"));
+
+    await user.type(screen.getByRole("textbox", { name: /response/i }), "go ahead");
+    await user.click(screen.getByRole("button", { name: /send/i }));
+
+    // Still there, and saying why.
+    expect(await screen.findByText(/backend exploded/)).toBeInTheDocument();
+    expect(inputDialog()).toBeInTheDocument();
   });
 });
 

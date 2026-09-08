@@ -38,9 +38,21 @@ export default defineConfig({
       // files; 37% is 1643/4402 of the app. The second is the honest one, and
       // large untested modules (`RunPanel.tsx`, `ChatPage.tsx`) now dominate
       // it, which is the point.
+      //
+      // Each floor sits ~1.2pp under actual, which is deliberate and uniform.
+      // A tighter one is not a stronger ratchet, it is a different trap: at
+      // 0.4pp of slack the binding metric is branches, where ~39 new uncovered
+      // branches trips the build — less than one mid-sized component. That
+      // would punish "added a file, tests in a follow-up" exactly the way the
+      // old denominator punished integration tests.
+      //
+      // Be honest about what a global percentage can catch. Deleting a large
+      // test file trips it; deleting a mid-sized one (StoryCard.test.tsx, say)
+      // moves the number by less than a point and passes. This is a floor
+      // against drift, not a per-file guarantee.
       thresholds: {
         statements: 36,
-        branches: 33,
+        branches: 32,
         functions: 34,
         lines: 37,
       },
