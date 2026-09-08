@@ -24,9 +24,8 @@ pub struct StoryRun {
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
-    /// An estimate from the per-model price table, not a bill. Stays 0.0 when
-    /// the model is not in the table.
-    /// What the run cost, or `None` when nobody can say.
+    /// An estimate from the per-model price table, not a bill — or `None`
+    /// when nobody can say.
     ///
     /// `Some(0.0)` and `None` are different answers: a local Ollama run really
     /// was free, while a DeepSeek run spent money the app has no rates for.

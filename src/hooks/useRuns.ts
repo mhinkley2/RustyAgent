@@ -18,7 +18,8 @@ interface RawRun {
   output_tokens: number;
   cache_read_input_tokens: number;
   cache_creation_input_tokens: number;
-  estimated_cost_usd: number;
+  /** `null` when the run's cost is not knowable. */
+  estimated_cost_usd: number | null;
   iteration_count: number;
   started_at: string;
   finished_at: string | null;

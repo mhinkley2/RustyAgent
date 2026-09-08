@@ -54,9 +54,9 @@ export interface StoryRun {
   cacheReadTokens: number;
   /** Input tokens written into the provider's prompt cache. */
   cacheCreationTokens: number;
-  /** Estimate from the per-model price table; 0 when the model is unpriced. */
   /**
-   * What the run cost, or `null` when nobody can say.
+   * An estimate from the per-model price table, not a bill — or `null` when
+   * nobody can say.
    *
    * Three states, and the last two are different claims: a number, `0` for a
    * provider that genuinely charges nothing (Ollama runs locally), and `null`

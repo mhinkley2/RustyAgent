@@ -146,7 +146,33 @@ async fn the_run_summary_carries_what_the_card_shows() {
     assert_eq!(latest.iteration_count, 3);
     assert_eq!(latest.input_tokens, 100);
     assert_eq!(latest.output_tokens, 50);
-    assert!((latest.estimated_cost_usd - 0.25).abs() < f64::EPSILON);
+    let cost = latest.estimated_cost_usd.expect("a priced run carries its cost");
+    assert!((cost - 0.25).abs() < f64::EPSILON);
+}
+
+/// The board's card must not turn "we cannot price this" into "$0.00".
+///
+/// `commands::runs` was converted to `Option<f64>` and this path was not, so
+/// the Runs page reported an unpriced run honestly while the kanban card and
+/// the detail panel's latest-run block still said free — the same run costing
+/// two different things in one view.
+#[tokio::test]
+async fn a_story_card_reports_an_unpriceable_run_as_unknown_rather_than_free() {
+    let db = pool().await;
+    seed_story(&db, "s1", "Ran on an unpriced model", "review").await;
+    seed_run_at(&db, "r1", "s1", "2026-04-13T00:00:00.000Z", "done").await;
+    sqlx::query("UPDATE story_runs SET estimated_cost_usd = NULL WHERE id = 'r1'")
+        .execute(&db)
+        .await
+        .expect("record an unpriced run");
+
+    let latest = stories_of(&db).await.remove(0).latest_run.expect("a run");
+
+    assert_eq!(latest.input_tokens, 100, "the tokens are real");
+    assert_eq!(
+        latest.estimated_cost_usd, None,
+        "an unpriced run has no cost, which is not the same as costing nothing",
+    );
 }
 
 

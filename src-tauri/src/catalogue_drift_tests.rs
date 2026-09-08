@@ -214,6 +214,14 @@ fn the_providers_the_app_cannot_price_are_the_ones_recorded_here() {
             unpriced.is_empty(),
             "{provider} is listed as priced but offers {unpriced:?}, which PRICES does not know",
         );
+        assert!(
+            !api::pricing::is_free_provider(provider),
+            "{provider} cannot be both priced and free",
+        );
+        assert!(
+            api::pricing::is_priced_provider(provider),
+            "{provider} is listed here as priced but `pricing` does not apply the table to it",
+        );
     }
 
     for provider in UNPRICED_PROVIDERS {
@@ -230,12 +238,28 @@ fn the_providers_the_app_cannot_price_are_the_ones_recorded_here() {
             priced.is_empty(),
             "{provider} now has rates for {priced:?}. Move it to PRICED_PROVIDERS — its runs              will start reporting real costs, and the editor will stop warning about them.",
         );
+        // Asserted in both directions, as the comment above promises. Without
+        // these a provider could be added to `pricing`'s free or priced lists
+        // and stay listed here as unpriced, and the only thing that caught it
+        // would be the mock's default provider id happening to collide.
+        assert!(
+            !api::pricing::is_free_provider(provider),
+            "{provider} charges; listing it as free would report its runs as costing nothing",
+        );
+        assert!(
+            !api::pricing::is_priced_provider(provider),
+            "{provider} has no rates in PRICES; pricing must not apply the table to it",
+        );
     }
 
     for provider in FREE_PROVIDERS {
         assert!(
             api::pricing::is_free_provider(provider),
             "{provider} is listed here as free but `pricing::is_free_provider` disagrees",
+        );
+        assert!(
+            !api::pricing::is_priced_provider(provider),
+            "{provider} is free; applying the price table to it would quote a rate it does not charge",
         );
     }
 

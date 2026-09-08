@@ -29,7 +29,10 @@ ALTER TABLE story_runs ADD COLUMN cost_usd REAL;
 --     migration exists for — NULL. The frontend already guessed exactly this
 --     (`formatEstimatedCost` rendered an em dash for it), so history keeps the
 --     reading it has been shown with, now as data rather than as a heuristic;
---   * zero against zero tokens genuinely cost nothing — keep 0.0.
+--   * zero against zero tokens genuinely cost nothing — keep 0.0. "Zero
+--     tokens" counts the cache columns too, matching `Usage::is_zero`: a run
+--     that only ever read a cached prefix still spent something, and calling
+--     that free would be the same mistake one column over.
 --
 -- This misfiles one case: an Ollama run that spent tokens and truly cost
 -- nothing becomes "unknown" instead of "free". That is the safe direction —
@@ -39,7 +42,9 @@ ALTER TABLE story_runs ADD COLUMN cost_usd REAL;
 UPDATE story_runs
    SET cost_usd = CASE
          WHEN estimated_cost_usd != 0.0 THEN estimated_cost_usd
-         WHEN input_tokens = 0 AND output_tokens = 0 THEN 0.0
+         WHEN input_tokens = 0 AND output_tokens = 0
+              AND COALESCE(cache_read_input_tokens, 0) = 0
+              AND COALESCE(cache_creation_input_tokens, 0) = 0 THEN 0.0
          ELSE NULL
        END;
 

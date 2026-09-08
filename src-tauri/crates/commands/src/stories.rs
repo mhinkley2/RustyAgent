@@ -56,7 +56,14 @@ pub struct StoryLatestRun {
     pub iteration_count: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub estimated_cost_usd: f64,
+    /// What the run cost, or `None` when nobody can say.
+    ///
+    /// Same three states as `commands::runs::StoryRun`, and for the same
+    /// reason: a card that flattens `NULL` to `0.0` reports an unpriced run as
+    /// free, which is the defect. It also has to agree with the Runs page —
+    /// the detail panel draws this field and the runs feed side by side, so
+    /// disagreeing shows one run costing two different things at once.
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,11 +152,11 @@ fn row_to_latest_run(row: &sqlx::sqlite::SqliteRow) -> Option<StoryLatestRun> {
         iteration_count: row.try_get("run_iteration_count").ok().flatten().unwrap_or(0),
         input_tokens: row.try_get("run_input_tokens").ok().flatten().unwrap_or(0),
         output_tokens: row.try_get("run_output_tokens").ok().flatten().unwrap_or(0),
-        estimated_cost_usd: row
-            .try_get("run_estimated_cost_usd")
-            .ok()
-            .flatten()
-            .unwrap_or(0.0),
+        // No `unwrap_or(0.0)`: `NULL` here means the cost is not knowable, and
+        // collapsing it to zero is exactly what made every DeepSeek run look
+        // free. `.ok().flatten()` already yields `None` for both a missing
+        // column and a null one, which is the right answer for each.
+        estimated_cost_usd: row.try_get("run_estimated_cost_usd").ok().flatten(),
     })
 }
 
