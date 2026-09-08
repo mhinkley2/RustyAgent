@@ -20,6 +20,12 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"],
+  // `vitest.config.ts` is in here, not in tsconfig.node.json with its sibling
+  // `vite.config.ts`, because CI runs a plain `tsc --noEmit` and that does not
+  // follow project references. Outside this list the config is not type-checked
+  // at all, which is how `coverage.all: true` — an option Vitest 4 removed —
+  // sat there being silently ignored: no warning at runtime, and no compile
+  // error either. It is rejected by the type now.
+  "include": ["src", "vitest.config.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }
