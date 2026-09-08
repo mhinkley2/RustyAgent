@@ -39,12 +39,17 @@ cron = "0.13"
 dashmap = "6"
 
 [package]
-name = "rustyagentrustyagent"
+# The product's name, once. This was `rustyagentrustyagent` — scaffolding
+# doubled it — which is what `target/release/` called the standalone binary
+# while the MSI installed the same build as `RustyAgent`.
+name = "rustyagent"
 version.workspace = true
-description = "A Tauri App"
-authors = ["you"]
+description = "Desktop app that runs coding agents against a kanban board of stories"
+authors = ["mhinkley2 <62087201+mhinkley2@users.noreply.github.com>"]
 edition = "2021"
-default-run = "rustyagentrustyagent"
+# Two binaries live here, so `cargo run` is ambiguous without this. It has to
+# change in step with the package name or the build breaks.
+default-run = "rustyagent"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -52,7 +57,7 @@ default-run = "rustyagentrustyagent"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "rustyagentrustyagent_lib"
+name = "rustyagent_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
