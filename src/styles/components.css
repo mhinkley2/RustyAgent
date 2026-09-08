@@ -534,3 +534,25 @@
 .skeleton-table__row:nth-child(even) {
   background-color: var(--bg-subtle);
 }
+
+/* ─── Screen-reader-only ──────────────────────────────────────────────────
+   Present to assistive technology, absent from the visual layout. Used for
+   live regions that announce what a control did — a filter result count, say —
+   where the visual answer is the board itself changing.
+
+   `clip-path` does the work in every engine this app ships on; `clip` stays
+   for the same reason it does everywhere else, as the older fallback. Not
+   `display: none` or `visibility: hidden`, which remove it from the
+   accessibility tree along with the layout, which is the opposite of the point. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}

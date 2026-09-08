@@ -7,8 +7,9 @@ import { ListView } from "../components/board/ListView";
 import { StoryDetailPanel } from "../components/board/StoryDetailPanel";
 import { StoryForm } from "../components/board/StoryForm";
 import { PageHeader } from "../components/board/PageHeader";
-import { FilterBar, DEFAULT_FILTERS } from "../components/board/FilterBar";
+import { FilterBar, DEFAULT_FILTERS, activeCount } from "../components/board/FilterBar";
 import { attentionByStory, type StoryAttention } from "../components/board/attention";
+import { matchesSearch } from "../components/board/search";
 import { assignmentInput } from "../components/board/assignment";
 import {
   activeRequests,
@@ -188,9 +189,28 @@ export default function BoardPage() {
       if (filters.priorities.length > 0 && !filters.priorities.includes(s.priority)) return false;
       if (filters.types.length > 0 && !filters.types.includes(s.type)) return false;
       if (filters.labels.length > 0 && !filters.labels.some(l => s.labels.includes(l))) return false;
+      if (filters.statuses.length > 0 && !filters.statuses.includes(s.status)) return false;
+      if (!matchesSearch(s, filters.search)) return false;
       return true;
     });
   }, [stories, filters]);
+
+  /**
+   * What the filters did, for anyone who cannot see the board change.
+   *
+   * The empty-column message is `aria-hidden`, and until now no control could
+   * empty more than part of the board at once. Search can empty all six
+   * columns, and without this a screen-reader user types a query and gets
+   * silence — indistinguishable from the box not working. Announced only when
+   * something is filtering, so an unfiltered board stays quiet.
+   */
+  const resultSummary = useMemo(() => {
+    if (activeCount(filters) === 0) return "";
+    const n = filteredStories.length;
+    return n === 0
+      ? "No stories match the current filters"
+      : `${n} ${n === 1 ? "story matches" : "stories match"} the current filters`;
+  }, [filteredStories.length, filters]);
 
   /**
    * The story the open panel is showing, derived rather than stored.
@@ -283,6 +303,9 @@ export default function BoardPage() {
             onChange={setFilters}
             availableLabels={availableLabels}
           />
+          <span className="sr-only" role="status" aria-live="polite">
+            {resultSummary}
+          </span>
           <div className="view-toggle" style={{ marginLeft: "auto", flexShrink: 0 }}>
             <button
               className={`view-toggle__btn${view === "kanban" ? " view-toggle__btn--active" : ""}`}
@@ -359,6 +382,8 @@ export default function BoardPage() {
             onAttention={handleAttention}
             agents={agents}
             onAssign={handleAssign}
+            allStories={stories}
+            visibleStatuses={filters.statuses}
           />
         ) : (
           <ListView
