@@ -233,7 +233,7 @@ pub async fn find_workspace_by_path(
 /// exact match against a workspace the user registered themselves — the
 /// fallback can hand back a different registered board, never an unregistered
 /// directory.
-const CASE_INSENSITIVE_PATHS: bool = cfg!(any(windows, target_os = "macos"));
+pub const CASE_INSENSITIVE_PATHS: bool = cfg!(any(windows, target_os = "macos"));
 
 /// One row of `workspaces`, selected by a fixed clause.
 ///
@@ -411,11 +411,14 @@ mod tests {
 
     /// A folder named in a different case is the same folder.
     ///
-    /// The case this exists for: the app stores what `canonicalize` reports,
-    /// and an MCP client hands back whatever its editor templated. On Windows
-    /// those can differ by case and still be one directory. This asserts
-    /// through a real temp directory rather than a string literal, because the
-    /// answer comes from the filesystem.
+    /// End-to-end through a real temp directory, because the answer comes from
+    /// the filesystem. Note what that means it does *not* reach:
+    /// `normalize_workspace_path` calls `canonicalize` first, which on Windows
+    /// restores the on-disk casing, so a shouted path to a directory that
+    /// exists resolves back to the stored spelling and matches *exactly*. The
+    /// `COLLATE NOCASE` fallback is never entered here. That branch is pinned
+    /// by `a_row_whose_stored_casing_differs_is_still_found` below, which is
+    /// the only one of the two that fails if the fallback is deleted.
     #[tokio::test]
     async fn a_workspace_is_found_under_a_differently_cased_spelling_of_its_path() {
         let path = temp_db_path();
@@ -435,6 +438,15 @@ mod tests {
         if CASE_INSENSITIVE_PATHS {
             let found = found.expect("the same folder, shouted, is still that workspace");
             assert_eq!(found.id, stored.id, "must not be a second workspace row");
+        } else {
+            // Asserted rather than skipped. A bare `if` leaves this test with
+            // no assertion at all on Linux, which is where CI runs it — so the
+            // one platform that executes it every push was the one proving
+            // nothing.
+            assert!(
+                found.is_none(),
+                "the shouted path is a different directory here, and refusing it is correct",
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -492,6 +504,11 @@ mod tests {
         if CASE_INSENSITIVE_PATHS {
             let found = found.expect("the legacy row is still this folder's workspace");
             assert_eq!(found.id, "ws-legacy");
+        } else {
+            assert!(
+                found.is_none(),
+                "folding case where the filesystem does not would hand back another project",
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
