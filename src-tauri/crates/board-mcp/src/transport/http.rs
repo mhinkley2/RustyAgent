@@ -1018,8 +1018,18 @@ mod tests {
     /// This is the shape of the real report: `${workspaceFolder}` is whatever
     /// casing the editor holds, the row is whatever casing the app canonicalized
     /// when the user opened the folder, and on Windows those can differ while
-    /// naming one directory. Refusing that told the user their own open project
-    /// was not a workspace this RustyAgent had opened.
+    /// naming one directory.
+    ///
+    /// What this pins is the *transport*: a re-cased header resolves to a
+    /// workspace end to end, through scoping and dispatch. It does not reach
+    /// `find_workspace_by_path`'s `COLLATE NOCASE` fallback on either platform
+    /// this runs on — Windows canonicalizes the casing back before the query is
+    /// built, so the exact match answers first; Linux has the fold off and
+    /// takes the refusal branch below.
+    ///
+    /// That branch belongs to `db` and is pinned there by
+    /// `a_legacy_row_stored_in_another_case_is_still_found` and
+    /// `the_case_fold_is_exercised_on_every_platform`.
     #[tokio::test]
     async fn a_header_that_shouts_the_path_still_finds_the_project() {
         let p = two_projects().await;
@@ -1038,7 +1048,7 @@ mod tests {
         // that does not exist, and the refusal it gets there is the correct
         // answer. Both outcomes are asserted, so neither platform is only
         // running the test vacuously.
-        if cfg!(any(windows, target_os = "macos")) {
+        if db::CASE_INSENSITIVE_PATHS {
             assert_eq!(status, StatusCode::OK, "got {value}");
             let payload = payload_of(&value);
             assert_eq!(payload["workspace"]["id"], json!("ws-a"), "got {payload}");
