@@ -1022,11 +1022,14 @@ mod tests {
     ///
     /// What this pins is the *transport*: a re-cased header resolves to a
     /// workspace end to end, through scoping and dispatch. It does not reach
-    /// `find_workspace_by_path`'s `COLLATE NOCASE` fallback — the directory
-    /// exists, so `canonicalize` restores its on-disk casing and the exact
-    /// match answers first. That branch belongs to `db` and is pinned there by
-    /// `a_legacy_row_stored_in_another_case_is_still_found`, which seeds a row
-    /// in a casing `canonicalize` cannot produce.
+    /// `find_workspace_by_path`'s `COLLATE NOCASE` fallback on either platform
+    /// this runs on — Windows canonicalizes the casing back before the query is
+    /// built, so the exact match answers first; Linux has the fold off and
+    /// takes the refusal branch below.
+    ///
+    /// That branch belongs to `db` and is pinned there by
+    /// `a_legacy_row_stored_in_another_case_is_still_found` and
+    /// `the_case_fold_is_exercised_on_every_platform`.
     #[tokio::test]
     async fn a_header_that_shouts_the_path_still_finds_the_project() {
         let p = two_projects().await;

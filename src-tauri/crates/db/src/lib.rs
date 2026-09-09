@@ -192,6 +192,24 @@ pub async fn find_workspace_by_path(
     db: &DbPool,
     path: &std::path::Path,
 ) -> Option<WorkspaceRecord> {
+    find_workspace_by_path_with(db, path, CASE_INSENSITIVE_PATHS).await
+}
+
+/// [`find_workspace_by_path`], with the filesystem's case behaviour passed in.
+///
+/// Split out so the case-folding branch can be tested on every platform rather
+/// than only on the ones that happen to enable it. CI runs on Linux, where the
+/// constant is `false` — so the fallback below was unreachable there, and
+/// deleting it outright left the suite green. A test that only runs on the
+/// maintainer's laptop is not a test the build depends on.
+///
+/// Production always calls the wrapper above; nothing but a test passes a
+/// value that disagrees with the platform.
+pub(crate) async fn find_workspace_by_path_with(
+    db: &DbPool,
+    path: &std::path::Path,
+    case_insensitive: bool,
+) -> Option<WorkspaceRecord> {
     let normalized_path = normalize_workspace_path(path);
 
     if let Some(found) = select_workspace(db, "WHERE path = ?", &normalized_path).await {
@@ -213,7 +231,7 @@ pub async fn find_workspace_by_path(
     // repository paths. A non-ASCII folder whose stored casing differs still
     // misses, falling back to the same refusal as before rather than to
     // something worse.
-    if !CASE_INSENSITIVE_PATHS {
+    if !case_insensitive {
         return None;
     }
 
@@ -412,13 +430,23 @@ mod tests {
     /// A folder named in a different case is the same folder.
     ///
     /// End-to-end through a real temp directory, because the answer comes from
-    /// the filesystem. Note what that means it does *not* reach:
-    /// `normalize_workspace_path` calls `canonicalize` first, which on Windows
-    /// restores the on-disk casing, so a shouted path to a directory that
-    /// exists resolves back to the stored spelling and matches *exactly*. The
-    /// `COLLATE NOCASE` fallback is never entered here. That branch is pinned
-    /// by `a_legacy_row_stored_in_another_case_is_still_found` below, which is
-    /// the only one of the two that fails if the fallback is deleted.
+    /// the filesystem. Which path it takes there depends on the platform, and
+    /// on none of them is it the `COLLATE NOCASE` fallback:
+    ///
+    /// * **Windows** — `normalize_workspace_path` canonicalizes first, and
+    ///   `GetFinalPathNameByHandle` restores the on-disk casing, so a shouted
+    ///   path to a directory that exists resolves back to the stored spelling
+    ///   and matches *exactly*.
+    /// * **Linux** — the fold is off, so the `else` below is what runs.
+    ///
+    /// (On a case-sensitive macOS volume the fallback *is* what answers, which
+    /// is the one configuration where this test does exercise it.)
+    ///
+    /// The branch itself is pinned by
+    /// `a_legacy_row_stored_in_another_case_is_still_found` below, which is the
+    /// only one of the two that fails if the fallback is deleted, and by
+    /// `the_case_fold_is_exercised_on_every_platform`, which does not depend on
+    /// the platform at all.
     #[tokio::test]
     async fn a_workspace_is_found_under_a_differently_cased_spelling_of_its_path() {
         let path = temp_db_path();
@@ -512,6 +540,52 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// The fold itself, on every platform including the one CI runs.
+    ///
+    /// The two tests above go through `find_workspace_by_path`, which hard-wires
+    /// `CASE_INSENSITIVE_PATHS` — so on Linux they assert the *refusal* and the
+    /// `COLLATE NOCASE` query never executes. Deleting that query left the
+    /// whole suite green on CI, which is the only place it runs on every push.
+    ///
+    /// This drives both values directly, so the branch is covered wherever the
+    /// suite runs. The paths are not on disk: `canonicalize` then fails,
+    /// normalization leaves the spelling alone, and the exact match misses —
+    /// which is the only way to reach the fallback deterministically, since a
+    /// real directory's casing is restored on Windows before the query is
+    /// built.
+    #[tokio::test]
+    async fn the_case_fold_is_exercised_on_every_platform() {
+        let path = temp_db_path();
+        let db = init_db(path.to_str().unwrap()).await.expect("init_db failed");
+
+        sqlx::query(
+            "INSERT INTO workspaces (id, path, name, last_opened_at, created_at)
+             VALUES ('ws-stored', '/tmp/RUSTYAGENT-FOLD-PROBE', 'stored',
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        )
+        .execute(&db)
+        .await
+        .expect("seed a row whose casing canonicalize would never produce");
+
+        let asked = std::path::Path::new("/tmp/rustyagent-fold-probe");
+
+        let folded = find_workspace_by_path_with(&db, asked, true).await;
+        assert_eq!(
+            folded.map(|w| w.id).as_deref(),
+            Some("ws-stored"),
+            "with the fold on, a row stored in another case is the same folder",
+        );
+
+        let unfolded = find_workspace_by_path_with(&db, asked, false).await;
+        assert!(
+            unfolded.is_none(),
+            "with the fold off these are two directories, and folding them              would hand a client another project's board",
+        );
+
         drop(db);
         cleanup(&path);
     }
