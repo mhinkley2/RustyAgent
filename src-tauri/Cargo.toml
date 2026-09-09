@@ -40,8 +40,11 @@ dashmap = "6"
 
 [package]
 # The product's name, once. This was `rustyagentrustyagent` — scaffolding
-# doubled it — which is what `target/release/` called the standalone binary
-# while the MSI installed the same build as `RustyAgent`.
+# doubled it — and it reached further than the build directory: Tauri's
+# `mainBinaryName` defaults to this value, so the doubled name was also what
+# the installer laid down and what every Start Menu shortcut pointed at. Only
+# the installer's own filename came from `productName`, which is why the
+# installed application looked correctly named and was not.
 name = "rustyagent"
 version.workspace = true
 description = "Desktop app that runs coding agents against a kanban board of stories"
