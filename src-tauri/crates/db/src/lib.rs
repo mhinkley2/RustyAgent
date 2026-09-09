@@ -417,7 +417,7 @@ mod tests {
     /// restores the on-disk casing, so a shouted path to a directory that
     /// exists resolves back to the stored spelling and matches *exactly*. The
     /// `COLLATE NOCASE` fallback is never entered here. That branch is pinned
-    /// by `a_row_whose_stored_casing_differs_is_still_found` below, which is
+    /// by `a_legacy_row_stored_in_another_case_is_still_found` below, which is
     /// the only one of the two that fails if the fallback is deleted.
     #[tokio::test]
     async fn a_workspace_is_found_under_a_differently_cased_spelling_of_its_path() {
